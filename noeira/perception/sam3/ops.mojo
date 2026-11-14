@@ -28,7 +28,7 @@ from linalg.matmul import matmul as max_matmul
 
 from noeira.io.safetensors import SafeTensors, ST_F32, ST_BF16
 from noeira.nn.constants import DT
-from noeira.nn.core.cublas_gemm import cublas_gemm, cublas_gemm_lp, _shared_workspace, CUBLAS_WS_BYTES
+from noeira.nn.core.cublas_gemm import cublas_gemm, cublas_gemm_lp, cublas_handle, _shared_workspace, CUBLAS_WS_BYTES
 from linalg.matmul.vendor.blas import _get_global_handle, Backend, _ffi_void_ptr
 from _cublas.cublas import (
     _get_dylib_function as _cublas_fn, Algorithm, ComputeType, _convert_to_cublas_datatype,
@@ -765,7 +765,7 @@ def gemm_strided_batched[TA: Bool, TB: Bool](
     The row-major mapping is `cublas_gemm`'s: cuBLAS gets (b, a), dims (n, m)."""
     comptime assert default_accelerator().is_nvidia_gpu(), "cuBLAS is NVIDIA-only"
     var ws = _shared_workspace(ctx)
-    var handle = _get_global_handle[DT, Backend.CUBLAS](ctx)._get_cublas()
+    var handle = cublas_handle(ctx)
     check_cublas_error(cublasSetWorkspace(handle, _ffi_void_ptr(ws.unsafe_ptr()), CUBLAS_WS_BYTES))
     check_cublas_error(
         cublasSetMathMode(handle, cublasMath_t.CUBLAS_TF32_TENSOR_OP_MATH if SAM3_TF32 else cublasMath_t.CUBLAS_DEFAULT_MATH)

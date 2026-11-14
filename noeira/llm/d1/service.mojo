@@ -144,6 +144,9 @@ struct D1Service(Movable, DecisionService):
     def loading(self) -> Bool:
         return self.call.loading()
 
+    def load_failed(self) -> Bool:
+        return self.call.load_failed()
+
     def load_ms(self) -> Int:
         return self.call.load_ms()
 

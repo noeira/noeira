@@ -917,6 +917,21 @@ struct G1VoiceLoopOf[
             w += " speak"
         return w^
 
+    def failed(self) -> String:
+        """The backends whose model failed to load, by role ("" when none).
+        ⚠ `loading` is empty for them too: without this the loop said "every
+        model ready" with no d1, and every decision then failed one by one."""
+        var w = String("")
+        if self.stt.load_failed():
+            w += " hear"
+        if self.jev.load_failed():
+            w += " decide"
+        if self.llm.load_failed():
+            w += " reply"
+        if self.tts and self.tts.value().load_failed():
+            w += " speak"
+        return w^
+
     def speaking(mut self) -> Bool:
         """⚠ A GATE THAT RAISES WOULD TAKE THE LOOP DOWN, and the safe default
         is to assume we ARE talking rather than open the microphone onto our
@@ -971,7 +986,11 @@ struct G1VoiceLoopOf[
                 # one line each time a backend comes in: the log then says how
                 # long each took, which is what was missing to see this fault
                 var el = _vl_f2(Float64(perf_counter_ns() - self.t_built) / 1e9)
-                if waiting == "":
+                var broken = self.failed()
+                if waiting == "" and broken != "":
+                    self.note = (String("[voice] listening ") + el + String(" s after the loop was built — FAILED TO LOAD:")
+                                 + broken + String(" (each call to it will fail and say why)"))
+                elif waiting == "":
                     self.note = String("[voice] listening — every model ready ") + el + String(" s after the loop was built")
                 else:
                     self.note = (String("[voice] not listening yet (") + el + String(" s) — still loading:") + waiting)

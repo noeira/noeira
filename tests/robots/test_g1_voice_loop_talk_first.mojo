@@ -16,6 +16,10 @@ its decision acts as before. What this pins:
    still comes out of the commands request.
 3. Talk at 0.55, under the bar: the order of today (commands, then reply).
 4. `talk_first` off: the order of today even at 0.95.
+5. Code holds the answer: the order of today, and the answer said is the finished one.
+6. One reply a decision.
+7. (the start-up fault, not `talk_first`) a model that failed to load is named by `failed()`,
+   and the listening line says so instead of "every model ready".
 
 The loop is the real `G1VoiceLoopOf`, its microphone closed, a stand-in
 recogniser handing it the sentence, a stand-in decision answering from a
@@ -100,8 +104,11 @@ struct ScriptDecision(Movable, DecisionService):
     var states: List[String]
     var wait: Int
     var polls: Int
+    var broken: Bool
+    """Its model "failed to load" (`load_failed`)."""
 
     def __init__(out self):
+        self.broken = False
         self.script = List[String]()
         self.asked = String("")
         self.states = List[String]()
@@ -114,6 +121,9 @@ struct ScriptDecision(Movable, DecisionService):
 
     def loading(self) -> Bool:
         return False
+
+    def load_failed(self) -> Bool:
+        return self.broken
 
     def warm_up(mut self):
         pass
@@ -367,6 +377,21 @@ def main() raises:
     f.replied = False
     f._reply(String(""), String("[spec] a question -> reply"))
     check(fails, f.llm.asked == 1, "the same call replies when nothing was said yet")
+
+    print("7. a model that failed to load")
+    var g = make_loop(0.7, bank)
+    check(fails, g.failed() == "", "nothing failed: " + g.failed())
+    g.jev.broken = True
+    check(fails, g.failed() == " decide", "d1 failed: named as `decide`: '" + g.failed() + "'")
+    g.mic_on = True
+    g.wait_what = String(" decide")     # it was loading at the previous poll, as d1 is in the demo
+    g.cfg.mic_input = String("-f lavfi -i anullsrc=r=16000:cl=mono -t 1")
+    var ctx7 = G1Context()
+    _ = g.poll(ctx7, bank)
+    var line = g.take_note()
+    g.stop()
+    check(fails, line.find("FAILED TO LOAD: decide") >= 0 and line.find("every model ready") < 0,
+          "the listening line names it: " + line)
 
     print("ALL PASS" if fails == 0 else String(fails) + " FAILED")
     if fails != 0:

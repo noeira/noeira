@@ -16,9 +16,21 @@ MAX ships the bindings (`_cublas.cublas`) and its vendor `matmul` wraps them,
 but that wrapper allocates and zeroes a fresh 32 MB workspace on EVERY call
 (an allocation inside a captured graph, and 32 MB of memset per GEMM). This
 calls `cublasGemmEx` directly on MAX's shared per-context handle with ONE
-persistent workspace per context (`_shared_workspace`) — set on every call,
-because MAX's own vendor calls re-point the shared handle at their temporary
-one.
+persistent workspace per context (`_shared_workspace`).
+
+⚠ ONE HANDLE AND ONE WORKSPACE PER STREAM, NOT MAX'S. MAX keeps one cuBLAS
+handle per DEVICE (`_get_global_handle` keys it by `ctx.id()`, the device's
+number: two `DeviceContext`s on the Orin both say 0 and get the same handle)
+and re-attaches it to the caller's stream on every call. A process whose
+models each run on their own thread with their own context (the room demo:
+the recogniser, d1, the reply model and the voice, loading at the same time)
+then races: one thread attaches its stream, another attaches its own, and the
+first one's GEMM is launched on the second's stream, while both use one
+workspace. The demo's start-up lost d1 to it (`cublas_gemm: [29x2048]
+K=7680 ... EXECUTION_FAILED` in d1's warm-up, docs/ROBOT_BRAIN_PLAN.md and
+docs/NN_MODEL_PORTS_PLAN.md §12.8.7). So `cublas_handle` creates a handle per
+stream, bound to that stream once, and the workspace is per stream too: a
+stream is driven from one thread, and its GEMMs run in order.
 
 Row-major → cuBLAS's column-major: a row-major X[r, c] is the column-major
 Xᵀ, so C = AᵀB (row-major) is Cᵀ = Bᵀ·A (column-major) = go_col · x_colᵀ:
@@ -33,6 +45,8 @@ from std.sys import default_accelerator
 from std.sys.defines import get_defined_string, is_defined
 from std.ffi import _get_global_or_null, external_call
 from std.memory.alloc import Layout as AllocLayout
+from max.gpu.host._kernel_load_gate import KernelLoadScope
+from max.gpu.host._nvidia_cuda import CUDA
 from max.gpu.host import DeviceContext, DeviceBuffer
 from linalg.matmul.vendor.blas import _get_global_handle, Backend, _ffi_void_ptr
 from _cublas.cublas import (
@@ -45,6 +59,9 @@ from _cublas.cublas import (
     cublasMath_t,
     cublasSetMathMode,
     cublasSetWorkspace,
+    cublasCreate,
+    cublasSetStream,
+    cublasHandle_t,
 )
 
 from noeira.nn.constants import DT
@@ -127,8 +144,40 @@ MAX's took 56); 32 MiB is NVIDIA's recommendation for Hopper and later.
 Less only makes it pick other kernels, never fail."""
 
 
+comptime CUBLAS_MAX_HANDLE = is_defined["NOEIRA_CUBLAS_MAX_HANDLE"]()
+"""`-D NOEIRA_CUBLAS_MAX_HANDLE`: the old path, MAX's one handle per device and a workspace per device, for the
+before / after of `tests/nn/test_cublas_threads_gpu.mojo`. Never for a program."""
+
+
+def _stream_key(c: DeviceContext) raises -> Int:
+    """What tells one context's stream from another's (`ctx.id()` is the device's number)."""
+    var s = CUDA(c.stream())
+    if not s:
+        raise Error("cublas: the context has no CUDA stream")
+    return Int(s.value())
+
+
+def cublas_handle(c: DeviceContext) raises -> cublasHandle_t[MutAnyOrigin]:
+    """noeira's cuBLAS handle for `c`'s stream: created on first use, bound to that stream, kept for the
+    life of the process (the module note: MAX's is one per device, shared by every thread)."""
+    var name = String("NOEIRA_CUBLAS_H_", _stream_key(c))
+    var g = _get_global_or_null(name)
+    if g:
+        return g.value().unsafe_bitcast[cublasHandle_t[MutAnyOrigin]]()[]
+    var h = cublasHandle_t[MutAnyOrigin]()
+    with KernelLoadScope(c):
+        check_cublas_error(cublasCreate(Pointer(to=h)))
+    check_cublas_error(cublasSetStream(h, CUDA(c.stream())))
+    var p = alloc(AllocLayout[cublasHandle_t[MutAnyOrigin]].single()).unsafe_leak()
+    p.unsafe_write(h)
+    external_call["KGEN_CompilerRT_InsertGlobal", NoneType](
+        StringSlice(name), p.unsafe_bitcast[NoneType]()
+    )
+    return h
+
+
 def _shared_workspace(c: DeviceContext) raises -> DeviceBuffer[DType.uint8]:
-    """The context's cuBLAS workspace: ONE buffer per `DeviceContext`, created
+    """The stream's cuBLAS workspace: ONE buffer per `DeviceContext` stream, created
     on first use and kept for the life of the process (a captured graph holds
     its raw pointer). Shared by every layer: GEMMs on one stream run in order,
     so they never use it at the same time.
@@ -136,7 +185,7 @@ def _shared_workspace(c: DeviceContext) raises -> DeviceBuffer[DType.uint8]:
     Created on the first call, which must be EAGER (an allocation cannot be
     captured); every trainer runs its step once before capturing it. Stored
     the way MAX keeps its per-context BLAS handle (`_get_global_handle`)."""
-    var name = String("NOEIRA_CUBLAS_WS_", c.id())
+    var name = String("NOEIRA_CUBLAS_WS_", Int(c.id()) if CUBLAS_MAX_HANDLE else _stream_key(c))
     var g = _get_global_or_null(name)
     if g:
         return g.value().unsafe_bitcast[DeviceBuffer[DType.uint8]]()[]
@@ -211,7 +260,11 @@ def _gemm_ex[
     (row-major mapping in `cublas_gemm`'s docstring)."""
     comptime assert default_accelerator().is_nvidia_gpu(), "cuBLAS is NVIDIA-only"
     var ws = _shared_workspace(c)
-    var handle = _get_global_handle[DT, Backend.CUBLAS](c)._get_cublas()
+    var handle: cublasHandle_t[MutAnyOrigin]
+    comptime if CUBLAS_MAX_HANDLE:
+        handle = _get_global_handle[DT, Backend.CUBLAS](c)._get_cublas()
+    else:
+        handle = cublas_handle(c)
     check_cublas_error(
         cublasSetWorkspace(handle, _ffi_void_ptr(ws.unsafe_ptr()), CUBLAS_WS_BYTES)
     )

@@ -255,6 +255,11 @@ struct LocalCall(Movable):
         queued now waits for that (`SpeechToTextService.loading`)."""
         return self.state() == SVC_LOADING
 
+    def load_failed(self) -> Bool:
+        """The model's load or warm-up raised: every request will fail, its
+        reply saying why. `loading()` is False then, as it is when ready."""
+        return self.state() == SVC_FAILED
+
     def load_ms(self) -> Int:
         """Load + warm-up time, once `state()` is `SVC_READY`."""
         return Int(self.cells.acquire_load(_CELL_LOAD_MS))

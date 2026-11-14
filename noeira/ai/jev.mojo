@@ -217,6 +217,13 @@ trait DecisionService(Movable & Deinitable):
         `noeira.ai.speech.SpeechToTextService.loading`."""
         ...
 
+    def load_failed(self) -> Bool:
+        """The backend's model failed to load or warm up: every call will fail.
+        Default False (an HTTP client has nothing to load). ⚠ A SERVICE WITH A
+        MODEL IN THIS PROCESS MUST OVERRIDE IT (`LocalCall.load_failed`): the
+        default made the room demo say "every model ready" with no d1."""
+        return False
+
     def warm_up(mut self):
         ...
 
