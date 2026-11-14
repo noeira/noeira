@@ -27,11 +27,22 @@ Clips (d1-Omni-2B, `D1.load(..., audio=True)`; `noeira.llm.lfm3.audio`): each
 clip's markup (`<|vision_start|>`, one `<|audio|>` per 80 ms, `<|vision_end|>`,
 d1's processor's) heads the user turn the same way, AFTER the pictures' (d1's
 `media` keeps the caller's order; here pictures come first, then clips).
+
+`NOEIRA_D1_TRACE=<dir>` (read at construction): each call prints where its time
+went (the CPU's part: the JSON, the tokens, the rows; the forwards with their
+read-out, which wait for the GPU; the answer's JSON) and saves its request to
+`<dir>/d1_req_<n>.bin` as `D1Service` frames it (`[0|1] state \0 questions`),
+so `benchmarks/bench_d1_replay_gpu.mojo` can time the same requests alone
+(docs/NN_MODEL_PORTS_PLAN.md §12.8.7, L1). Pictures and clips are not saved.
 """
+
+from std.os import getenv
+from std.time import perf_counter_ns
 
 from std.math import exp
 from max.gpu.host import DeviceContext, DeviceBuffer
 
+from noeira.io.fileio import write_file_atomic
 from noeira.io.json import JsonWriter, load_json, parse_json, J_STRING
 from noeira.nn.constants import DT
 from noeira.llm.lfm3 import Lfm3Text, Lfm3Vision, Lfm3Audio, Picture
@@ -54,6 +65,9 @@ struct D1(Movable):
     """The picture encoder (`D1.load(..., vision=True)`); None: text only."""
     var audio: Optional[Lfm3Audio]
     """The audio encoder (`D1.load(..., audio=True)`, an omni checkpoint); None: no clips."""
+    var trace: String
+    """`NOEIRA_D1_TRACE`: the folder requests are saved to, "" = no trace (the module note)."""
+    var traced: Int
 
     def __init__(
         out self, var lm: Lfm3Text, var tok: ByteLevelBPE, temperature: Float64, var vision: Optional[Lfm3Vision] = None,
@@ -66,6 +80,8 @@ struct D1(Movable):
         self.temperature = temperature
         self.set_size = 16
         self.last_rows = List[D1Row]()
+        self.trace = getenv("NOEIRA_D1_TRACE")
+        self.traced = 0
 
     @staticmethod
     def load(var ctx: DeviceContext, dir: String, vision: Bool = False, audio: Bool = False) raises -> D1:
@@ -95,6 +111,9 @@ struct D1(Movable):
         shows (needs `D1.load(..., vision=True)`); `clips`: what was heard, 16
         kHz mono samples in [-1, 1] (needs `D1.load(..., audio=True)`). Returns
         d1's answer JSON."""
+        var t0 = perf_counter_ns()
+        if self.trace != "":
+            self._save(state, state_is_json, questions_json)
         var block: String
         if state_is_json:
             var sd = parse_json(_bytes(state))
@@ -131,6 +150,7 @@ struct D1(Movable):
         for q in qs:
             suffixes.append(suffix_text(self.tok, q))
         var rows = pack_rows(self.tok, prefix, suffixes, self.set_size)
+        var t1 = perf_counter_ns()
         var probs = List[List[Float64]]()
         var read = 0
         var v = self.lm.cfg.vocab
@@ -151,6 +171,8 @@ struct D1(Movable):
                         best = max(best, Float64(logz[s * v + id]))
                     scores.append(best / self.temperature)
                 probs.append(_softmax(scores))
+        var t2 = perf_counter_ns()
+        var nrows = len(rows)
         self.last_rows = rows^
         var w = JsonWriter()
         w.begin_object()
@@ -165,7 +187,29 @@ struct D1(Movable):
         w.member("output_tokens", 0)
         w.end_object()
         w.end_object()
-        return w.done()
+        var out = w.done()
+        if self.trace != "":
+            print("  [d1 trace] request", self.traced - 1, ":", read, "tokens in", nrows, "row(s): CPU",
+                  Int((t1 - t0) // 1_000_000), "ms, forwards + read-out", Int((t2 - t1) // 1_000_000), "ms, answer",
+                  Int((perf_counter_ns() - t2) // 1_000_000), "ms")
+        return out^
+
+    def _save(mut self, state: String, state_is_json: Bool, questions_json: String):
+        """The request as `D1Service` frames it, to `<trace>/d1_req_<n>.bin`. Never raises: a trace that cannot
+        be written says so and the call goes on."""
+        var b = List[UInt8](capacity=state.byte_length() + questions_json.byte_length() + 2)
+        b.append(UInt8(49) if state_is_json else UInt8(48))
+        for x in state.as_bytes():
+            b.append(x)
+        b.append(0)
+        for x in questions_json.as_bytes():
+            b.append(x)
+        var path = self.trace + "/d1_req_" + String(self.traced) + ".bin"
+        self.traced += 1
+        try:
+            write_file_atomic(path, b)
+        except e:
+            print("  [d1 trace] not saved:", path, e)
 
 
 def _bytes(s: String) -> List[UInt8]:

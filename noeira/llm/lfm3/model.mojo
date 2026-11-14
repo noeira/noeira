@@ -49,7 +49,20 @@ in one kernel (`attn_probs`, `attn_apply`). It was a dot product per thread:
 ## `debug` (falsification only)
 
 Bit 1: the full layers causal instead of `set`. Bit 2: full RoPE on the full
-layers (no zero tail). Bit 4: no output gate.
+layers (no zero tail). Bit 4: no output gate. Bit 8: no band split (below).
+
+## The w1 / w3 band (Orin, cuBLAS)
+
+`[t, 2048] @ W[7680, 2048]^T` in bf16 (the MLP's w1 and w3, 48 calls a
+forward) takes twice as long or more when `t mod 512` is just above 256: 4.48
+ms at t = 816 against 1.95 at 836 and 1.81 at 768; the same at 272-320,
+1296-1344 and 1808-1856 (`benchmarks/bench_d1_shape_sweep_gpu.mojo`, Orin,
+2026-11-14). cuBLAS's choice for those shapes. d1's destination request (814
+to 819 tokens) sat in it on every turn: 433 ms a forward against 333 at 836.
+In that band (`gemm_band_split`) the GEMM is two calls, the first `t - r +
+256` rows then the rest (2.13 ms at 816); each row's numbers come from the same
+operands, only the kernel cuBLAS picks changes. On the Orin only
+(`band_split`, from the device's name): the band was measured there.
 """
 
 from std.math import cos, sin, pow
@@ -178,6 +191,20 @@ struct Lfm3Config(Copyable, Movable):
         return cfg^
 
 
+def gemm_band_split(t: Int, n: Int, k: Int) -> Int:
+    """Where to cut `[t, k] @ W[n, k]^T` into two calls, or 0 for one call: the w1 / w3 shape (7680 x 2048)
+    when `t mod 512` is in (256, 320], cut at the odd multiple of 256 below `t` (the module note). Measured
+    on the Orin at every 4 rows from 760 to 900 and every 16 to 2048, and on d1's own requests: 832 is in the
+    band; 833 and 834 are not, and split they took 375 ms against 350 (a split outside the band costs: 2.46 ms
+    against 1.99 for the GEMM at 836)."""
+    if n != 7680 or k != 2048:
+        return 0
+    var r = t % 512
+    if r > 256 and r <= 320:
+        return t - r + 256
+    return 0
+
+
 def q8_cols(cfg: Lfm3Config, name: String) -> Int:
     """The input width `k` of a weight `quantize_int8` / `load(int8=True)`
     quantizes (`[n, k]`), or 0: the linears (`*_proj`, the MLP's w1 / w2 / w3)
@@ -206,6 +233,8 @@ struct Lfm3Text(Movable):
     var scratch: DeviceBuffer[DT]
     """A weight widened to fp32 for its GEMM (the largest weight's size)."""
     var debug: Int
+    var band_split: Bool
+    """Split the w1 / w3 GEMMs in their slow band (the module note): the Orin."""
     var training: Bool
     """`forward` keeps what the backward needs (`act`, `act_x_last`) — see `train.mojo`."""
     var act: List[Dict[String, DeviceBuffer[DT]]]
@@ -251,6 +280,7 @@ struct Lfm3Text(Movable):
         self.names = names^
         self.scratch = scratch^
         self.debug = 0
+        self.band_split = self.ctx.name().find("Orin") >= 0
         self.training = False
         self.act = List[Dict[String, DeviceBuffer[DT]]]()
         self.act_x_last = List[DeviceBuffer[DT]]()
@@ -518,13 +548,28 @@ struct Lfm3Text(Movable):
             else:
                 xbb = self.to_bf16(x, t * k)
             var yb = self.new(t * n)
-            cublas_gemm_lp[False, True, DType.bfloat16, DT](self.ctx, yb, xbb, self.weight_bf16(name), t, n, k, 0.0)
+            self._gemm_bf16(yb, xbb, self.weight_bf16(name), t, n, k)
             return yb^
         var wf = self.scratch.create_sub_buffer[DT](0, n * k)
         self.ctx.enqueue_function[bf16_to_f32_kernel](wb, wf, Int64(n * k), grid_dim=_blocks(n * k), block_dim=TPB)
         var y = self.new(t * n)
         self.gemm_tb(y, x, wf, t, n, k)
         return y^
+
+    def _gemm_bf16(
+        self, y: DeviceBuffer[DT], x: DeviceBuffer[DType.bfloat16], w: DeviceBuffer[DType.bfloat16], t: Int, n: Int,
+        k: Int,
+    ) raises:
+        """`y[t, n] = x[t, k] @ w[n, k]^T` on the tensor cores, in two calls in the w1 / w3 band (the module
+        note)."""
+        var cut = gemm_band_split(t, n, k) if self.band_split and (self.debug & 8) == 0 else 0
+        if cut <= 0:
+            cublas_gemm_lp[False, True, DType.bfloat16, DT](self.ctx, y, x, w, t, n, k, 0.0)
+            return
+        cublas_gemm_lp[False, True, DType.bfloat16, DT](self.ctx, y, x, w, cut, n, k, 0.0)
+        var x2 = x.create_sub_buffer[DType.bfloat16](cut * k, (t - cut) * k)
+        var y2 = y.create_sub_buffer[DT](cut * n, (t - cut) * n)
+        cublas_gemm_lp[False, True, DType.bfloat16, DT](self.ctx, y2, x2, w, t - cut, n, k, 0.0)
 
     # ── int8 weights ─────────────────────────────────────────────────────
 
