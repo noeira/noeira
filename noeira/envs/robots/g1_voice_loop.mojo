@@ -817,11 +817,12 @@ struct G1VoiceLoopOf[
         a reply is due and this is not empty, it is said as it is and the reply
         model is not asked. "" (the default) = the model replies.
 
-        For an answer that must be exact: who the speaker is
-        (`noeira.brain.people.identity_answer`). Told to say that sentence in
-        its prompt, the reply model still answered « Je m'appelle Noé » when
-        the question came through the no-command route and its hint. Set it
-        before `poll`, each frame, as `set_reply_system`."""
+        For an answer that must be exact (`noeira.brain.answers.computed_reply`):
+        who the speaker is, whether the robot has finished what it was asked.
+        Told to say that sentence in its prompt, the reply model still answered
+        « Je m'appelle Noé » when the question came through the no-command
+        route and its hint. Set it before `poll`, each frame, as
+        `set_reply_system`."""
         self.reply_override = text^
 
     def take_segment(mut self) -> List[Int16]:

@@ -36,6 +36,7 @@ from std.sys import exit
 
 from noeira.brain import (
     People, name_given, asks_identity, identity_answer, speaker_sentence,
+    asks_task_done, task_done_answer, computed_reply,
     restore_memory, digest_lines, log_days, when_words, save_places, load_places, time_refs, focused_memory,
     Task, Step, give_task, cancel_task, refuse_step, tick_tasks, notice_text, task_sentences,
     EX_NONE, EX_START, EX_NOTICE, NOTICE_ALL_DONE, NOTICE_NOT_REACHED, NOTICE_REFUSED,
@@ -605,6 +606,70 @@ def main() raises:
     with open(pdir + "/people/p1.voice", "w") as f:
         f.write("short")
     check(fails, People.load(pdir).error.find("p1.voice") >= 0, "a damaged voice file is reported: " + People.load(pdir).error)
+
+    print("10. the answers code gives")
+    check(fails, asks_task_done("As-tu fini ce que je t'ai demandé ?") and asks_task_done("as tu terminé") and asks_task_done("Est-ce que tu as fini ?")
+          and asks_task_done("Tu as fini ?") and asks_task_done("Have you finished?") and asks_task_done("Are you done"),
+          "the question, inverted or with its mark, hyphen or not")
+    check(fails, not asks_task_done("Quand tu as fini, va à la porte.") and not asks_task_done("Quand auras-tu fini ?")
+          and not asks_task_done("Où est le frigo ?") and not asks_task_done("Va à la table.") and not asks_task_done("You are done here."),
+          "a request, another question and a statement are not it")
+    var q = WorldState(Body.g1_room("Noé"), String("a furnished room"))
+    q.language = String("fr")
+    q.call_place(String("table"), String("fr"), String("la table"))
+    q.call_place(String("door"), String("fr"), String("la porte"))
+    q.asked = String("As-tu fini ce que je t'ai demandé ?")
+    check(fails, task_done_answer(q) == "" and computed_reply(q) == "", "no task ever: code has nothing to say, the model replies")
+    var qone = Task(String("va à la table"))
+    qone.steps.append(Step.goto(String("table")))
+    give_task(q, qone^, 0.0, 100)
+    _ = tick_tasks(q, 0.0, 100)
+    q.observe_motion(String("goto:table"), String("table"), String("none"), 101)
+    check(fails, computed_reply(q) == "Pas encore, je suis en route vers la table.", "one walk in hand: " + computed_reply(q))
+    q.observe_motion(String("goto:table"), String("none"), String("table"), 110)
+    _ = tick_tasks(q, 10.0, 110)
+    check(fails, not q.has_task and computed_reply(q) == "Oui, j'ai fini ce que tu m'as demandé.", "done: " + computed_reply(q))
+    q.asked = String("Où est le frigo ?")
+    check(fails, computed_reply(q) == "", "another question is the model's")
+    q.asked = String("Have you finished?")
+    q.language = String("en")
+    check(fails, computed_reply(q) == "Yes, I have finished what you asked.", "in English")
+    q.language = String("fr")
+    # station keeping walks back to the place: still the same finished task
+    q.observe_motion(String("goto:table"), String("table"), String("none"), 115)
+    q.observe_motion(String("stand"), String("none"), String("table"), 118)
+    check(fails, task_done_answer(q) == "Oui, j'ai fini ce que tu m'as demandé.", "a walk back to the place changes nothing")
+    # a spoken gesture is not a task: what the person means has no record
+    q.observe_motion(String("squat"), String("none"), String("table"), 120)
+    check(fails, task_done_answer(q) == "", "a gesture asked since: code stays silent")
+    q.observe_motion(String("stand"), String("none"), String("table"), 125)
+    check(fails, task_done_answer(q) == "", "and still once the gesture is over")
+    var qtwo = Task(String("va à la table puis à la porte"))
+    qtwo.steps.append(Step.goto(String("table")))
+    qtwo.steps.append(Step.goto(String("door")))
+    qtwo.steps[1].timeout_s = 5.0
+    give_task(q, qtwo^, 30.0, 130)
+    _ = tick_tasks(q, 30.0, 130)
+    check(fails, task_done_answer(q) == "Pas encore : j'en suis à l'étape 1 sur 2.", "several steps, the first in hand")
+    _ = tick_tasks(q, 31.0, 131)     # at the table already: step 1 is done
+    _ = tick_tasks(q, 31.1, 131)
+    q.observe_motion(String("goto:door"), String("door"), String("none"), 132)
+    check(fails, task_done_answer(q) == "Pas encore : j'en suis à l'étape 2 sur 2.", "then the second")
+    var late = tick_tasks(q, 40.0, 140)
+    q.observe_motion(String("stand"), String("none"), String("none"), 141)
+    check(fails, late.kind == EX_NOTICE and q.last_task.status == TASK_FAILED
+          and task_done_answer(q) == "Non, je n'ai pas réussi à atteindre la porte.", "a place not reached: " + task_done_answer(q))
+    var qagain = Task(String("va à la table"))
+    qagain.steps.append(Step.goto(String("table")))
+    give_task(q, qagain^, 50.0, 150)
+    _ = tick_tasks(q, 50.0, 150)
+    cancel_task(q, String("another command replaced it"), 51.0, 151)
+    check(fails, q.last_task.status == TASK_CANCELLED and task_done_answer(q) == "", "a cancelled task: code stays silent")
+    # who the speaker is comes first, and only with a people store
+    q.asked = String("Qui suis-je ?")
+    check(fails, computed_reply(q) == "", "no people store: an identity question is the model's")
+    q.people_on = True
+    check(fails, computed_reply(q) == "Je ne sais pas : tu ne m'as pas encore dit ton nom.", "with one: the identity answer")
 
     print("ALL PASS" if fails == 0 else String(fails) + " FAILED")
     if fails != 0:

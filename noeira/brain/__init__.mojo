@@ -12,7 +12,8 @@ a failure), with the task in hand in the reply view. B3: `restore_memory` (what
 the robot did on earlier days and sessions, rebuilt from its log by rule at
 start) and `save_places` / `load_places`. B4: `People` (who gave their name,
 whose voice this is, on disk) and the reply view's line about the person
-talking. A second body (B5) is not here yet.
+talking. `computed_reply`: the questions code answers exactly (who the
+speaker is, whether the task is finished). A second body (B5) is not here yet.
 """
 
 from .geometry import (
@@ -37,4 +38,5 @@ from .tasks import (
     ExecAction, give_task, cancel_task, refuse_step, tick_tasks, notice_text,
     EX_NONE, EX_START, EX_NOTICE, STOP_COMMAND, NOTICE_NOT_REACHED, NOTICE_REFUSED, NOTICE_ALL_DONE,
 )
+from .answers import asks_task_done, task_done_answer, computed_reply
 from .views import ReplyView, reply_view, reply_stable, reply_live, task_sentences, speaker_sentence, memory_section, metres, language_name, REPLY_VIEW_LINES, REPLY_VIEW_SENTENCES
