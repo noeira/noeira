@@ -288,6 +288,16 @@ struct G1VoiceConfig(Copyable, Movable):
     (d1): unsafe and the speaker's side only, and no goto for a step.
     OFF (`G1_TRIAGE_OFF`) by default. The caller keeps the log, as for
     `memory_route`."""
+    var talk_first: Float64
+    """`triage` only: when the first request routed no place and the triage's
+    top kind is `talk` with at least this probability, the reply starts at
+    once, and the commands request is asked once the reply is out: the robot
+    answers ~0.7 s sooner (docs/NN_MODEL_PORTS_PLAN.md §12.8.6, S3 item 1).
+    ⚠ THE COMMANDS REQUEST IS STILL ASKED, AND ITS DECISION STILL ACTS: d1
+    named "no, not the table, stop" `talk` 0.51 and "non, plus le frigo, tu
+    bouges pas" 0.58 (RB-1/RB-2 logs), so skipping it would have lost two
+    stops. A `talk` answer there is not replied twice. 0 = off (the default:
+    every bench measured the order commands, then reply)."""
     var dest_chain: Bool
     """`request_wording` only: "go to the table, then to the door". The
     destination request gets one yes/no question (are two places asked for,
@@ -356,6 +366,7 @@ struct G1VoiceConfig(Copyable, Movable):
         self.memory_route = False
         self.dest_words = List[String]()
         self.triage = G1_TRIAGE_OFF
+        self.talk_first = 0.0
         self.dest_chain = False
         self.miss_kind = False
         self.name_desc = False
@@ -429,6 +440,12 @@ struct G1VoiceLoopOf[
     var dest_tok: Int
     """The tokens that first request read (the note shows them with the time:
     a decision's wait is its tokens, docs/NN_MODEL_PORTS_PLAN.md §12.8)."""
+    var then_decide: Bool
+    """`talk_first`: a reply was started after the first request, and the
+    commands request is asked as soon as it is out."""
+    var replied: Bool
+    """The current decision has replied already (`talk_first`): its commands'
+    `talk` says nothing more."""
     var spec_q: JevQuestions
     var has_pool: Bool
     var pool: G1Pool
@@ -567,6 +584,8 @@ struct G1VoiceLoopOf[
         self.asked = String("")
         self.dest_ms = 0.0
         self.dest_tok = 0
+        self.then_decide = False
+        self.replied = False
         self.spec_q = g1_spec_questions(True)
         if self.cfg.miss_kind:
             g1_add_miss_kind(self.spec_q, self.cfg.name_desc)
@@ -635,6 +654,8 @@ struct G1VoiceLoopOf[
         self.asked = move.asked^
         self.dest_ms = move.dest_ms
         self.dest_tok = move.dest_tok
+        self.then_decide = move.then_decide
+        self.replied = move.replied
         self.spec_q = move.spec_q^
         self.has_pool = move.has_pool
         self.pool = move.pool^
@@ -1097,6 +1118,8 @@ struct G1VoiceLoopOf[
                             self.tri = G1Triage()
                             self.dest_ms = 0.0
                             self.dest_tok = 0
+                            self.then_decide = False
+                            self.replied = False
                             if self._two_requests():
                                 self._ask(_VL_Q_DEST)
                                 self.state = VL_ST_DEST
@@ -1218,6 +1241,7 @@ struct G1VoiceLoopOf[
             ev.kind = VL_TALK
             ev.text = ctxt
             self.state = VL_ST_IDLE
+            self._after_reply()
 
         # ── the reply ─────────────────────────────────────────────────
         elif self.state == VL_ST_CHAT:
@@ -1230,6 +1254,7 @@ struct G1VoiceLoopOf[
                 except:
                     pass
                 self.state = VL_ST_IDLE
+                self._after_reply()
             else:
                 try:
                     _ = self.llm.poll()
@@ -1260,6 +1285,7 @@ struct G1VoiceLoopOf[
                         ev.kind = VL_TALK
                         ev.text = rtxt
                     self.state = VL_ST_IDLE
+                    self._after_reply()
 
         return ev^
 
@@ -1365,12 +1391,37 @@ struct G1VoiceLoopOf[
                              + _vl_f2(ans.probability(String("destination"), dest))
                              + self._jev_ms(ans.latency_ms, ans.input_tokens))
                 return ev^
-            self.dest_ms = ans.latency_ms
-            self.dest_tok = ans.input_tokens
             # ⚠ THE SAME STATE, not a fresh one: the robot may have moved on
             # while the first request was answered, and the two answers must
             # be about the same moment.
             self.mem_asked = self._settles_other_one(ctx)
+            # ⚠ NOT WHEN CODE HOLDS THE ANSWER (`set_reply_override`): « Comment je m'appelle ? » was
+            # answered « Un instant, je n'ai pas encore reconnu ta voix » 0.5 s in, the voice check still
+            # running (e2e_b4_s1). A computed answer costs no model time: it waits for the decision, as before.
+            if (self.cfg.talk_first > 0.0 and self.tri.top == "talk"
+                    and self.tri.top_p >= self.cfg.talk_first and self.reply_override == ""):
+                # the reply first, the commands request once it is out (the
+                # field's note: that request is never skipped)
+                var tnote = (String("[talk-first] talk ") + _vl_f2(self.tri.top_p)
+                             + String(" -> reply now, the commands after it")
+                             + self._jev_ms(ans.latency_ms, ans.input_tokens))
+                self.dest_ms = ans.latency_ms
+                self.dest_tok = ans.input_tokens
+                self.then_decide = True
+                self._reply(String(""), tnote)
+                if self.state != VL_ST_CHAT:
+                    self._after_reply()     # no reply could start: the commands now
+                return ev^
+            if self.cfg.talk_first > 0.0 and self.tri.top == "talk":
+                # not taken: said, so a log shows where the bar sits against the room's sentences
+                if self.reply_override != "":
+                    self._add_note(String("[talk-first] talk ") + _vl_f2(self.tri.top_p)
+                                   + String(", a computed answer: the commands first"))
+                else:
+                    self._add_note(String("[talk-first] talk ") + _vl_f2(self.tri.top_p) + String(" < ")
+                                   + _vl_f2(self.cfg.talk_first) + String(": the commands first"))
+            self.dest_ms = ans.latency_ms
+            self.dest_tok = ans.input_tokens
             if self.mem_asked:
                 self._ask(_VL_Q_MEM)
             else:
@@ -1442,7 +1493,16 @@ struct G1VoiceLoopOf[
 
     def _reply(mut self, hint: String, note: String):
         """A spoken reply and nothing else: the robot's motion is unchanged.
-        `hint` is added to the reply's system prompt ("" = a plain reply)."""
+        `hint` is added to the reply's system prompt ("" = a plain reply).
+
+        ⚠ ONE REPLY A DECISION: after a `talk_first` reply, the commands request
+        can still end in one (the miss route's "a question -> reply": the
+        e2e replays said two jokes for « raconte-moi une blague »). It is not
+        started; the note says so."""
+        if self.replied:
+            self.note = note + String("  (replied already: nothing more said)")
+            self.state = VL_ST_IDLE
+            return
         if self.reply_override != "":
             # a computed reply: said as it is, the model is not asked
             self.canned = self.reply_override
@@ -1462,6 +1522,22 @@ struct G1VoiceLoopOf[
             self.state = VL_ST_CHAT
         except e:
             self.note = String("[talk] could not start: ") + String(e)
+            self.state = VL_ST_IDLE
+
+    def _after_reply(mut self):
+        """`talk_first`: the reply is out, or could not be had. The commands
+        request of the same decision is asked now, with the state the first
+        request was asked with (`asked`). Nothing when no reply came first."""
+        if not self.then_decide:
+            return
+        self.then_decide = False
+        self.replied = True
+        try:
+            self._ask(_VL_Q_MEM if self.mem_asked else _VL_Q_CMD)
+            self.t_wait = perf_counter_ns()
+            self.state = VL_ST_JEV
+        except e:
+            self._add_note(String("[jev] could not start: ") + String(e))
             self.state = VL_ST_IDLE
 
     def _settles_other_one(self, ref ctx: G1Context) -> Bool:
@@ -1549,6 +1625,10 @@ struct G1VoiceLoopOf[
                              + _vl_f2(self.pick.conf) + String("  P(none) ")
                              + _vl_f2(self.pick.p_none) + String("  world ")
                              + _vl_f2(self.pick.needs_world)
+                             + self._jev_ms(ans.latency_ms, ans.input_tokens))
+            elif self.pick.talk and self.replied:
+                # `talk_first`: the reply is out already, and one is enough
+                self.note = (String("[talk] ") + _vl_f2(self.pick.conf) + String(" — replied already")
                              + self._jev_ms(ans.latency_ms, ans.input_tokens))
             elif self.pick.talk:
                 # ⚠ Nothing about the robot's motion changes — it goes on
