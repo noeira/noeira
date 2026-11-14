@@ -101,6 +101,8 @@ def main() raises:
     var out_path = String(args[1]) if len(args) > 1 else String("")
     var set_path = String(args[2]) if len(args) > 2 else String("tests/brain/dest_chain.tsv")
     var spec = String(args[3]) if len(args) > 3 else String("native-text")
+    # `nokind`: the second request without the triage question (`g1_two_places_questions(with_kind=False)`)
+    var with_kind = not (len(args) > 4 and String(args[4]) == "nokind")
     var rows = List[Row]()
     for l in string_from_bytes(read_file_bytes(set_path)).split("\n"):
         var line = String(l)
@@ -121,7 +123,8 @@ def main() raises:
     var q_gate = g1_destination_questions(places)
     g1_add_triage(q_gate, True)
     g1_add_two_places_gate(q_gate)
-    var q_pair = g1_two_places_questions(places, True)
+    var q_pair = g1_two_places_questions(places, True, with_kind)
+    print("the second request:", "as measured first" if with_kind else "WITHOUT the triage question")
     var layout: List[PlaceXY] = [
         PlaceXY("fridge", 3.0, 1.5), PlaceXY("door", -3.2, 2.0), PlaceXY("table", 1.0, -2.5), PlaceXY("sofa", -2.0, -2.8),
     ]

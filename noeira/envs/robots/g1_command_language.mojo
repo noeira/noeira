@@ -560,15 +560,23 @@ def g1_two_places_state(instruction: String) raises -> String:
     return g1_command_state(instruction, ctx)
 
 
-def g1_two_places_questions(destinations: List[String], name_desc: Bool = False) raises -> JevQuestions:
+def g1_two_places_questions(
+    destinations: List[String], name_desc: Bool = False, with_kind: Bool = True,
+) raises -> JevQuestions:
     """The request asked when the gate says two places: the destination
     request over again (destination, its gate, the triage) with the SECOND
     place, the FIRST of the two, and the two-place gate. `g1_route_two_places`
     reads it. ⚠ This exact set, against `g1_two_places_state`, is what
     `bench_brain_dest_chain_gpu` measured; d1's answers move a little with the
-    questions asked beside them, so the set is kept whole."""
+    questions asked beside them, so the set is kept whole.
+
+    `with_kind=False` leaves the triage question out: `g1_route_two_places`
+    does not read it, and it is 355 of the request's 1211 tokens
+    (`benchmarks/bench_d1_row_tokens.mojo`). Measured by the same bench
+    (its fourth argument); the default is the set as it was measured first."""
     var q = g1_destination_questions(destinations)
-    g1_add_triage(q, name_desc)
+    if with_kind:
+        g1_add_triage(q, name_desc)
     var ops = List[String]()
     var descs = List[String]()
     for i in range(len(destinations)):
