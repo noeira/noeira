@@ -11,7 +11,7 @@ every body, joint, geom and actuator of the robot is that file's, byte for byte:
     the last body, joint, geom, qpos (36..42) and qvel (35..40) slots: every index of the robot is unchanged, and a
     state row or a checkpoint written for `unitree_g1_mjlab` addresses the same robot here;
   * the `stand` key gets the box's rest pose appended;
-  * `<option>` gains `cone="elliptic" impratio="10"`, and the solver's two caps double: `iterations` 10 to 20,
+  * `<option>` gains `cone="elliptic" impratio="3"`, and the solver's two caps double: `iterations` 10 to 20,
     `ls_iterations` 20 to 40 (see THE HOLD below). This one is GLOBAL: the feet's contacts with the floor are solved under it too, so this model's robot does not step
     exactly as `unitree_g1_mjlab`'s does.
 
@@ -37,13 +37,18 @@ two hands and hung 7 cm low:
     of 3.3 cm, the hand capsule's radius (3.5 cm). On the bench the box then holds once 2·0.02·N exceeds gravity's
     torque about the grip, as the physics says, and not below;
   * with `impratio 1` friction is as soft as the normal force, and a squeezed box creeps (1 cm in 3 s on a centred
-    bench grip, and the robot pinned at 15 of its own carry poses kept the box in 5). `cone="elliptic" impratio="10"`
-    is what mjlab sets for its own manipulation task (`tasks/manipulation/lift_cube_env_cfg.py`, with this same
-    timestep); with it 11 of the 15 keep the box. The pyramidal cone with `condim 4` drops the box at a 10 N squeeze
-    on the bench, so the cone changes with the rest;
+    bench grip, and the robot pinned at 15 of its own carry poses kept the box in 6, with a median drop of 11 cm).
+    mjlab sets `cone="elliptic" impratio="10"` for its own manipulation task (`tasks/manipulation/
+    lift_cube_env_cfg.py`, with this same timestep), and at 10 the pinned robot keeps 12 of the 15. The pyramidal
+    cone with `condim 4` drops the box at a 10 N squeeze on the bench, so the cone changes with the rest.
+    IT IS 3 HERE, NOT 10, FOR THE DEVICE. In single precision the device does not reproduce the step at which the
+    feet touch down once friction is that stiff: `test_unitree_g1_mjlab_box_gpu_vs_cpu` on an RTX 5090, the asset
+    alone varied under one binary, passes at impratio 1, 3 and 4 and fails at 5, 7 and 10 (at 10: joint velocities
+    0.09 rad/s from the float64 step, whatever the iteration caps and with or without the torsional row). At 3 the
+    pinned robot keeps 9 of the 15, with a median drop of 1 cm;
   * `iterations="20" ls_iterations="40"`, where the robot's own model and mjlab's task have 10 and 20. Both are CAPS:
     the solver stops when it has converged, so they cost only where they were cutting it short. Under the elliptic
-    cone at `impratio 10` they were, measured in MuJoCo against its own converged solve over 40 control steps:
+    cone they were (measured at `impratio 10`, in MuJoCo against its own converged solve over 40 control steps):
       - at `ls_iterations 20` the standing robot is 8e-4 away (the LINE SEARCH stops short; Newton takes 1 to 5
         iterations there), at 25 and above 6e-7 or less on the five scenarios of `test_unitree_g1_mjlab_box_vs_mujoco`;
       - at `iterations 10` the driven catch ends some substeps at the cap, unconverged, and two solvers that agree to
@@ -69,7 +74,7 @@ BOX_MASS = 1.0                          # kg (OmniRetarget randomises 0.1 - 2)
 BOX_CONDIM = 4                          # sliding + torsional: a contact patch, not a point (THE HOLD above)
 BOX_FRICTION = (0.9, 0.02, 0.0001)      # lateral 0.9 from the scan's URDF; torsional 0.02 m = (2/3)·0.9·(3.3 cm patch)
 OPTION_SRC = '<option timestep="0.005" iterations="10" ls_iterations="20"/>'
-OPTION_BOX = '<option timestep="0.005" iterations="20" ls_iterations="40" cone="elliptic" impratio="10"/>'
+OPTION_BOX = '<option timestep="0.005" iterations="20" ls_iterations="40" cone="elliptic" impratio="3"/>'
 BOX_REST_XY = (0.6, 0.0)                # in front of the standing robot, out of reach of its feet
 
 

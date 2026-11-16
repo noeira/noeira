@@ -18,12 +18,12 @@ here (`G1M_BOX_QPOS` / `G1M_BOX_QVEL` below are where the box starts).
 ITS CONTACTS are frictional with the BOX's friction, whatever touches it
 (`priority 1` on the box geom; the robot's geoms stay `condim 1` as mjlab has
 them), and they are PATCHES, not points: `condim 4` (torsional friction of
-0.02 m), solved under `cone="elliptic" impratio="10"`. A box squeezed between
+0.02 m), solved under `cone="elliptic" impratio="3"`. A box squeezed between
 two capsule hands by frictional points is a hinge and swings about the line
 between them; the bake script's THE HOLD has the measurements.
 
 ⚠ THE OPTION IS THE MODEL'S, so the robot's feet are solved under the elliptic
-cone and `impratio 10` here, and under the pyramidal default in
+cone and `impratio 3` here, and under the pyramidal default in
 `unitree_g1_mjlab`. `cone_type` and `max_condim` below must follow the asset:
 left at pyramidal / 3 the model still builds, the torsional row is never
 built, and nothing reports it (`model_def_from_xml`'s note on `MAX_CONDIM`).

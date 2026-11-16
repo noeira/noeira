@@ -3,7 +3,7 @@
   <compiler angle="radian" meshdir="unitree_g1" autolimits="true"/>
 
   <!-- the reproduction's MujocoCfg; Euler, not mjlab's implicitfast: see the bake script -->
-  <option timestep="0.005" iterations="20" ls_iterations="40" cone="elliptic" impratio="10"/>
+  <option timestep="0.005" iterations="20" ls_iterations="40" cone="elliptic" impratio="3"/>
 
   <default>
     <default class="g1">

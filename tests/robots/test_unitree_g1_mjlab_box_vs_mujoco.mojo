@@ -13,7 +13,7 @@ contacts; and MuJoCo's contact-parameter mixing by PRIORITY — the box geom is
 `condim 4`, `priority 1`, so its contacts with the robot's `condim 1` geoms
 are frictional with the box's friction (sliding and torsional), and with the
 feet (also priority 1) take the larger friction. The model's option is
-`cone="elliptic" impratio="10"` (the bake script's THE HOLD), so every
+`cone="elliptic" impratio="3"` (the bake script's THE HOLD), so every
 rollout here, the feet's contacts included, is the elliptic cone's.
 
     rest   the key pose, zero action: the box stays where it is
@@ -88,7 +88,7 @@ def test_model_counts_and_slots() raises:
     # the model definition must follow the asset: a smaller MAX_CONDIM drops the torsional row without a word
     assert_true(UnitreeG1MjlabBoxModel.MAX_CONDIM >= Int(py=m.geom_condim[G1M_BOX_GEOM]), "the model def's MAX_CONDIM is below the box's condim")
     assert_true(Int(py=m.opt.cone) == 1 and UnitreeG1MjlabBoxModel.CONE_TYPE == ConeType.ELLIPTIC, "the cone is not elliptic on both sides")
-    assert_true(Float64(py=m.opt.impratio) == 10.0, "impratio is not 10")
+    assert_true(Float64(py=m.opt.impratio) == 3.0, "impratio is not 3")
     print("  counts and slots OK — nbody", Int(py=m.nbody), " nq", NQ, " nv", NV, " box qpos at", G1M_BOX_QPOS)
 
 
