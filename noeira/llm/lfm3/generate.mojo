@@ -51,7 +51,7 @@ from .generate_kernels import (
     conv_cached_kernel, conv_history_kernel, put_kv_kernel, cached_attention_kernel, masked_softmax_offset_kernel,
     MAX_KEYS,
 )
-from .model import Lfm3Text, LT_CONV, LT_FULL, LT_SLIDING, LF_BF16, LF_ATTN_TF32, split_heads
+from .model import Lfm3Text, LinIn, LT_CONV, LT_FULL, LT_SLIDING, LF_BF16, LF_ATTN_TF32, split_heads
 
 
 def _blocks(n: Int) -> Int:
@@ -352,15 +352,20 @@ def _mlp(mut lm: Lfm3Text, pre: String, x: DeviceBuffer[DT], n: Int) raises:
     var ff = lm.cfg.ff
     var fnrm = lm.new(n * dm)
     var fnb = lm.rms_b(pre + "ffn_norm", x, fnrm, n, dm)
+    if lm.mlp_w8a8_ok(n, fnb):
+        var fq = lm.mlp_w8a8(pre, fnb, n)
+        lm.rms(pre + "post_ffn_norm", fq, fq, n, dm)
+        lm.ctx.enqueue_function[add_kernel](x, fq, Int64(n * dm), grid_dim=_blocks(n * dm), block_dim=TPB)
+        return
     var a1 = lm.linear(pre + "feed_forward.w1", fnrm, n, dm, fnb)
     var a3 = lm.linear(pre + "feed_forward.w3", fnrm, n, dm, fnb)
-    var swb = Optional[DeviceBuffer[DType.bfloat16]](None)
+    var swb = LinIn()
     comptime if LF_BF16:
         if len(lm.lora_index) == 0 and not lm.q8_on:  # the int8 GEMV reads the fp32 product
             var b = lm.ctx.enqueue_create_buffer[DType.bfloat16](n * ff)
             lm.ctx.enqueue_function[swiglu_bf16_kernel](a1, a3, b, Int64(n * ff), grid_dim=_blocks(n * ff), block_dim=TPB)
-            swb = Optional(b^)
-    if not swb:
+            swb = LinIn(b^)
+    if not swb.bf:
         lm.ctx.enqueue_function[swiglu_kernel](a1, a3, a1, Int64(n * ff), grid_dim=_blocks(n * ff), block_dim=TPB)
     var f = lm.linear(pre + "feed_forward.w2", a1, n, ff, swb)
     lm.rms(pre + "post_ffn_norm", f, f, n, dm)

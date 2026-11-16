@@ -50,6 +50,28 @@ in one kernel (`attn_probs`, `attn_apply`). It was a dot product per thread:
 
 Bit 1: the full layers causal instead of `set`. Bit 2: full RoPE on the full
 layers (no zero tail). Bit 4: no output gate. Bit 8: no band split (below).
+Bits 16 / 32 / 64 (diagnosis of `w8a8`): the linears that read a norm (q / k /
+v / gate, in_proj, w1 / w3), the operators' outputs (out_proj, o_proj), or
+w2 keep int8 weights but bf16 activations (`q8_kind`). Bit 128: the MLP
+unfused on the W8A8 path (`mlp_w8a8`'s gate: the same numbers).
+
+## W8A8 (`w8a8`, NVIDIA; docs/NN_MODEL_PORTS_PLAN.md §12.8.8)
+
+With the int8 weights (`load(int8=True)` / `quantize_int8`) and `w8a8` set, a
+chunk of more than Q8_GEMV_MAX rows no longer dequantizes each weight for a
+bf16 GEMM: its activations are quantized too, one scale a token
+(`q8_act_kernel`, or `q8_rms_kernel` inside the norm whose output several
+linears read), and the GEMM runs on the int8 tensor cores (`cublas_gemm_i8`,
+exact int32 sums), scaled back by `q8_out_kernel`. About twice the bf16 GEMM
+on the Orin, the dequantization gone (`benchmarks/bench_w8a8_gemm_gpu.mojo`).
+Lossy twice over (weights per row, activations per token): the decision
+benches are its gate, not a code bound. d1 keeps its embedding table in bf16
+(`int8_table=False`): the answers are read from the head. And it keeps the
+operators' output projections (the conv's out_proj, attention's o_proj) in
+bf16 (`int8_operator_out=False`): their inputs are where activations lose
+the most to int8. On 88 of the demo's requests (348 picks), W8A8 everywhere
+moved 10 picks against bf16; with those two in bf16, 2 — the 2 that int8
+weights alone move, every one a near tie in bf16 (§12.8.8).
 
 ## The w1 / w3 band (Orin, cuBLAS)
 
@@ -75,7 +97,7 @@ from layout import TileTensor, row_major
 from linalg.matmul import matmul as max_matmul
 
 from noeira.nn.constants import DT
-from noeira.nn.core.cublas_gemm import cublas_gemm, cublas_gemm_lp
+from noeira.nn.core.cublas_gemm import cublas_gemm, cublas_gemm_lp, cublas_gemm_i8
 from noeira.io.fileio import release_file_cache
 from noeira.io.json import load_json
 from noeira.io.safetensors import SafeTensors, ST_BF16
@@ -88,7 +110,7 @@ from .kernels import (
 from .vision_kernels import put_rows_kernel
 from .int8_kernels import (
     QPtr, q8_quantize_kernel, q8_gemv_kernel, q8_dequant_bf16_kernel, q8_dequant_f32_kernel, q8_embed_kernel,
-    Q8_GEMV_MAX, Q8_RPW,
+    Q8_GEMV_MAX, Q8_RPW, q8_act_kernel, q8_rms_kernel, q8_out_kernel, Q8_OUT_W, q8_swiglu_kernel, Q8_FF_MAX,
 )
 
 
@@ -205,6 +227,42 @@ def gemm_band_split(t: Int, n: Int, k: Int) -> Int:
     return 0
 
 
+struct LinIn(Copyable, Movable):
+    """What a norm hands the linears that read its output, beside the fp32
+    rows (`rms_b`): the rows rounded to bf16 (LFM3_BF16), or quantized to int8
+    with a scale a row (`w8a8`). Empty: each linear makes its own operand."""
+    var bf: Optional[DeviceBuffer[DType.bfloat16]]
+    var q: Optional[DeviceBuffer[DType.int8]]
+    var qs: Optional[DeviceBuffer[DT]]
+
+    def __init__(out self):
+        self.bf = None
+        self.q = None
+        self.qs = None
+
+    def __init__(out self, var bf: DeviceBuffer[DType.bfloat16]):
+        self.bf = Optional(bf^)
+        self.q = None
+        self.qs = None
+
+    def __init__(out self, var q: DeviceBuffer[DType.int8], var qs: DeviceBuffer[DT]):
+        self.bf = None
+        self.q = Optional(q^)
+        self.qs = Optional(qs^)
+
+
+def is_operator_out(name: String) -> Bool:
+    """The operators' output projections: the conv's out_proj, attention's o_proj (the module note, W8A8)."""
+    return name.endswith("out_proj.weight") or name.endswith("o_proj.weight")
+
+
+def q8_keeps_bf16(name: String, table: Bool, operator_out: Bool) -> Bool:
+    """A weight `q8_cols` would quantize that stays bf16 instead: the tied table without `table`, the
+    operators' output projections without `operator_out` (`load`'s `int8_table` / `int8_operator_out`,
+    `quantize_int8`'s)."""
+    return (not table and name == "embed_tokens.weight") or (not operator_out and is_operator_out(name))
+
+
 def q8_cols(cfg: Lfm3Config, name: String) -> Int:
     """The input width `k` of a weight `quantize_int8` / `load(int8=True)`
     quantizes (`[n, k]`), or 0: the linears (`*_proj`, the MLP's w1 / w2 / w3)
@@ -262,8 +320,13 @@ struct Lfm3Text(Movable):
     """Its scales' offset in `q8_scale`."""
     var q8_rows: List[Int]
     var q8_cols: List[Int]
+    var q8_kind: List[Int]
+    """Each slot's place for `debug` bits 16 / 32 / 64: 0 reads a norm, 1 an operator's output, 2 w2 (3: the table)."""
     var q8_bf: DeviceBuffer[DType.bfloat16]
     """A weight dequantized to bf16 for a chunk's GEMM (LFM3_BF16; the fp32 build uses `scratch`)."""
+    var w8a8: Bool
+    """With the int8 weights, a chunk's linears quantize their activations and run the int8 GEMM (the module
+    note, W8A8; NVIDIA). Off: the weight is dequantized for the build's GEMM."""
 
     def __init__(
         out self, var ctx: DeviceContext, var cfg: Lfm3Config, var arena: DeviceBuffer[DType.uint16],
@@ -301,17 +364,25 @@ struct Lfm3Text(Movable):
         self.q8_soff = List[Int]()
         self.q8_rows = List[Int]()
         self.q8_cols = List[Int]()
+        self.q8_kind = List[Int]()
         self.q8_bf = self.ctx.enqueue_create_buffer[DType.bfloat16](1)
+        self.w8a8 = False
 
     @staticmethod
-    def load(var ctx: DeviceContext, dir: String, int8: Bool = False, q8_levels: Int = 127) raises -> Lfm3Text:
+    def load(
+        var ctx: DeviceContext, dir: String, int8: Bool = False, q8_levels: Int = 127, int8_table: Bool = True,
+        int8_operator_out: Bool = True,
+    ) raises -> Lfm3Text:
         """`config.json` and `model.safetensors` from `dir`: every language-model
         tensor (`model.language_model.*`, or `model.*` for a text-only model)
         into one bf16 device arena; the vision / audio parts are skipped.
         `int8`: the linears and the tied table go straight to int8 (one tensor
         at a time through a staging buffer) and are NOT kept in bf16 — half the
         memory; inference only (`quantize_int8` keeps both). `q8_levels`: the
-        grid's half-width, 127 (falsification: 7 is a 4-bit grid)."""
+        grid's half-width, 127 (falsification: 7 is a 4-bit grid).
+        `int8_table`: the tied embedding / head table too (off: it stays bf16).
+        `int8_operator_out`: the operators' output projections too (off: the
+        conv's out_proj and attention's o_proj stay bf16; the module note, W8A8)."""
         var cfg = Lfm3Config.load(dir + "/config.json")
         var st = SafeTensors(dir + "/model.safetensors")
         var prefix = String("model.language_model.")
@@ -330,7 +401,8 @@ struct Lfm3Text(Movable):
             var n = st.numel(name)
             if not name.endswith("embed_tokens.weight"):
                 largest = max(largest, n)
-            if int8 and q8_cols(cfg, String(name[byte=prefix.byte_length():])) > 0:
+            var short_name = String(name[byte=prefix.byte_length():])
+            if int8 and q8_cols(cfg, short_name) > 0 and not q8_keeps_bf16(short_name, int8_table, int8_operator_out):
                 quant.append(i)
                 continue
             picked.append(i)
@@ -510,11 +582,11 @@ struct Lfm3Text(Movable):
         return d^
 
     def linear(
-        mut self, name: String, x: DeviceBuffer[DT], t: Int, k: Int,
-        xb: Optional[DeviceBuffer[DType.bfloat16]] = None,
+        mut self, name: String, x: DeviceBuffer[DT], t: Int, k: Int, xb: LinIn = LinIn(),
     ) raises -> DeviceBuffer[DT]:
         """`x[t, k] @ W^T` (+ the adapter's term). `xb`: `x` already rounded to
-        bf16 (LFM3_BF16; `rms_b`), shared by the linears that read one input."""
+        bf16 (LFM3_BF16) or quantized to int8 (`w8a8`) by `rms_b`, shared by the
+        linears that read one input."""
         var y = self._linear_base(name, x, t, k, xb)
         var li = self.lora_index.get(name)
         if li:
@@ -529,8 +601,7 @@ struct Lfm3Text(Movable):
         return y^
 
     def _linear_base(
-        mut self, name: String, x: DeviceBuffer[DT], t: Int, k: Int,
-        xb: Optional[DeviceBuffer[DType.bfloat16]] = None,
+        mut self, name: String, x: DeviceBuffer[DT], t: Int, k: Int, xb: LinIn = LinIn(),
     ) raises -> DeviceBuffer[DT]:
         """`x[t, k] @ W^T` for the bf16 weight `name` ([n, k]): widened into the
         scratch first, or (LFM3_BF16) against the weight in place; after
@@ -543,8 +614,8 @@ struct Lfm3Text(Movable):
         var n = len(wb) // k
         comptime if LF_BF16:
             var xbb: DeviceBuffer[DType.bfloat16]
-            if xb:
-                xbb = xb.value()
+            if xb.bf:
+                xbb = xb.bf.value()
             else:
                 xbb = self.to_bf16(x, t * k)
             var yb = self.new(t * n)
@@ -591,6 +662,14 @@ struct Lfm3Text(Movable):
             self.q8_soff.append(rows_total)
             self.q8_rows.append(n)
             self.q8_cols.append(k)
+            var nm = names[i]
+            self.q8_kind.append(
+                2 if nm.endswith("feed_forward.w2.weight") else (
+                    1 if is_operator_out(nm) else (
+                        3 if nm == "embed_tokens.weight" else 0
+                    )
+                )
+            )
             total += (n * k + _ALIGN - 1) // _ALIGN * _ALIGN
             rows_total += n
             largest = max(largest, n * k)
@@ -659,15 +738,19 @@ struct Lfm3Text(Movable):
             ids, self.w("embed_tokens.weight"), x, Int64(dm), grid_dim=(_blocks(dm), t), block_dim=TPB,
         )
 
-    def quantize_int8(mut self) raises:
+    def quantize_int8(mut self, table: Bool = True, operator_out: Bool = True) raises:
         """Every linear's weight and the tied table to int8, one scale per row
         (`int8_kernels.mojo`), on the device from the bf16 arena — which STAYS
         (the embedding lookup reads it; the backward reads the bf16 weights).
-        `load(int8=True)` is the same quantization without the bf16 copy."""
+        `load(int8=True)` is the same quantization without the bf16 copy.
+        `table` / `operator_out`: the tied table / the operators' output
+        projections too (off: those read their bf16 weights, as `load`'s
+        `int8_table` / `int8_operator_out`)."""
         var names = List[String]()
         var numels = List[Int]()
         for i in range(len(self.names)):
-            if q8_cols(self.cfg, self.names[i]) > 0:
+            var nm = self.names[i]
+            if q8_cols(self.cfg, nm) > 0 and not q8_keeps_bf16(nm, table, operator_out):
                 names.append(self.names[i])
                 numels.append(len(self.dev[i]))
         _ = self._q8_layout(names, numels)
@@ -697,10 +780,10 @@ struct Lfm3Text(Movable):
             self.ctx.enqueue_function[q8_gemv_kernel[4]](x, q, sc, y, Int64(n), Int64(k), grid_dim=g, block_dim=256)
 
     def _linear_q8(
-        mut self, j: Int, x: DeviceBuffer[DT], t: Int, k: Int, xb: Optional[DeviceBuffer[DType.bfloat16]],
+        mut self, j: Int, x: DeviceBuffer[DT], t: Int, k: Int, xb: LinIn,
     ) raises -> DeviceBuffer[DT]:
-        """The int8 route: the GEMV for a few rows; for a chunk, the weight
-        dequantized (bf16 / fp32) and the build's GEMM."""
+        """The int8 route: the GEMV for a few rows; for a chunk, the int8 GEMM
+        (`w8a8`), or the weight dequantized (bf16 / fp32) and the build's GEMM."""
         var n = self.q8_rows[j]
         if k != self.q8_cols[j]:
             raise Error("lfm3 int8: a [" + String(t) + ", " + String(k) + "] input for a weight of " + String(self.q8_cols[j]) + " columns")
@@ -710,12 +793,25 @@ struct Lfm3Text(Movable):
             return y^
         var q = self.q8.create_sub_buffer[DType.int8](self.q8_off[j], n * k)
         var sc = self.q8_scale.create_sub_buffer[DT](self.q8_soff[j], n)
+        comptime if default_accelerator().is_nvidia_gpu():
+            if self.w8a8 and (self.debug & (16 << self.q8_kind[j])) == 0:
+                var xq: DeviceBuffer[DType.int8]
+                var xs: DeviceBuffer[DT]
+                if xb.q:
+                    xq = xb.q.value()
+                    xs = xb.qs.value()
+                else:
+                    xq = self.ctx.enqueue_create_buffer[DType.int8](t * k)
+                    xs = self.new(t)
+                    self.ctx.enqueue_function[q8_act_kernel](x, xq, xs, Int64(k), grid_dim=t, block_dim=TPB)
+                self._gemm_w8a8(j, xq, xs, y, t)
+                return y^
         comptime if LF_BF16:
             var wb = self.q8_bf.create_sub_buffer[DType.bfloat16](0, n * k)
             self.ctx.enqueue_function[q8_dequant_bf16_kernel](q, sc, wb, Int64(k), grid_dim=(_blocks(k // 16), n), block_dim=TPB)
             var xbb: DeviceBuffer[DType.bfloat16]
-            if xb:
-                xbb = xb.value()
+            if xb.bf:
+                xbb = xb.bf.value()
             else:
                 xbb = self.to_bf16(x, t * k)
             cublas_gemm_lp[False, True, DType.bfloat16, DT](self.ctx, y, xbb, wb, t, n, k, 0.0)
@@ -723,6 +819,55 @@ struct Lfm3Text(Movable):
         var wf = self.scratch.create_sub_buffer[DT](0, n * k)
         self.ctx.enqueue_function[q8_dequant_f32_kernel](q, sc, wf, Int64(k), grid_dim=(_blocks(k // 16), n), block_dim=TPB)
         self.gemm_tb(y, x, wf, t, n, k)
+        return y^
+
+    def _gemm_w8a8(self, j: Int, xq: DeviceBuffer[DType.int8], xs: DeviceBuffer[DT], y: DeviceBuffer[DT], t: Int) raises:
+        """`y[t, n] = xs[t] sw[n] (xq[t, :] . wq[n, :])` for weight slot `j`: the int8 GEMM, then both scales."""
+        comptime if default_accelerator().is_nvidia_gpu():
+            var n = self.q8_rows[j]
+            var k = self.q8_cols[j]
+            var acc = self.ctx.enqueue_create_buffer[DType.int32](t * n)
+            cublas_gemm_i8(self.ctx, acc, xq, self.q8.create_sub_buffer[DType.int8](self.q8_off[j], n * k), t, n, k)
+            self.ctx.enqueue_function[q8_out_kernel](
+                acc, xs, self.q8_scale.create_sub_buffer[DT](self.q8_soff[j], n), y, Int64(n),
+                grid_dim=((n + Q8_OUT_W * TPB - 1) // (Q8_OUT_W * TPB), t), block_dim=TPB,
+            )
+        else:
+            raise Error("lfm3: W8A8 runs on NVIDIA (cuBLAS) only")
+
+    def mlp_w8a8_ok(self, t: Int, xin: LinIn) -> Bool:
+        """Whether a chunk's MLP takes `mlp_w8a8`: `w8a8` on the int8 weights, more than Q8_GEMV_MAX rows, the
+        norm's output quantized (`rms_b`), inference without adapters, no `debug` bit on its linears."""
+        comptime if not default_accelerator().is_nvidia_gpu():
+            return False
+        return (
+            self.w8a8 and self.q8_on and t > Q8_GEMV_MAX and (True if xin.q else False) and not self.training
+            and len(self.lora_index) == 0 and (self.debug & (16 | 64 | 128)) == 0 and self.cfg.ff <= Q8_FF_MAX
+        )
+
+    def mlp_w8a8(mut self, pre: String, xin: LinIn, t: Int) raises -> DeviceBuffer[DT]:
+        """`w2(silu(w1 n) * w3 n)` for a chunk on the int8 path, fused between the GEMMs: w1's and w3's int32
+        sums go straight to `q8_swiglu_kernel`, which hands w2 its int8 operand (the unfused route wrote both
+        in fp32, read them, wrote the product, read it again to quantize it: ~150 MB a layer at 836 rows)."""
+        var dm = self.cfg.hidden
+        var ff = self.cfg.ff
+        var j1 = self.q8_index[pre + "feed_forward.w1.weight"]
+        var j3 = self.q8_index[pre + "feed_forward.w3.weight"]
+        var j2 = self.q8_index[pre + "feed_forward.w2.weight"]
+        var xq = xin.q.value()
+        var a1 = self.ctx.enqueue_create_buffer[DType.int32](t * ff)
+        var a3 = self.ctx.enqueue_create_buffer[DType.int32](t * ff)
+        comptime if default_accelerator().is_nvidia_gpu():
+            cublas_gemm_i8(self.ctx, a1, xq, self.q8.create_sub_buffer[DType.int8](self.q8_off[j1], ff * dm), t, ff, dm)
+            cublas_gemm_i8(self.ctx, a3, xq, self.q8.create_sub_buffer[DType.int8](self.q8_off[j3], ff * dm), t, ff, dm)
+        var hq = self.ctx.enqueue_create_buffer[DType.int8](t * ff)
+        var hs = self.new(t)
+        self.ctx.enqueue_function[q8_swiglu_kernel](
+            a1, a3, xin.qs.value(), self.q8_scale.create_sub_buffer[DT](self.q8_soff[j1], ff),
+            self.q8_scale.create_sub_buffer[DT](self.q8_soff[j3], ff), hq, hs, Int64(ff), grid_dim=t, block_dim=TPB,
+        )
+        var y = self.new(t * dm)
+        self._gemm_w8a8(j2, hq, hs, y, t)
         return y^
 
     def weight_bf16(mut self, name: String) raises -> DeviceBuffer[DType.bfloat16]:
@@ -742,17 +887,27 @@ struct Lfm3Text(Movable):
 
     def rms_b(
         mut self, name: String, x: DeviceBuffer[DT], y: DeviceBuffer[DT], rows: Int, dim: Int,
-    ) raises -> Optional[DeviceBuffer[DType.bfloat16]]:
-        """`rms`, and (LFM3_BF16) its output rounded to bf16 by the same kernel,
-        for the GEMMs that read it; None in the other builds."""
+    ) raises -> LinIn:
+        """`rms`, and its output as the GEMMs that read it want it, by the same
+        kernel: quantized to int8 (`w8a8` with the int8 weights, a chunk of more
+        than Q8_GEMV_MAX rows), or rounded to bf16 (LFM3_BF16); empty in the
+        other builds."""
+        comptime if default_accelerator().is_nvidia_gpu():
+            if self.w8a8 and self.q8_on and rows > Q8_GEMV_MAX:
+                var q = self.ctx.enqueue_create_buffer[DType.int8](rows * dim)
+                var s = self.new(rows)
+                self.ctx.enqueue_function[q8_rms_kernel](
+                    x, y, q, s, self.w(name + ".weight"), Int64(dim), self.cfg.eps, grid_dim=rows, block_dim=TPB,
+                )
+                return LinIn(q^, s^)
         comptime if LF_BF16:
             var yb = self.ctx.enqueue_create_buffer[DType.bfloat16](rows * dim)
             self.ctx.enqueue_function[rms_bf16_kernel](
                 x, y, yb, self.w(name + ".weight"), Int64(dim), self.cfg.eps, grid_dim=rows, block_dim=TPB,
             )
-            return Optional(yb^)
+            return LinIn(yb^)
         self.rms(name, x, y, rows, dim)
-        return None
+        return LinIn()
 
     def rms(mut self, name: String, x: DeviceBuffer[DT], y: DeviceBuffer[DT], rows: Int, dim: Int) raises:
         self.ctx.enqueue_function[rms_kernel](
@@ -913,19 +1068,26 @@ struct Lfm3Text(Movable):
             var fnb = self.rms_b(p + "ffn_norm", x, fnrm, t, dm)
             if self.training:
                 self.cur["fn"] = fnrm
+            if self.mlp_w8a8_ok(t, fnb):
+                var fq = self.mlp_w8a8(p, fnb, t)
+                self.rms(p + "post_ffn_norm", fq, fq, t, dm)
+                self.ctx.enqueue_function[add_kernel](x, fq, Int64(t * dm), grid_dim=_blocks(t * dm), block_dim=TPB)
+                if keep_taps:
+                    taps.append(self._copy(x, t * dm))
+                continue
             var a1 = self.linear(p + "feed_forward.w1", fnrm, t, dm, fnb)
             var a3 = self.linear(p + "feed_forward.w3", fnrm, t, dm, fnb)
             var ff = self.cfg.ff
             if self.training:
                 self.cur["a1"] = self._copy(a1, t * ff)
                 self.cur["a3"] = a3
-            var swb = Optional[DeviceBuffer[DType.bfloat16]](None)
+            var swb = LinIn()
             comptime if LF_BF16:
                 if not self.training and len(self.lora_index) == 0 and not self.q8_on:  # nothing reads silu(a1) a3 in fp32 (the int8 GEMV does)
                     var b = self.ctx.enqueue_create_buffer[DType.bfloat16](t * ff)
                     self.ctx.enqueue_function[swiglu_bf16_kernel](a1, a3, b, Int64(t * ff), grid_dim=_blocks(t * ff), block_dim=TPB)
-                    swb = Optional(b^)
-            if not swb:
+                    swb = LinIn(b^)
+            if not swb.bf:
                 self.ctx.enqueue_function[swiglu_kernel](a1, a3, a1, Int64(t * ff), grid_dim=_blocks(t * ff), block_dim=TPB)
             if self.training:
                 self.cur["sw"] = a1

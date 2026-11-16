@@ -84,16 +84,23 @@ struct D1(Movable):
         self.traced = 0
 
     @staticmethod
-    def load(var ctx: DeviceContext, dir: String, vision: Bool = False, audio: Bool = False) raises -> D1:
+    def load(
+        var ctx: DeviceContext, dir: String, vision: Bool = False, audio: Bool = False, w8a8: Bool = False,
+    ) raises -> D1:
         """`vision`: load the picture encoder too (~0.4 GB more on the device);
-        `audio`: the audio encoder (d1-Omni, ~0.2 GB)."""
+        `audio`: the audio encoder (d1-Omni, ~0.2 GB); `w8a8`: the backbone's
+        linears in int8, run as int8 GEMMs on int8 activations (NVIDIA;
+        `noeira/llm/lfm3/model.mojo`, W8A8), the head's table and the
+        operators' output projections kept bf16 (where int8 cost the answers
+        most)."""
         var vis = Optional[Lfm3Vision](None)
         if vision:
             vis = Optional(Lfm3Vision.load(ctx, dir))
         var aud = Optional[Lfm3Audio](None)
         if audio:
             aud = Optional(Lfm3Audio.load(ctx, dir))
-        var lm = Lfm3Text.load(ctx^, dir)
+        var lm = Lfm3Text.load(ctx^, dir, int8=w8a8, int8_table=False, int8_operator_out=False)
+        lm.w8a8 = w8a8
         var tok = ByteLevelBPE.load(dir + "/tokenizer.json")
         var cal = load_json(dir + "/calibration.json")
         var t = cal.number(cal.field(cal.root(), "default"))

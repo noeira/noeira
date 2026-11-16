@@ -1,6 +1,6 @@
 """d1's System One in Mojo (`noeira.llm.d1`) against d1-2B's own code.
 
-    ./test_d1_system_one_gpu [--prompt-only] [d1 dir] [ref dir]
+    ./test_d1_system_one_gpu [--prompt-only | --w8a8] [d1 dir] [ref dir]
       defaults: ~/.cache/noeira/local-ai/d1/d1-2B (or ~/.cache/noeira/d1 with --prompt-only)
                 and ~/.cache/noeira/d1/ref
 
@@ -13,6 +13,10 @@ The three cases of `tools/d1/dump_d1_reference.py`, asked again here:
 2. ANSWERS (the model; the Orin): `system_one`'s answers equal `answers.json` —
    the same choice and score level, every probability within 1e-4, the same
    input-token count.
+
+`--w8a8`: step 2 with `D1.load(w8a8=True)` (int8 weights and activations,
+docs/NN_MODEL_PORTS_PLAN.md §12.8.8): the same picks, every probability within
+W8A8_BOUND of d1's fp32 answers.
 """
 
 from std.os import getenv
@@ -31,6 +35,13 @@ from noeira.llm.lfm3.model import LF_BF16
 comptime PROB_BOUND: Float64 = 3e-3 if LF_BF16 else 1e-4
 """fp32: measured <= 1.8e-6. LFM3_BF16: measured <= 8.1e-4 (the Orin,
 2026-11-10), against d1's own fp32 answers; the picks are equal either way."""
+
+comptime W8A8_BOUND: Float64 = 0.1
+"""`--w8a8`: measured 0.014 / 0.0015 / 0.066 on the three cases (the Orin,
+2026-11-16; the picks equal). On 88 of the room demo's requests W8A8 moved
+probabilities by up to 0.086 against bf16 (`benchmarks/bench_d1_w8a8_gpu.mojo`).
+A wrong operand or scale in the backbone moves them by far more (the plan's
+mutants)."""
 
 comptime ROOM_STATE = """{"robot": {"at": "door", "facing": "kitchen", "doing": "standing"}, "places": {"fridge": "3.1 m ahead, slightly left", "door": "here", "table": "2.0 m to the right", "sofa": "4.5 m behind"}, "heard": "Can you go to the fridge and wait there?", "recently": ["walked to the door", "heard: hello robot"]}"""
 comptime ROOM_Q = """{"addressed": {"type": "noul", "instructions": "Is the speaker asking the robot to do something?"}, "destination": {"type": "choice", "instructions": "Where should the robot walk?", "criteria": {"fridge": "walk to the fridge", "door": "walk to the door", "table": "walk to the table", "sofa": "walk to the sofa", "nowhere": "do not walk anywhere"}}, "urgency": {"type": "score", "instructions": "How urgent is the request?", "criteria": ["not urgent", "somewhat urgent", "very urgent"]}}"""
@@ -83,10 +94,13 @@ def same_ints(a: List[Int], b: List[Float64]) -> Bool:
 def main() raises:
     var args = argv()
     var prompt_only = False
+    var w8a8 = False
     var pos = List[String]()
     for i in range(1, len(args)):
         if String(args[i]) == "--prompt-only":
             prompt_only = True
+        elif String(args[i]) == "--w8a8":
+            w8a8 = True
         else:
             pos.append(String(args[i]))
     var home = getenv("HOME")
@@ -98,7 +112,8 @@ def main() raises:
     var questions: List[String] = [ROOM_Q, FR_Q, many_questions()]
     var fails = 0
 
-    print("d1 System One in Mojo vs d1-2B's own code", "(LFM3_BF16)" if LF_BF16 else "(fp32)")
+    print("d1 System One in Mojo vs d1-2B's own code", "(LFM3_BF16)" if LF_BF16 else "(fp32)", "W8A8" if w8a8 else "")
+    var bound = W8A8_BOUND if w8a8 else PROB_BOUND
     var tok = ByteLevelBPE.load(model_dir + "/tokenizer.json")
     # 1. prompts and rows
     for c in range(3):
@@ -149,7 +164,7 @@ def main() raises:
 
     # 2. answers
     var t0 = perf_counter_ns()
-    var d1 = D1.load(DeviceContext(), model_dir)
+    var d1 = D1.load(DeviceContext(), model_dir, w8a8=w8a8)
     print("  d1 loaded in", (perf_counter_ns() - t0) // 1_000_000, "ms; temperature", d1.temperature)
     for c in range(3):
         var t1 = perf_counter_ns()
@@ -186,7 +201,7 @@ def main() raises:
                 worst = max(worst, abs(got.number(gk) - want.number(want.at(wp, k))))
         var wu = want.integer(want.field(want.field(want.root(), "usage"), "input_tokens"))
         var gu = got.integer(got.field(got.field(got.root(), "usage"), "input_tokens"))
-        check(fails, same and worst < PROB_BOUND and wu == gu,
+        check(fails, same and worst < bound and wu == gu,
               names[c] + ": " + String(want.size(wa)) + " answers, same picks, worst probability |d| = " + String(worst)
               + ", " + String(gu) + " tokens (" + String(ms) + " ms)")
     if fails > 0:

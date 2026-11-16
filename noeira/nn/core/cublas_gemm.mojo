@@ -63,6 +63,7 @@ from _cublas.cublas import (
     cublasSetStream,
     cublasHandle_t,
 )
+from _cublas.dtype import DataType
 
 from noeira.nn.constants import DT
 
@@ -241,6 +242,61 @@ def cublas_gemm_lp[
     place with `beta = 1`. Accumulation is fp32 (`COMPUTE_32F`) either way;
     bf16 operands run on the tensor cores without a TF32 mode."""
     _gemm_ex[TA, TB, IN_DT, OUT_DT, False](c, dst, a, b, M, N, K, beta)
+
+
+def cublas_gemm_i8(
+    c: DeviceContext,
+    dst: DeviceBuffer[DType.int32],
+    a: DeviceBuffer[DType.int8],
+    b: DeviceBuffer[DType.int8],
+    M: Int,
+    N: Int,
+    K: Int,
+) raises:
+    """`dst[M, N] = a[M, K] @ b[N, K]^T`, int8 operands, exact int32 sums, on the
+    int8 tensor cores (`COMPUTE_32I`). Row-major as `cublas_gemm`; only this
+    one transpose form: it is cuBLAS's "TN" in column-major, the form int8
+    GEMMs require. cuBLAS also wants `K` and the leading dimensions to be
+    multiples of 4 (checked here)."""
+    comptime assert default_accelerator().is_nvidia_gpu(), "cuBLAS is NVIDIA-only"
+    if K % 4 != 0 or N % 4 != 0:
+        raise Error(String("cublas_gemm_i8: K (", K, ") and N (", N, ") must be multiples of 4"))
+    var ws = _shared_workspace(c)
+    var handle: cublasHandle_t[MutAnyOrigin]
+    comptime if CUBLAS_MAX_HANDLE:
+        handle = _get_global_handle[DT, Backend.CUBLAS](c)._get_cublas()
+    else:
+        handle = cublas_handle(c)
+    check_cublas_error(
+        cublasSetWorkspace(handle, _ffi_void_ptr(ws.unsafe_ptr()), CUBLAS_WS_BYTES)
+    )
+    check_cublas_error(cublasSetMathMode(handle, cublasMath_t.CUBLAS_DEFAULT_MATH))
+    var alpha_v = Int32(1)
+    var beta_v = Int32(0)
+    check_cublas_error(
+        cublasGemmEx(
+            handle,
+            _convert_to_cublas_transpose(True),
+            _convert_to_cublas_transpose(False),
+            Int32(N),
+            Int32(M),
+            Int32(K),
+            Pointer(to=alpha_v).unsafe_bitcast[NoneType]().as_imm().as_unsafe_any_origin(),
+            _ffi_void_ptr(b.unsafe_ptr()),
+            DataType.R_8I,
+            Int32(K),
+            _ffi_void_ptr(a.unsafe_ptr()),
+            DataType.R_8I,
+            Int32(K),
+            Pointer(to=beta_v).unsafe_bitcast[NoneType]().as_imm().as_unsafe_any_origin(),
+            _ffi_void_ptr(dst.unsafe_ptr()),
+            DataType.R_32I,
+            Int32(N),
+            ComputeType.COMPUTE_32I,
+            Algorithm.DEFAULT,
+        ),
+        msg=String("cublas_gemm_i8: [", M, "x", N, "] K=", K),
+    )
 
 
 def _gemm_ex[

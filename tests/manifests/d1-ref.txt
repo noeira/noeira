@@ -31,7 +31,17 @@ tests/llm/test_lfm3_d1_reference_gpu.mojo
 # cases' prompts text-exact and rows id-exact (`--prompt-only` runs this part
 # with the tokenizer alone, on any machine), then on the device the answers —
 # same picks and levels, probabilities within 1e-4 (measured <= 1.8e-6).
+# Its `--w8a8` leg (run by hand: `./build/t --w8a8`) loads d1 W8A8
+# (`D1.load(w8a8=True)`, docs/NN_MODEL_PORTS_PLAN.md §12.8.8): the same picks,
+# probabilities within 0.1 of d1's fp32 answers (measured 0.014 / 0.0015 / 0.066).
 tests/llm/test_d1_system_one_gpu.mojo
+
+# W8A8's kernels (noeira/llm/lfm3/int8_kernels.mojo) and cuBLAS's int8 GEMM
+# against the host: the per-token int8 rows and scales exact, the norm-fused
+# quantization exact, the int32 sums exact, the scaled output within 8e-8,
+# the fused SwiGLU equal to the unfused chain bit for bit; five mutants caught.
+# No reference needed; NVIDIA only (cuBLAS), build with `-D LFM3_BF16=1`.
+tests/llm/test_lfm3_w8a8_gpu.mojo
 
 # ⚠ Both device gates have a bf16 build, `-D LFM3_BF16=1` (NVIDIA): GEMMs on the
 # tensor cores against the bf16 weights in place, activations rounded to bf16 at

@@ -21,7 +21,9 @@ is_json, questions, pictures)`, `Picture`s RGB24 with sides multiples of 32
 
 Spec: `native` (`~/.cache/noeira/local-ai/d1/d1-2B`, the Orin's copy) or
 `native:<dir>` — with the vision tower (~0.4 GB more on the device);
-`native-text` / `native-text:<dir>` without it (pictures then fail). Build with
+`native-text` / `native-text:<dir>` without it (pictures then fail). Any of
+them with `+w8a8` at the end: the backbone's linears in int8, run on int8
+activations (`D1.load(w8a8=True)`; NVIDIA). Build with
 `-D LFM3_BF16=1` on NVIDIA for the tensor-core GEMMs (75 tokens ~95 ms, 250
 ~115 ms on the Orin).
 
@@ -50,15 +52,17 @@ comptime DS_REP_SLOT: Int = 64 * 1024
 struct D1Model(LocalModel):
     var dir: String
     var vision: Bool
+    var w8a8: Bool
     var d1: Optional[D1]
 
-    def __init__(out self, var dir: String, vision: Bool = True):
+    def __init__(out self, var dir: String, vision: Bool = True, w8a8: Bool = False):
         self.dir = dir^
         self.vision = vision
+        self.w8a8 = w8a8
         self.d1 = None
 
     def load(mut self) raises:
-        self.d1 = D1.load(DeviceContext(), self.dir, self.vision)
+        self.d1 = D1.load(DeviceContext(), self.dir, self.vision, w8a8=self.w8a8)
 
     def warm(mut self) raises:
         var q = String('{"x": {"type": "noul", "instructions": "Is this a test?"}}')
@@ -116,27 +120,30 @@ struct D1Service(Movable, DecisionService):
     var call: LocalCall
     var bg: BackgroundThread[LocalWorker[D1Model]]
 
-    def __init__(out self, var dir: String = String(""), vision: Bool = True) raises:
+    def __init__(out self, var dir: String = String(""), vision: Bool = True, w8a8: Bool = False) raises:
         if dir.byte_length() == 0:
             dir = getenv("HOME") + "/.cache/noeira/local-ai/d1/d1-2B"
         var call = LocalCall(DS_REQ_SLOT, DS_REP_SLOT)
-        var bg = BackgroundThread(LocalWorker(D1Model(dir^, vision), call))
+        var bg = BackgroundThread(LocalWorker(D1Model(dir^, vision, w8a8), call))
         self.call = call^
         self.bg = bg^
 
     @staticmethod
-    def from_spec(spec: String) raises -> D1Service:
+    def from_spec(full: String) raises -> D1Service:
         """`native` / `native:<checkpoint dir>` (with the vision tower), or
-        `native-text` / `native-text:<dir>` (text only)."""
+        `native-text` / `native-text:<dir>` (text only); `+w8a8` at the end:
+        W8A8 (the module note)."""
+        var w8 = full.endswith("+w8a8")
+        var spec = String(full[byte=0:full.byte_length() - 5]) if w8 else full.copy()
         if spec == "native":
-            return D1Service()
+            return D1Service(String(""), True, w8)
         if spec.startswith("native:"):
-            return D1Service(String(spec[byte=7:]))
+            return D1Service(String(spec[byte=7:]), True, w8)
         if spec == "native-text":
-            return D1Service(String(""), False)
+            return D1Service(String(""), False, w8)
         if spec.startswith("native-text:"):
-            return D1Service(String(spec[byte=12:]), False)
-        raise Error("decision: D1Service takes 'native[-text]' or 'native[-text]:<dir>', not '" + spec + "'")
+            return D1Service(String(spec[byte=12:]), False, w8)
+        raise Error("decision: D1Service takes 'native[-text][:<dir>][+w8a8]', not '" + full + "'")
 
     def state(self) -> Int:
         return self.call.state()
