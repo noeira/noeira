@@ -27,15 +27,24 @@ seed, so the same request gives the same reply). The system prompt is computed
 once and reused while it does not change (`Lfm3Chat.keep_system`): a reply
 costs its own messages, not the robot's persona.
 
-Not served: tools, pictures, streaming (`poll` returns "" and the text comes
-with `result`; a short spoken reply is ~0.5 s).
+Not served: tools, pictures.
+
+STREAMED: `poll` returns the reply's text as it is written, token by token
+(what arrived since the last poll), so a voice can say the first sentence while
+the next is generated (docs/NN_MODEL_PORTS_PLAN.md §12.8.7, L2). `result` still
+carries the whole answer, and IT is the answer: the stream is the raw decode
+cut at a stray `</think>` (where `Lfm3Chat` ends the reply), with a character
+split between two tokens held back until its last byte comes. A third ring
+carries it, each piece tagged with its call's stream id, so the text of a
+cancelled call still being written is never read as the next call's.
 
 `prepare(system)` computes a system prompt ahead of the request that will use
 it (`Lfm3Chat.prepare`); the request then keeps the part of its own prompt
 that is already in the cache, matched by tokens (`ChatResponse.cached_tokens`).
 
-The request, one message on the ring: `[u32 max_tokens] system \\0` then per
-message `role (u|a) text \\0`; no message and `max_tokens` 0 = `prepare`. The
+The request, one message on the ring: `[u32 max_tokens][u32 stream id] system \\0`
+then per message `role (u|a) text \\0`; no message and `max_tokens` 0 = `prepare`.
+A streamed piece, on the stream ring: `svc_push` framing, its id = the stream id. The
 reply: `[u32 input tokens][u32 output tokens][u8 ended][u32 first token us]
 [u32 cached tokens] text`.
 """
@@ -45,7 +54,8 @@ from std.time import perf_counter_ns
 from max.gpu.host import DeviceContext
 
 from noeira.ai.chat import ChatService, ChatMessage, ChatResponse, ToolSpec
-from noeira.ai.local_service import LocalCall, LocalModel, LocalWorker
+from noeira.ai.local_service import LocalCall, LocalModel, LocalWorker, svc_pop, svc_push
+from noeira.core.concurrent.ring import SharedRing
 from noeira.core.concurrent.thread import sleep_us
 from noeira.core.concurrent.worker import BackgroundThread
 from .chat import Lfm3Chat, ChatSettings
@@ -57,6 +67,27 @@ comptime CS_CAP: Int = 4096
 """The longest conversation one request may carry, in tokens."""
 comptime CS_HEAD: Int = 17
 """The reply frame's bytes before its text."""
+comptime CS_REQ_HEAD: Int = 8
+"""The request's bytes before its system prompt: max_tokens, stream id."""
+comptime CS_STREAM_SLOTS: Int = 64
+comptime CS_STREAM_SLOT: Int = 4096
+"""A streamed piece is one token's text (a few bytes); 64 slots hold ~1.3 s of
+reply at 23 ms a token if the caller missed polls. A full ring loses nothing:
+the piece waits and goes with the next token's."""
+comptime THINK_MARK = "</think>"
+
+
+def stream_text(raw: String) -> String:
+    """What of the raw decode so far may be streamed: up to a `</think>` (where
+    the reply ends), and without a trailing U+FFFD (a character whose last
+    bytes are in the next token)."""
+    var k = raw.find(THINK_MARK)
+    var t = String(raw[byte=0:k]) if k >= 0 else raw.copy()
+    var b = t.as_bytes()
+    var n = len(b)
+    if n >= 3 and Int(b[n - 3]) == 0xEF and Int(b[n - 2]) == 0xBF and Int(b[n - 1]) == 0xBD:
+        return String(t[byte=0 : n - 3])
+    return t^
 
 
 def _put_u32(mut b: List[UInt8], v: Int):
@@ -85,15 +116,36 @@ def _find0(ref b: List[UInt8], start: Int) -> Int:
     return -1
 
 
+def _stream_piece(ring: SharedRing, ref c: Lfm3Chat, sid: Int, mut sent: Int):
+    """Push what was written since `sent` bytes (the module note). A full ring
+    or an oversize piece pushes nothing: the piece goes with the next token."""
+    if sid == 0:
+        return
+    var t = stream_text(c.reply_text())
+    var n = t.byte_length()
+    if n <= sent:
+        return
+    var piece = List[UInt8](capacity=n - sent)
+    var tb = t.as_bytes()
+    for i in range(sent, n):
+        piece.append(tb[i])
+    if svc_push(ring, Int64(sid), 0, 0, piece):
+        sent = n
+
+
 struct Lfm3ChatModel(LocalModel):
     var dir: String
     var int8: Bool
     var chat: Optional[Lfm3Chat]
+    var stream: SharedRing
+    """The reply's text as it is written (the module note); the service reads it."""
 
-    def __init__(out self, var dir: String, int8: Bool):
+    def __init__(out self, var dir: String, int8: Bool, stream: SharedRing):
         self.dir = dir^
         self.int8 = int8
         self.chat = None
+        self.stream = stream
+
 
     def load(mut self) raises:
         var c = Lfm3Chat.load(DeviceContext(), self.dir, CS_CAP, self.int8)
@@ -113,16 +165,17 @@ struct Lfm3ChatModel(LocalModel):
     def serve(mut self, ref request: List[UInt8]) raises -> List[UInt8]:
         """The request (module note) -> the reply's frame."""
         var n = len(request)
-        if n < 5:
-            raise Error("lfm3 chat: a request is [u32 max_tokens] system \\0 (role text \\0)*")
+        if n < CS_REQ_HEAD + 1:
+            raise Error("lfm3 chat: a request is [u32 max_tokens][u32 stream id] system \\0 (role text \\0)*")
         var max_tokens = _get_u32(request, 0)
-        var cut = _find0(request, 4)
+        var sid = _get_u32(request, 4)
+        var cut = _find0(request, CS_REQ_HEAD)
         if cut < 0:
             raise Error("lfm3 chat: no end to the system prompt")
         ref c = self.chat.value()
         if cut + 1 >= n and max_tokens == 0:
             # `prepare`: the system prompt into the cache, nothing generated
-            c.prepare(_text(request, 4, cut))
+            c.prepare(_text(request, CS_REQ_HEAD, cut))
             var p = List[UInt8](capacity=CS_HEAD)
             _put_u32(p, c.head_len)
             _put_u32(p, 0)
@@ -130,7 +183,7 @@ struct Lfm3ChatModel(LocalModel):
             _put_u32(p, 0)
             _put_u32(p, c.reused)
             return p^
-        c.reset(_text(request, 4, cut))
+        c.reset(_text(request, CS_REQ_HEAD, cut))
         var cached = c.reused
         var at = cut + 1
         var last = String("")
@@ -157,8 +210,10 @@ struct Lfm3ChatModel(LocalModel):
         var t0 = perf_counter_ns()
         c.start(s)
         var first_us = Int(perf_counter_ns() - t0) // 1000
+        var sent = 0
+        _stream_piece(self.stream, c, sid, sent)
         while c.next():
-            pass
+            _stream_piece(self.stream, c, sid, sent)
         # ended by the model: at `<|im_end|>`, or at a stray `</think>` (`Lfm3Chat.think_end`)
         var ended = len(c.reply) > 0 and (c.reply[len(c.reply) - 1] == c.eos or c.reply[len(c.reply) - 1] == c.think_end)
         var text = c.answer_text()  # after a stray `</think>`, if the model wrote one
@@ -175,6 +230,9 @@ struct Lfm3ChatModel(LocalModel):
 
 struct Lfm3ChatService(Movable, ChatService):
     var call: LocalCall
+    var stream: SharedRing
+    var sid: Int
+    """The stream id of the call in flight (one per `start`; 0 = `prepare`, never streamed)."""
     var bg: BackgroundThread[LocalWorker[Lfm3ChatModel]]
     var max_tokens: Int
     var started: Bool
@@ -187,8 +245,11 @@ struct Lfm3ChatService(Movable, ChatService):
         if dir.byte_length() == 0:
             dir = getenv("HOME") + "/.cache/noeira/local-ai/lfm3/LFM3-1.7B"
         var call = LocalCall(CS_REQ_SLOT, CS_REP_SLOT)
-        var bg = BackgroundThread(LocalWorker(Lfm3ChatModel(dir^, int8), call))
+        var stream = SharedRing(CS_STREAM_SLOTS, CS_STREAM_SLOT)
+        var bg = BackgroundThread(LocalWorker(Lfm3ChatModel(dir^, int8, stream), call))
         self.call = call^
+        self.stream = stream
+        self.sid = 0
         self.bg = bg^
         self.max_tokens = 256
         self.started = False
@@ -241,6 +302,7 @@ struct Lfm3ChatService(Movable, ChatService):
         self._drop_prepare()
         var b = List[UInt8](capacity=64 + system.byte_length())
         _put_u32(b, 0)
+        _put_u32(b, 0)   # a prepare is not streamed
         for x in system.as_bytes():
             if x == 0:
                 raise Error("chat (LFM3): a NUL byte in the system prompt")
@@ -271,12 +333,14 @@ struct Lfm3ChatService(Movable, ChatService):
         tools: List[ToolSpec] = List[ToolSpec](),
         stream: Bool = True,
     ) raises:
-        """Queue the reply (never blocks). `stream` is accepted and ignored: the
-        text comes with `result`."""
+        """Queue the reply (never blocks). Its text streams through `poll`
+        whatever `stream` says; `result` has the whole answer."""
         if len(tools) > 0:
             raise Error("chat (LFM3): tools are not served")
+        self.sid += 1
         var b = List[UInt8](capacity=256)
         _put_u32(b, self.max_tokens)
+        _put_u32(b, self.sid)
         for x in system.as_bytes():
             if x == 0:
                 raise Error("chat (LFM3): a NUL byte in the system prompt")
@@ -306,9 +370,11 @@ struct Lfm3ChatService(Movable, ChatService):
             if self.preparing and self.call.poll():
                 self._drop_prepare()
             return String("")
+        # ⚠ THE CALL'S END IS READ BEFORE THE STREAM IS DRAINED: the worker pushes every piece before
+        # its reply, so once the reply is seen, draining after it gets the last piece too.
         if self.call.poll():
             self.over = True
-            return String("")
+            return self._drain()
         var waited = 0
         while waited < timeout_ms * 1000:
             _ = sleep_us(500)
@@ -316,7 +382,19 @@ struct Lfm3ChatService(Movable, ChatService):
             if self.call.poll():
                 self.over = True
                 break
-        return String("")
+        return self._drain()
+
+    def _drain(mut self) -> String:
+        """The streamed text of the call in flight since the last drain; pieces
+        of an earlier (cancelled) call are dropped."""
+        var out = String("")
+        while True:
+            var m = svc_pop(self.stream)
+            if not m:
+                break
+            if Int(m.value().id) == self.sid:
+                out += _text(m.value().payload, 0, len(m.value().payload))
+        return out^
 
     def done(self) -> Bool:
         """True once the call is over (either way), or none was started.

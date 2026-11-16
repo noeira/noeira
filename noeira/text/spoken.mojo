@@ -69,3 +69,58 @@ def spoken_text(reply: String) -> String:
     for k in range(start, len(out)):
         t.append(out[k])
     return String(unsafe_from_utf8=Span(t))
+
+
+def spoken_sentence_end(text: String, start: Int) -> Int:
+    """Where the first finished sentence of `text[start:]` ends (a byte index
+    past its last mark), or -1 while none has finished. For a reply spoken
+    sentence by sentence while it is still being written.
+
+    A sentence is finished by `.`, `!`, `?` or `…` (with the marks, quotes and
+    brackets right after them: `?!`, `...`, `.»`, `!)`) FOLLOWED BY A BLANK, or
+    by a line break. ⚠ THE BLANK IS WHAT WAITS FOR THE NEXT TOKEN: `2.5`,
+    `3,5 m.` at the very end and `Noé.` with nothing after it are not
+    finished yet, as the next token can still be `5` or `com`. The end of the
+    reply says the rest (`spoken_text` of what is left). French puts a blank
+    BEFORE `!` and `?` (« Oui ! »): the blank after the mark still closes it.
+    A piece of blanks only is not a sentence. `M. Dupont` cuts after `M.`
+    (rare in a robot's reply; it is said in two pieces, not lost)."""
+    var b = text.as_bytes()
+    var n = len(b)
+    var i = start
+    var seen_word = False
+    while i < n:
+        var c = Int(b[i])
+        if c == 10:
+            if seen_word:
+                return i + 1
+            i += 1
+            continue
+        var mark = c == 46 or c == 33 or c == 63          # . ! ?
+        var mlen = 1
+        if c == 0xE2 and i + 2 < n and Int(b[i + 1]) == 0x80 and Int(b[i + 2]) == 0xA6:
+            mark = True                                   # … U+2026
+            mlen = 3
+        if mark and seen_word:
+            var j = i + mlen
+            # more marks, closing quotes and brackets: `?!`, `...`, `."`, `.»` (C2 BB), `!)`
+            while j < n:
+                var d = Int(b[j])
+                if d == 46 or d == 33 or d == 63 or d == 34 or d == 39 or d == 41 or d == 93:
+                    j += 1
+                elif d == 0xC2 and j + 1 < n and Int(b[j + 1]) == 0xBB:
+                    j += 2
+                elif d == 0xE2 and j + 2 < n and Int(b[j + 1]) == 0x80 and Int(b[j + 2]) == 0xA6:
+                    j += 3
+                else:
+                    break
+            if j < n and (Int(b[j]) == 32 or Int(b[j]) == 10 or Int(b[j]) == 9):
+                return j
+            if j >= n:
+                return -1   # the mark is the last thing written: wait for what comes after it
+            i = j
+            continue
+        if c != 32 and c != 9 and not mark:
+            seen_word = True
+        i += mlen if mark else 1
+    return -1

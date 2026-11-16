@@ -84,9 +84,9 @@ from noeira.ai.picture import Picture
 from noeira.ai.speech import (
     SpeechToText, TextToSpeech, SpeechToTextService, TextToSpeechService,
 )
-from noeira.io.fileio import write_file_atomic
+from noeira.io.fileio import remove_file, write_file_atomic
 from noeira.io.wav import WavAudio
-from noeira.text.spoken import spoken_text
+from noeira.text.spoken import spoken_sentence_end, spoken_text
 from noeira.envs.robots.g1_command_bank import G1CommandBank
 from noeira.envs.robots.g1_command_language import (
     g1_command_questions, g1_decide, g1_decide_chain, g1_command_state,
@@ -265,6 +265,17 @@ struct G1VoiceConfig(Copyable, Movable):
     `os_voice_for(lang)`. Otherwise the voice's name for the backend in use."""
     var tts_dl: Float64
     """Seconds a synthesis may take before the OS voice says it instead."""
+    var stream_reply: Bool
+    """With a synthesiser (`tts_spec`): the reply is said SENTENCE BY SENTENCE
+    as the reply model writes it, each synthesised while the one before plays
+    (docs/NN_MODEL_PORTS_PLAN.md §12.8.7, L2). On by default; off = the whole
+    reply, synthesised once it is written (as before). The OS voice says the
+    whole reply either way."""
+    var tts_no_play: Bool
+    """Synthesise but do not play: each piece "plays" for its WAV's length, in
+    silence, and the microphone is never gated by it. For timing the voice on a
+    headless replay (`--mic-input`): the note says when the first audio would
+    have started."""
     var dec_spec: String
     """The decision backend's spec (`DEC.from_spec`): for `JevClient`, "" =
     hosted Jev or `JEV_URL`; for `D1Service`, `native` / `native:<dir>`."""
@@ -362,6 +373,8 @@ struct G1VoiceConfig(Copyable, Movable):
         self.tts_spec = String("")
         self.tts_voice = String("")
         self.tts_dl = VL_TTS_DEADLINE_S
+        self.stream_reply = True
+        self.tts_no_play = False
         self.dec_spec = String("")
         self.memory_route = False
         self.dest_words = List[String]()
@@ -408,6 +421,27 @@ struct G1VoiceLoopOf[
     var tts_text: String
     """What is being synthesised, for the OS-voice fallback."""
     var tts_t0: Int
+    var tts_queue: List[String]
+    """Pieces of a reply waiting for the synthesiser (one synthesis at a time)."""
+    var tts_ready: List[String]
+    """Synthesised pieces waiting for the one playing to end: their WAV files."""
+    var tts_ready_s: List[Float64]
+    """Their lengths in seconds (`tts_no_play` plays them in silence that long)."""
+    var play_until: Int
+    """`tts_no_play`: when the piece "playing" ends (perf_counter_ns)."""
+    var stream_raw: String
+    """The reply's text streamed so far (`LLM.poll`)."""
+    var stream_used: Int
+    """Bytes of `stream_raw` already sent to be said."""
+    var stream_parts: Int
+    """Pieces of the current reply sent to be said."""
+    var stream_cut: Bool
+    """The caller said something over the streamed reply (`say`): the rest of
+    the reply is not said."""
+    var audio_wait: Bool
+    """The reply's first audio has not started yet: the note says when it does."""
+    var reply_t0: Int
+    """When the reply model was asked (the first audio is timed from it)."""
     var stt: Self.STT
     var jev: Self.DEC
     var llm: Self.LLM
@@ -544,6 +578,16 @@ struct G1VoiceLoopOf[
         self.tts_busy = False
         self.tts_text = String("")
         self.tts_t0 = 0
+        self.tts_queue = List[String]()
+        self.tts_ready = List[String]()
+        self.tts_ready_s = List[Float64]()
+        self.play_until = 0
+        self.stream_raw = String("")
+        self.stream_used = 0
+        self.stream_parts = 0
+        self.stream_cut = False
+        self.audio_wait = False
+        self.reply_t0 = 0
         # ⚠ the capture is NOT opened here: `poll` opens it the first time it
         # runs (the `mic` field's note). A device that cannot be opened is
         # reported there, in `mic_dead` and the note, as a dead one is.
@@ -638,6 +682,16 @@ struct G1VoiceLoopOf[
         self.tts_busy = move.tts_busy
         self.tts_text = move.tts_text^
         self.tts_t0 = move.tts_t0
+        self.tts_queue = move.tts_queue^
+        self.tts_ready = move.tts_ready^
+        self.tts_ready_s = move.tts_ready_s^
+        self.play_until = move.play_until
+        self.stream_raw = move.stream_raw^
+        self.stream_used = move.stream_used
+        self.stream_parts = move.stream_parts
+        self.stream_cut = move.stream_cut
+        self.audio_wait = move.audio_wait
+        self.reply_t0 = move.reply_t0
         self.stt = move.stt^
         self.jev = move.jev^
         self.llm = move.llm^
@@ -712,71 +766,161 @@ struct G1VoiceLoopOf[
     def say(mut self, text: String):
         """Speak, and never raise. ⚠ THE ONLY WAY THE CALLER SHOULD SPEAK.
         The echo gate reads `voice.speaking()`, so a caller that owned its own
-        TTS would reopen §12.56's race — two voices and one "done"."""
+        TTS would reopen §12.56's race — two voices and one "done".
+        ⚠ IT ENDS A STREAMED REPLY: its sentences still to come are not said."""
+        self.stream_cut = True
+        self._speak(text, False)
+
+    def _speak(mut self, text: String, reply: Bool):
+        """`say`; `reply` = the first piece of the reply being timed (the note
+        says when its audio starts), anything else stops that timing."""
         # ⚠ ONE UTTERANCE AT A TIME, as `LocalVoice` says: a new reply cuts
-        # off the one playing AND the one still being synthesised
+        # off the one playing AND the one still being synthesised, AND the
+        # pieces of a streamed reply still waiting
         self._tts_cancel()
+        if not reply:
+            self.audio_wait = False
         try:
             self.voice.stop()
         except:
             pass
-        var started = False
         if self.tts:
+            self.tts_queue.append(text)
+            self._tts_next()
+            if self.tts_busy:
+                self.mute_until = perf_counter_ns() + _vl_ns(VL_ECHO_TAIL_S)
+                return
+            self.tts_queue = List[String]()
+        try:
+            self.voice.say(text)
+        except:
+            pass
+        self.mute_until = perf_counter_ns() + _vl_ns(VL_ECHO_TAIL_S)
+
+    def say_more(mut self, text: String):
+        """The next piece of what is being said (a streamed reply's next
+        sentence): synthesised as soon as the synthesiser is free, played when
+        the piece before it has ended. Cuts nothing off. With no synthesiser
+        it is said by the OS voice when nothing is being said, else dropped
+        with a note: the OS voice says one utterance at a time (a caller
+        streams only with a synthesiser)."""
+        if not self.tts:
+            if not self.speaking():
+                try:
+                    self.voice.say(text)
+                except:
+                    pass
+            else:
+                self._add_note(String("[tts] no synthesiser: a piece not said: ") + text)
+            return
+        self.tts_queue.append(text)
+        if not self.tts_busy:
+            self._tts_next()
+
+    def _tts_next(mut self):
+        """Start synthesising the next queued piece. Never raises."""
+        while len(self.tts_queue) > 0 and not self.tts_busy:
+            var text = self.tts_queue.pop(0)
             try:
                 self.tts.value().start(text)
                 self.tts_busy = True
                 self.tts_text = text
                 self.tts_t0 = perf_counter_ns()
-                started = True
             except e:
                 self.note = String("[tts] could not start: ") + String(e)
-        if not started:
-            try:
-                self.voice.say(text)
-            except:
-                pass
-        self.mute_until = perf_counter_ns() + _vl_ns(VL_ECHO_TAIL_S)
 
     def _tts_cancel(mut self):
+        """Drop everything not yet heard: the synthesis in flight, the pieces
+        waiting for it and the ones waiting to play."""
         if self.tts_busy:
             try:
                 self.tts.value().cancel()
             except:
                 pass
             self.tts_busy = False
+        self.tts_queue = List[String]()
+        for p in self.tts_ready:
+            if p.byte_length() > 0:
+                try:
+                    remove_file(p)
+                except:
+                    pass
+        self.tts_ready = List[String]()
+        self.tts_ready_s = List[Float64]()
+        self.play_until = 0
+
+    def _playing(mut self) -> Bool:
+        """A piece is playing (or, `tts_no_play`, would be)."""
+        if self.cfg.tts_no_play:
+            return perf_counter_ns() < self.play_until
+        try:
+            return self.voice.speaking()
+        except:
+            return True
+
+    def _tts_fallback(mut self, why: String):
+        """The synthesis in flight failed or was late: the OS voice says it if
+        nothing else is being said; otherwise the piece is dropped (two voices
+        at once would be worse than a missing sentence)."""
+        self.note = why
+        if len(self.tts_ready) == 0 and not self._playing():
+            try:
+                self.voice.say(self.tts_text)
+            except:
+                pass
+        else:
+            self._add_note(String("  (a piece not said)"))
 
     def _tts_step(mut self):
-        """The synthesis in flight: play its WAV once it is in, or fall back
-        to the OS voice when it fails or misses `tts_dl`. Never raises."""
-        if not self.tts_busy:
-            return
-        var el = Float64(perf_counter_ns() - self.tts_t0) / 1e9
-        var ready: Bool
-        if el > self.cfg.tts_dl:
-            self._tts_cancel()
-            self.note = String("[tts] GAVE UP after ") + _vl_f2(el) + String(" s — OS voice")
-        else:
-            try:
-                ready = self.tts.value().poll()
-            except:
-                ready = True
-            if not ready:
-                return
-            self.tts_busy = False
-            try:
-                var wav = self.tts.value().result_wav_bytes()
-                var path = (String("/tmp/noeira_tts_") + String(perf_counter_ns())
-                            + String(".wav"))
-                write_file_atomic(path, wav)
-                self.voice.play(path)
-                self.note = String("[tts] ") + String(Int(el * 1000.0)) + String(" ms")
-                return
-            except e:
-                self.note = String("[tts] FAILED: ") + String(e) + String(" — OS voice")
-        try:
-            self.voice.say(self.tts_text)
-        except:
-            pass
+        """The voice, once a frame. Never raises: (1) the synthesis in flight —
+        its WAV queued to play once in, or the OS voice when it fails or misses
+        `tts_dl`; (2) the next piece to synthesise; (3) the next piece to play,
+        once the one before it has ended."""
+        if self.tts_busy:
+            var el = Float64(perf_counter_ns() - self.tts_t0) / 1e9
+            if el > self.cfg.tts_dl:
+                try:
+                    self.tts.value().cancel()
+                except:
+                    pass
+                self.tts_busy = False
+                self._tts_fallback(String("[tts] GAVE UP after ") + _vl_f2(el) + String(" s — OS voice"))
+            else:
+                var ready: Bool
+                try:
+                    ready = self.tts.value().poll()
+                except:
+                    ready = True
+                if ready:
+                    self.tts_busy = False
+                    try:
+                        var wav = self.tts.value().result_wav_bytes()
+                        var path = String("")
+                        if not self.cfg.tts_no_play:
+                            path = (String("/tmp/noeira_tts_") + String(perf_counter_ns()) + String(".wav"))
+                            write_file_atomic(path, wav)
+                        self.tts_ready.append(path)
+                        self.tts_ready_s.append(_vl_wav_seconds(wav))
+                        self._add_note(String("[tts] ") + String(Int(el * 1000.0)) + String(" ms"))
+                    except e:
+                        self._tts_fallback(String("[tts] FAILED: ") + String(e) + String(" — OS voice"))
+        if not self.tts_busy and len(self.tts_queue) > 0:
+            self._tts_next()
+        if len(self.tts_ready) > 0 and not self._playing():
+            var path = self.tts_ready.pop(0)
+            var secs = self.tts_ready_s.pop(0)
+            if self.cfg.tts_no_play:
+                self.play_until = perf_counter_ns() + Int(secs * 1e9)
+            else:
+                try:
+                    self.voice.play(path)
+                except e:
+                    self._add_note(String("[tts] could not play: ") + String(e))
+                self.mute_until = perf_counter_ns() + _vl_ns(VL_ECHO_TAIL_S)
+            if self.audio_wait:
+                self.audio_wait = False
+                self._add_note(String("[voice] first audio ") + String(Int(Float64(perf_counter_ns() - self.reply_t0) / 1e6))
+                               + String(" ms after the reply began (") + String(Int(secs * 1000.0)) + String(" ms of audio)"))
 
     def force(mut self):
         """TAB: end the current segment now, or start one. For a room too loud
@@ -935,8 +1079,11 @@ struct G1VoiceLoopOf[
     def speaking(mut self) -> Bool:
         """⚠ A GATE THAT RAISES WOULD TAKE THE LOOP DOWN, and the safe default
         is to assume we ARE talking rather than open the microphone onto our
-        own voice."""
-        if self.tts_busy:
+        own voice. A piece being synthesised or waiting to play counts: the
+        robot is about to say it. `tts_no_play`: never (nothing is heard)."""
+        if self.cfg.tts_no_play:
+            return False
+        if self.tts_busy or len(self.tts_queue) > 0 or len(self.tts_ready) > 0:
             return True
         try:
             return self.voice.speaking()
@@ -1275,19 +1422,27 @@ struct G1VoiceLoopOf[
                 self.state = VL_ST_IDLE
                 self._after_reply()
             else:
+                var delta = String("")
                 try:
-                    _ = self.llm.poll()
+                    delta = self.llm.poll()
                 except:
                     pass
+                # L2: the reply said sentence by sentence while it is written (`stream_reply`, a synthesiser)
+                var streaming = self.cfg.stream_reply and Bool(self.tts) and not self.cfg.mute
+                if streaming and delta.byte_length() > 0:
+                    self.stream_raw += delta
+                    self._say_sentences()
                 var done = self.llm.done()
                 if done:
                     var rtxt = String("")
+                    var rtxt_raw = String("")
                     var rms_ = 0.0
                     var rcost = String("")
                     try:
                         var rep = self.llm.result()
                         # what a voice can say: no emoji, no markup (`noeira.text.spoken`)
                         rtxt = spoken_text(rep.text)
+                        rtxt_raw = rep.text
                         rms_ = rep.latency_ms
                         if rep.input_tokens > 0:
                             # where the reply's time went: its first token (the prompt), then its tokens
@@ -1297,10 +1452,18 @@ struct G1VoiceLoopOf[
                     except e:
                         self.note = String("[talk] FAILED: ") + String(e)
                     if rtxt != "":
-                        self.note = (String("[said] ") + rtxt + String("  (reply ") + String(Int(rms_)) + String(" ms")
-                                     + rcost + String(")"))
+                        var pieces = String("")
                         if not self.cfg.mute:
-                            self.say(rtxt)
+                            if streaming and self.stream_parts > 0:
+                                # what the stream had not finished as a sentence: the end of the answer
+                                var rest = self._stream_rest(rtxt_raw)
+                                if rest != "":
+                                    self._say_part(rest)
+                                pieces = String("; said in ") + String(self.stream_parts) + String(" pieces")
+                            else:
+                                self._speak(rtxt, True)
+                        self._add_note(String("[said] ") + rtxt + String("  (reply ") + String(Int(rms_)) + String(" ms")
+                                       + rcost + pieces + String(")"))
                         ev.kind = VL_TALK
                         ev.text = rtxt
                     self.state = VL_ST_IDLE
@@ -1510,6 +1673,42 @@ struct G1VoiceLoopOf[
             self.note = String("[jev] FAILED: ") + String(e)
         return ev^
 
+    def _say_part(mut self, piece: String):
+        """One piece of the reply being written: the first cuts off whatever is
+        being said (as `say` does), the next ones follow it. None once the
+        caller said something over the reply (`stream_cut`)."""
+        if self.stream_cut:
+            return
+        if self.stream_parts == 0:
+            self._speak(piece, True)
+        else:
+            self.say_more(piece)
+        self.stream_parts += 1
+
+    def _say_sentences(mut self):
+        """Every sentence the stream has finished since the last call goes to
+        the voice (`spoken_sentence_end`, `spoken_text`)."""
+        while True:
+            var e = spoken_sentence_end(self.stream_raw, self.stream_used)
+            if e < 0:
+                return
+            var piece = spoken_text(String(self.stream_raw[byte = self.stream_used : e]))
+            self.stream_used = e
+            if piece.byte_length() > 0:
+                self._say_part(piece)
+
+    def _stream_rest(mut self, answer: String) -> String:
+        """What of `answer` (the reply model's whole answer, `result().text`)
+        the streamed sentences did not say. ⚠ THE ANSWER IS THE AUTHORITY: when
+        it does not start with what was streamed, nothing more is said and the
+        note says so (half a reply heard twice would be worse)."""
+        var said = String(String(self.stream_raw[byte = 0 : self.stream_used]).strip())
+        var a = String(answer.strip())
+        if not a.startswith(said):
+            self._add_note(String("[talk] the streamed text is not the answer's start: the rest is not said"))
+            return String("")
+        return spoken_text(String(a[byte = said.byte_length() :]))
+
     def _reply(mut self, hint: String, note: String):
         """A spoken reply and nothing else: the robot's motion is unchanged.
         `hint` is added to the reply's system prompt ("" = a plain reply).
@@ -1537,6 +1736,12 @@ struct G1VoiceLoopOf[
                 sys += String(" ") + hint
             self.llm.start(msgs, sys, List[ToolSpec](), False)
             self.t_wait = perf_counter_ns()
+            self.reply_t0 = self.t_wait
+            self.audio_wait = not self.cfg.mute
+            self.stream_raw = String("")
+            self.stream_used = 0
+            self.stream_parts = 0
+            self.stream_cut = False
             self.note = note
             self.state = VL_ST_CHAT
         except e:
@@ -1890,6 +2095,20 @@ def _vl_triage_hint(kind: String) -> String:
             " one."
         )
     return String("")
+
+
+def _vl_wav_seconds(ref wav: List[UInt8]) -> Float64:
+    """A PCM WAV's length from its header (channels, rate, bits) and size; 0 when
+    the header is not one (a 44-byte RIFF header is assumed)."""
+    if len(wav) < 44:
+        return 0.0
+    var ch = Int(wav[22]) | (Int(wav[23]) << 8)
+    var rate = Int(wav[24]) | (Int(wav[25]) << 8) | (Int(wav[26]) << 16) | (Int(wav[27]) << 24)
+    var bits = Int(wav[34]) | (Int(wav[35]) << 8)
+    var per_s = rate * ch * (bits // 8)
+    if per_s <= 0:
+        return 0.0
+    return Float64(len(wav) - 44) / Float64(per_s)
 
 
 def _vl_ns(seconds: Float64) -> Int:
