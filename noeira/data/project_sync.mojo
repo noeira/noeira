@@ -130,30 +130,51 @@ def push_definition(
     root: String,
     description: String = String(""),
     force: Bool = False,
+    dry: Bool = False,
 ) raises -> SyncReport:
     """Send `<root>/<slug>/`'s definition files to the platform.
 
     ⚠ THE PROJECT IS UPSERTED FIRST, so a project that exists only on this box
     — the normal state after `project-init` — needs no separate step.
+
+    `dry=True` (`project-push --dry-run`): the same plan against the platform's
+    file list (one GET), and NOTHING WRITTEN — no upsert, no upload, no
+    `.sync.kv`. The report's `moved` counts what a real push would upload.
+    ⚠ A project the platform has never seen plans every file as an upload,
+    with no cap known yet (the real push reads the cap after creating it).
     """
     var dir = root + "/" + slug
     if not exists(dir + "/project.kv"):
         raise Error(
             "no project '" + slug + "' under " + root + "/ — nothing to push"
         )
-    cat.upsert_project(slug, description)
-
-    var doc = cat.project_files(slug)
     var rshas = Dict[String, String]()
     var rsizes = Dict[String, Int]()
     var rurls = Dict[String, String]()
-    var max_bytes = _remote_maps(doc, rshas, rsizes, rurls)
+    var max_bytes = 0
+    var rep = SyncReport()
+    if dry:
+        var known = True
+        try:
+            var doc = cat.project_files(slug)
+            max_bytes = _remote_maps(doc, rshas, rsizes, rurls)
+        except e:
+            if String(e).find("is not on the platform") < 0:
+                raise Error(String(e))
+            known = False
+        if not known:
+            rep.lines.append(
+                String("(not on the platform yet: a push creates it; the platform's size cap is not known)")
+            )
+    else:
+        cat.upsert_project(slug, description)
+        var doc = cat.project_files(slug)
+        max_bytes = _remote_maps(doc, rshas, rsizes, rurls)
 
     var scan = scan_definition(dir, max_bytes)
     var base = load_base(dir)
     var plan = plan_push(scan.shas, rshas, base, force)
 
-    var rep = SyncReport()
     for i in range(len(scan.skipped_paths)):
         rep.skipped.append(scan.skipped_paths[i] + " — " + scan.skipped_reasons[i])
 
@@ -165,6 +186,10 @@ def push_definition(
                     base[a.path] = a.local_sha
                 elif a.path in base:
                     _ = base.pop(a.path, String(""))
+                continue
+            if a.action == ACT_UPLOAD and dry:
+                rep.moved += 1
+                rep.lines.append(_describe(a))
                 continue
             if a.action == ACT_UPLOAD:
                 var got = cat.push_project_file(
@@ -193,7 +218,8 @@ def push_definition(
                 rep.other += 1
             rep.lines.append(_describe(a) + _hint_push(a.action))
     finally:
-        save_base(dir, base)
+        if not dry:
+            save_base(dir, base)
     return rep^
 
 

@@ -265,6 +265,38 @@ def part_b(base_url: String) raises -> Int:
     print("  B2 re-push: 0 moved, 3 same, 0 object PUTs")
     n += 1
 
+    # ── 2b. --dry-run: the push's plan, and nothing written ────────────
+    # (`project-push --dry-run --definition-only` listed runs and checkpoints instead, 2026-11-16)
+    _put(A, String("notes/plan.md"), String("draft\n"))
+    var base_before = load_base(A + "/" + SLUG)
+    var puts1 = _puts()
+    var rd = push_definition(cat, String(SLUG), A, dry=True)
+    rd.print_all(String("would be pushed"))
+    _check(rd.moved == 1 and rd.same == 3, "B2b: the dry run should plan 1 upload and 3 same")
+    _check(_puts() == puts1, "B2b: a DRY RUN transferred bytes")
+    _check(_remote_sha(cat, String("notes/plan.md")) == "", "B2b: a dry run put a file on the platform")
+    var base_after = load_base(A + "/" + SLUG)
+    _check(
+        len(base_after) == len(base_before) and String("notes/plan.md") not in base_after,
+        "B2b: a dry run wrote .sync.kv",
+    )
+    # a project the platform has never seen: planned in full, and NOT created
+    var C = String(WORK) + "/box_c"
+    makedirs(C + "/ghost", exist_ok=True)
+    write_text_atomic(C + "/ghost/project.kv", String("schema_version=1\nname=ghost\ndescription=x\n"))
+    var rg = push_definition(cat, String("ghost"), C, dry=True)
+    _check(rg.moved == 1, "B2b: an unknown project's dry run should plan its one file")
+    var created = True
+    try:
+        _ = cat.project_files(String("ghost"))
+    except:
+        created = False
+    _check(not created, "B2b: a dry run CREATED the project on the platform")
+    _check(not exists(C + "/ghost/.sync.kv"), "B2b: a dry run wrote the unknown project's .sync.kv")
+    remove_file(A + "/" + SLUG + "/notes/plan.md")
+    print("  B2b dry run: 1 would upload, 0 object PUTs, platform and .sync.kv unchanged; unknown project not created")
+    n += 1
+
     # ── 3. a fresh box pulls the definition, byte for byte ─────────────
     var r3 = pull_definition(cat, String(SLUG), B)
     _check(r3.moved == 3, "B3: expected 3 pulled, got " + String(r3.moved))

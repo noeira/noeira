@@ -831,6 +831,26 @@ def _ready_digests(mut cat: RemoteCatalog, run_id: String) -> List[String]:
     return out^
 
 
+def _push_definition_dry_run(project: String) raises:
+    """`project-push --dry-run`, the definition: what the push would upload, and why each other file is
+    left alone or skipped — planned against the platform's file list, nothing written."""
+    var root = projects_root()
+    if not project_exists(project, root):
+        print("definition  none — " + project + " was never project-init'ed here")
+        return
+    var spec = load_project(project, root)
+    var cat: RemoteCatalog
+    try:
+        cat = RemoteCatalog.from_env()
+    except e:
+        print("definition  " + root + "/" + project + "/  not previewed: " + String(e))
+        return
+    print("definition  " + root + "/" + project + "/  (dry run)")
+    var rep = push_definition(cat, project, root, spec.description, _has("--force"), dry=True)
+    rep.print_all(String("would be pushed"))
+    print("dry run, nothing sent")
+
+
 def _push_dry_run(project: String, only: String, kind: String) raises:
     """`project-push --dry-run`: every run, its status, its config size and
     the files a push would consider — with no network and no credentials."""
@@ -879,9 +899,17 @@ def cmd_push() raises:
         )
     var only = _positional(2)
     var kind = _flag(String("--kind"), String(""))
-    # `--dry-run`: what would be registered and sent, with no request made.
+    # `--dry-run`: what a push would send, and nothing written. The definition is planned against the
+    # platform's file list (one GET: the same plan as the real push, conflicts included); the runs are listed
+    # from this box alone. ⚠ `--definition-only` stops after the definition HERE TOO: the dry run used to ignore
+    # it and list every run and checkpoint instead (2026-11-16).
     var dry = _has("--dry-run")
     if dry:
+        if only.byte_length() == 0:
+            _push_definition_dry_run(project)
+            if _has("--definition-only"):
+                return
+            print()
         _push_dry_run(project, only, kind)
         return
     var cat = RemoteCatalog.from_env()
