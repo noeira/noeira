@@ -33,6 +33,12 @@ was missing:
    after it is whole. The same audio WITHOUT the flag does send the tail: the
    fixture reaches the fault.
 
+9. The early pause (`early_s`, L3): after 0.3 s of quiet in a segment it would
+   keep, `paused` and `pause_seq` say so; speech again clears `paused`; the
+   segment then closes on the second pause, still `paused`, with `pause_seq`
+   2; the same counts whatever the chunks; off (0), never; what the detector
+   would drop (a knock under `min_seg`, a faint sound) never pauses.
+
 The recording is synthetic (a tone for speech, noise for the room) and
 deterministic. Nothing here opens a device.
 """
@@ -319,6 +325,65 @@ def main() raises:
     var sk = sp.skip(16000)                                      # the robot starts to speak over it
     check(fails, was_blocked and not sp.blocked and sk.missed_s > 0.9 and sk.missed_s < 1.1 and sk.note.startswith("[vad] "),
           "the echo gate closing over it reports what was heard of it: " + sk.note)
+
+    print("9. the early pause")
+    var r9 = Rng(9)
+    var u = List[Int16]()
+    room(u, 1.5, r9)
+    speech(u, 0.8, r9)          # « Va à la table, »
+    room(u, 0.45, r9)           # a pause inside the sentence: over 0.3 s, under 0.6 s
+    speech(u, 0.6, r9)          # « puis à la porte. »
+    room(u, 1.2, r9)            # the end of the turn
+    var chunks: List[Int] = [VL_FRAME, 777, 8000, len(u)]
+    var seqs = List[Int]()
+    var paused_at_end = List[Bool]()
+    for c in chunks:
+        var v = G1Vad(0.6, 0.35, 10.0)
+        v.early_s = 0.3
+        var at = 0
+        var during = False      # paused seen inside the sentence's pause, and cleared by the speech after it
+        var cleared = False
+        var done_seq = -1
+        var done_paused = False
+        while at < len(u):
+            var part = List[Int16]()
+            for i in range(at, min(at + c, len(u))):
+                part.append(u[i])
+            at += c
+            var ev = v.feed(part, True)
+            while True:
+                if v.pause_seq >= 1 and v.paused and not ev.done:
+                    during = True
+                if during and v.pause_seq == 1 and not v.paused:
+                    cleared = True
+                if not ev.done:
+                    break
+                done_seq = v.pause_seq
+                done_paused = v.paused
+                var nothing = List[Int16]()
+                ev = v.feed(nothing, True)
+        seqs.append(done_seq)
+        paused_at_end.append(done_paused)
+        if c == VL_FRAME:
+            check(fails, during and cleared, "real time: paused in the sentence's pause, cleared by the speech after it")
+    var all2 = True
+    for i in range(len(seqs)):
+        if seqs[i] != 2 or not paused_at_end[i]:
+            all2 = False
+    check(fails, all2, "the turn ends on the second pause, still paused, whatever the chunks: seq "
+          + String(seqs[0]) + "/" + String(seqs[1]) + "/" + String(seqs[2]) + "/" + String(seqs[3]))
+    var off = G1Vad(0.6, 0.35, 10.0)
+    _ = off.feed(u, True)
+    check(fails, off.pause_seq == 0 and not off.paused, "early_s 0: never paused")
+    # what the detector would drop never pauses: a knock under a 1.2 s minimum, a faint sound (section 3's fixtures)
+    var vk = G1Vad(0.6, 1.2, 10.0)
+    vk.early_s = 0.3
+    var evk = vk.feed(knock, True)
+    var vf = G1Vad(0.6, 0.35, 10.0)
+    vf.early_s = 0.3
+    var evf = vf.feed(faint, True)
+    check(fails, vk.pause_seq == 0 and vf.pause_seq == 0 and evk.note.startswith("[vad] dropped") and evf.note.startswith("[vad] dropped"),
+          "what it drops never pauses: a knock under 1.2 s, a faint sound")
 
     print("ALL PASS" if fails == 0 else String(fails) + " FAILED")
     if fails != 0:

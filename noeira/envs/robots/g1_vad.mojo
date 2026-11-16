@@ -38,6 +38,18 @@ next call: the caller decides, with `may_open`, whether the audio after an
 utterance may start another (the voice loop says no while a transcription or a
 decision is in flight, as before).
 
+AN EARLY PAUSE (`early_s`, 0 = off). A segment closes after `hang_s` of quiet
+(0.6 s): waiting that long is how a pause inside a sentence is told from its
+end. With `early_s` (0.3 s in the room demo) the detector also says when a
+segment it would keep has been quiet that long: `paused` turns True and
+`pause_seq` counts it; speech again turns `paused` back to False. A caller can
+start transcribing what is in hand at the pause and keep it when the segment
+does close on that same pause (`pause_seq` unchanged, still `paused`), or drop
+it when the person goes on (docs/NN_MODEL_PORTS_PLAN.md §12.8.7, L3). State,
+not an event: the same samples give the same `paused` / `pause_seq` however
+they are chunked, and a caller reading them after each `feed` sees where the
+audio it was given has got to.
+
 ⚠ SPEECH WHILE THE CALLER IS BUSY IS LOST ON PURPOSE, BUT NEVER SILENTLY, AND
 NEVER IN HALVES (`busy`). The count above was not the whole fault. With the
 detector exact, a replayed recording still lost its second utterance: the first
@@ -165,6 +177,13 @@ struct G1Vad(Movable):
     var hang_s: Float64
     var min_seg: Float64
     var max_seg: Float64
+    var early_s: Float64
+    """Quiet that reports a pause (`paused`); 0 = never (the module note)."""
+    var paused: Bool
+    """The segment in hand has been quiet for `early_s` and would be kept if it
+    ended now; False again when speech resumes, or a new segment opens."""
+    var pause_seq: Int
+    """Pauses reported so far (one per quiet stretch)."""
 
     def __init__(out self, hang_s: Float64, min_seg: Float64, max_seg: Float64):
         self.floor = 0.0010
@@ -185,6 +204,9 @@ struct G1Vad(Movable):
         self.hang_s = hang_s
         self.min_seg = min_seg
         self.max_seg = max_seg
+        self.early_s = 0.0
+        self.paused = False
+        self.pause_seq = 0
 
     def restart(mut self):
         """The microphone was reopened: nothing is in hand, and the floor
@@ -202,6 +224,7 @@ struct G1Vad(Movable):
         self.blocked = False
         self.missed = 0
         self.calm = 0
+        self.paused = False
 
     def open_now(mut self):
         """Start a segment from the pre-roll, whatever the level (TAB)."""
@@ -211,6 +234,12 @@ struct G1Vad(Movable):
         self.quiet = 0
         self.forced = False
         self.recording = True
+        self.paused = False
+
+    def _would_keep(self, open_at: Float64) -> Bool:
+        """The segment in hand would be kept if it ended now (`_finish`'s rules)."""
+        var seg_s = Float64(len(self.seg)) / 16000.0
+        return seg_s > VL_DRAIN_S and seg_s >= self.min_seg and self.peak >= open_at * VL_MIN_PEAK_MULT
 
     def _finish(mut self, mut ev: G1VadEvent, open_at: Float64) -> Bool:
         """End the segment in hand if it is due. True when it ended (kept, in
@@ -338,8 +367,13 @@ struct G1Vad(Movable):
             if self.recording:
                 if lv > close_at:
                     self.quiet = 0
+                    self.paused = False     # the person goes on
                 else:
                     self.quiet += VL_FRAME
+                    if (self.early_s > 0.0 and not self.paused and Float64(self.quiet) / 16000.0 > self.early_s
+                            and self._would_keep(open_at)):
+                        self.paused = True
+                        self.pause_seq += 1
                 _ = self._finish(ev, open_at)
         if i > 0:
             var rest = List[Int16](capacity=n - i)

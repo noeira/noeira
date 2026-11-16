@@ -216,6 +216,16 @@ struct G1VoiceConfig(Copyable, Movable):
     var vad: Bool
     var mute: Bool
     var hang_s: Float64
+    var early_s: Float64
+    """An EARLY START (docs/NN_MODEL_PORTS_PLAN.md §12.8.7, L3; 0 = off, the
+    default: every bench was measured without it). A turn ends after `hang_s`
+    of quiet; after `early_s` of it (0.3 s in the room demo) the segment in hand
+    is transcribed and the decision's first request started, while the loop
+    still listens. If the turn does end on that pause, the work in flight is
+    the turn's, `hang_s - early_s` ahead; if the person goes on, it is
+    cancelled (a d1 request still finishes on the GPU, its answer dropped).
+    Nothing of it is heard by the caller before the turn ends: no `[heard]`,
+    no `take_heard`."""
     var min_seg: Float64
     var max_seg: Float64
     var max_none: Float64
@@ -357,6 +367,7 @@ struct G1VoiceConfig(Copyable, Movable):
         self.vad = True
         self.mute = False
         self.hang_s = 0.6
+        self.early_s = 0.0
         self.min_seg = 0.35
         self.max_seg = 10.0
         self.max_none = 0.25
@@ -449,6 +460,28 @@ struct G1VoiceLoopOf[
     """The reply's first audio has not started yet: the note says when it does."""
     var reply_t0: Int
     """When the reply model was asked (the first audio is timed from it)."""
+    var early: Int
+    """The early start in flight: 0 none, 1 transcribing, 2 the first request
+    asked, 3 transcribed but nothing to ask (too few letters, or the request
+    could not start: the turn then ends as it would have)."""
+    var early_seq: Int
+    """The detector's `pause_seq` it started at (that pause, no other)."""
+    var early_t0: Int
+    var early_t_ask: Int
+    var early_text: String
+    var early_lat: Float64
+    var early_err: String
+    var early_dest: Bool
+    """Its first request is the destination one (`_two_requests`)."""
+    var early_cancels: Int
+    var early_verify: Bool
+    """The turn kept its early request; its own segment is being transcribed to check the words."""
+    var early_ahead: Int
+    """Early starts dropped because the person went on (a counter for the log)."""
+    var turn_t: Int
+    """When the last turn ended (the detector closed its segment)."""
+    var turn_told: Bool
+    """The `[turn]` note for it was given."""
     var pieces_played: Int
     """Pieces of the current utterance that have started playing."""
     var gap_t0: Int
@@ -600,6 +633,19 @@ struct G1VoiceLoopOf[
         self.stream_cut = False
         self.audio_wait = False
         self.reply_t0 = 0
+        self.early = 0
+        self.early_seq = 0
+        self.early_t0 = 0
+        self.early_t_ask = 0
+        self.early_text = String("")
+        self.early_lat = 0.0
+        self.early_err = String("")
+        self.early_dest = False
+        self.early_cancels = 0
+        self.early_verify = False
+        self.early_ahead = 0
+        self.turn_t = 0
+        self.turn_told = True
         self.pieces_played = 0
         self.gap_t0 = 0
         # ⚠ the capture is NOT opened here: `poll` opens it the first time it
@@ -607,6 +653,7 @@ struct G1VoiceLoopOf[
         # reported there, in `mic_dead` and the note, as a dead one is.
         self.mic = None
         self.vad = G1Vad(self.cfg.hang_s, self.cfg.min_seg, self.cfg.max_seg)
+        self.vad.early_s = self.cfg.early_s
         self.dest_q = JevQuestions()
         self.quest_mem = JevQuestions()
         self.mem_asked = False
@@ -706,6 +753,19 @@ struct G1VoiceLoopOf[
         self.stream_cut = move.stream_cut
         self.audio_wait = move.audio_wait
         self.reply_t0 = move.reply_t0
+        self.early = move.early
+        self.early_seq = move.early_seq
+        self.early_t0 = move.early_t0
+        self.early_t_ask = move.early_t_ask
+        self.early_text = move.early_text^
+        self.early_lat = move.early_lat
+        self.early_err = move.early_err^
+        self.early_dest = move.early_dest
+        self.early_cancels = move.early_cancels
+        self.early_verify = move.early_verify
+        self.early_ahead = move.early_ahead
+        self.turn_t = move.turn_t
+        self.turn_told = move.turn_told
         self.pieces_played = move.pieces_played
         self.gap_t0 = move.gap_t0
         self.stt = move.stt^
@@ -948,7 +1008,9 @@ struct G1VoiceLoopOf[
             if self.audio_wait:
                 self.audio_wait = False
                 self._add_note(String("[voice] first audio ") + String(Int(Float64(perf_counter_ns() - self.reply_t0) / 1e6))
-                               + String(" ms after the reply began (") + String(Int(secs * 1000.0)) + String(" ms of audio)"))
+                               + String(" ms after the reply began, ")
+                               + String(Int(Float64(perf_counter_ns() - self.turn_t) / 1e6))
+                               + String(" ms after the turn ended (") + String(Int(secs * 1000.0)) + String(" ms of audio)"))
 
     def force(mut self):
         """TAB: end the current segment now, or start one. For a room too loud
@@ -980,6 +1042,7 @@ struct G1VoiceLoopOf[
                 pass
             self.mic = None
             self.mic_on = False
+            self._early_cancel(String("the mic was closed"))
             self.vad.restart()
             self.state = VL_ST_IDLE
             return String("[mic] closed")
@@ -1228,8 +1291,15 @@ struct G1VoiceLoopOf[
                 if ve.note != "":
                     self.note = ve.note
                 self.missed_s += ve.missed_s
+                if self.state == VL_ST_REC and not ve.done:
+                    self._early_step(ctx)
+                if self.state == VL_ST_REC and ve.done:
+                    self.turn_t = perf_counter_ns()
+                    self.turn_told = False
                 if self.state == VL_ST_REC:
-                    if ve.done:
+                    if ve.done and self._early_commit(ev):
+                        pass    # the turn's transcription (and its first request) are already in flight
+                    elif ve.done:
                         try:
                             var audio = WavAudio(16000, 1, self.vad.seg.copy())
                             self.seg_keep = self.vad.seg.copy()
@@ -1246,11 +1316,13 @@ struct G1VoiceLoopOf[
                             self.note = String("[stt] could not start: ") + String(e)
                             self.state = VL_ST_IDLE
                     elif not self.vad.recording:
+                        self._early_cancel(String("the segment was dropped"))
                         self.state = VL_ST_IDLE     # the segment was dropped (its note says why)
             except e:
                 self.mic_dead = String(e)
                 self.note = String("[mic] ") + self.mic_dead
                 if self.state == VL_ST_REC:
+                    self._early_cancel(String("the mic failed"))
                     self.state = VL_ST_IDLE
 
         # ── transcribing ──────────────────────────────────────────────
@@ -1305,27 +1377,22 @@ struct G1VoiceLoopOf[
                         self.state = VL_ST_IDLE
                     else:
                         try:
-                            self.asked = g1_command_state(self.heard, ctx)
-                            self._snapshot_view()
                             self.heard_new = self.heard
-                            self.mem_asked = False
-                            self.tri = G1Triage()
-                            self.dest_ms = 0.0
-                            self.dest_tok = 0
-                            self.then_decide = False
-                            self.replied = False
-                            if self._two_requests():
-                                self._ask(_VL_Q_DEST)
-                                self.state = VL_ST_DEST
-                            else:
-                                self._ask(_VL_Q_CMD)
-                                self.state = VL_ST_JEV
+                            self.state = VL_ST_DEST if self._first_request(ctx, self.heard.copy()) else VL_ST_JEV
                             self.t_wait = perf_counter_ns()
                         except e:
                             self.note = String("[jev] could not start: ") \
                                         + String(e)
                             self.state = VL_ST_IDLE
                         ev.text = self.heard
+
+        # ── the early start's request: its words checked first (`_early_verified`) ─
+        # ⚠ IN A POLL OF ITS OWN, AND THE ANSWER AT THE NEXT ONE. The caller learns the words from this poll
+        # (`take_heard`) and sets what code would answer from them (`set_reply_override`) before the next: an
+        # answer read in the same poll replied to « Où est le frigo ? » with the previous turn's computed
+        # answer, « Oui, j'ai fini » (round 36, e2e_b2). The turn's end without an early start has that order.
+        elif (self.state == VL_ST_DEST or self.state == VL_ST_JEV) and self.early_verify:
+            _ = self._early_verified(ctx, ev)
 
         # ── deciding: the destination request (`request_wording`) ──────
         elif self.state == VL_ST_DEST:
@@ -1497,6 +1564,12 @@ struct G1VoiceLoopOf[
                     self.state = VL_ST_IDLE
                     self._after_reply()
 
+        if not self.turn_told and ev.kind != VL_NONE and self.turn_t > 0:
+            # how long the robot took from the end of the turn to its first answer, of any kind
+            self.turn_told = True
+            var kinds: List[String] = ["", "command", "spec", "world", "talk", "refused"]
+            self._add_note(String("[turn] ") + kinds[ev.kind] + String(" ")
+                           + String(Int(Float64(perf_counter_ns() - self.turn_t) / 1e6)) + String(" ms after the turn ended"))
         return ev^
 
     def _snapshot_view(mut self):
@@ -1701,6 +1774,179 @@ struct G1VoiceLoopOf[
             self.note = String("[jev] FAILED: ") + String(e)
         return ev^
 
+    def _first_request(mut self, ref ctx: G1Context, text: String) raises -> Bool:
+        """A decision for `text`: its state, and its first request asked (the
+        destination one when there are two: True). The turn's end, the early
+        start and its re-ask all start a decision HERE."""
+        self.asked = g1_command_state(text, ctx)
+        self._snapshot_view()
+        self.mem_asked = False
+        self.tri = G1Triage()
+        self.dest_ms = 0.0
+        self.dest_tok = 0
+        self.then_decide = False
+        self.replied = False
+        var dest = self._two_requests()
+        self._ask(_VL_Q_DEST if dest else _VL_Q_CMD)
+        return dest
+
+    # ── the early start (`early_s`, L3) ───────────────────────────────
+    def _early_step(mut self, ref ctx: G1Context):
+        """While recording: at a new pause, transcribe what is in hand; once it
+        is transcribed, ask the decision's first request; when the person goes
+        on, drop both. Nothing here is told to the caller (the turn may go on)."""
+        if self.cfg.early_s <= 0.0:
+            return
+        if self.early != 0 and (not self.vad.paused or self.early_seq != self.vad.pause_seq):
+            self._early_cancel(String("the person went on"))
+        if self.early == 0:
+            if self.vad.paused and self.early_seq != self.vad.pause_seq:
+                self.early_seq = self.vad.pause_seq     # this pause, once
+                try:
+                    var audio = WavAudio(16000, 1, self.vad.seg.copy())
+                    self.stt.start(audio)
+                    self.early = 1
+                    self.early_t0 = perf_counter_ns()
+                    self.early_text = String("")
+                    self.early_lat = 0.0
+                    self.early_err = String("")
+                except:
+                    pass    # the turn's end transcribes it as before
+            return
+        if self.early != 1:
+            return
+        var ready: Bool
+        try:
+            ready = self.stt.poll()
+        except:
+            ready = True
+        if not ready:
+            return
+        try:
+            var tr = self.stt.result()
+            self.early_text = tr.text
+            self.early_lat = tr.latency_ms
+        except e:
+            self.early_err = String("[stt] FAILED: ") + String(e)
+        var letters = 0
+        for ch in self.early_text.codepoints():
+            if ch.to_u32() > 64:
+                letters += 1
+        if letters < 3:
+            self.early = 3
+            return
+        # what the turn's end would do with this text (the STT branch of `poll`)
+        try:
+            self.early_dest = self._first_request(ctx, self.early_text.copy())
+            self.early = 2
+            self.early_t_ask = perf_counter_ns()
+        except e:
+            self.early_err = String("[jev] could not start: ") + String(e)
+            self.early = 3
+
+    def _early_cancel(mut self, why: String):
+        """Drop the early start in flight (a d1 request still finishes on its
+        thread; its answer is dropped as stale)."""
+        if self.early == 0:
+            return
+        try:
+            if self.early == 1:
+                self.stt.cancel()
+            elif self.early == 2:
+                self.jev.cancel()
+        except:
+            pass
+        self.early_cancels += 1
+        self._add_note(String("[early] dropped (") + why + String(") after ")
+                       + String(Int(Float64(perf_counter_ns() - self.early_t0) / 1e6)) + String(" ms"))
+        self.early = 0
+
+    def _early_commit(mut self, mut ev: G1VoiceEvent) -> Bool:
+        """The turn ended. Kept when it ended on the early start's pause (the
+        audio after the snapshot is the quiet that closed it) AND its first
+        request is in flight: the loop goes on from that request, and the TURN'S
+        OWN SEGMENT is transcribed once more beside it (`_early_verified`).
+        False = the turn's end does it as before (no early start, another
+        pause, or still transcribing: the turn's segment is then transcribed
+        anew, which costs nothing the snapshot's would have saved)."""
+        if self.early == 0:
+            return False
+        if not (self.vad.paused and self.early_seq == self.vad.pause_seq):
+            self._early_cancel(String("the turn ended on another pause"))
+            return False
+        if self.early == 1:
+            self._early_cancel(String("the turn ended before its transcript"))
+            return False
+        if self.early == 3:
+            # nothing was asked (too few letters, or the request could not start): the turn's end decides
+            self.early = 0
+            return False
+        try:
+            self.stt.start(WavAudio(16000, 1, self.vad.seg.copy()))
+        except e:
+            self._early_cancel(String("the turn's transcript could not start: ") + String(e))
+            return False
+        self.seg_keep = self.vad.seg.copy()
+        self.early_ahead = Int(Float64(perf_counter_ns() - self.early_t0) / 1e6)
+        self.early_verify = True
+        self.t_wait = self.early_t_ask
+        self.state = VL_ST_DEST if self.early_dest else VL_ST_JEV
+        self.early = 0
+        return True
+
+    def _early_verified(mut self, ref ctx: G1Context, mut ev: G1VoiceEvent) -> Bool:
+        """The early request's answer may be used once the turn's own segment is
+        transcribed AND reads the same: then the caller is told what was heard
+        (only now). A different reading drops the early request and asks again
+        with the turn's own words (the robot decides on what it would have
+        decided on without the early start). False = not yet (or asked again)."""
+        var ready: Bool
+        try:
+            ready = self.stt.poll()
+        except:
+            ready = True
+        if not ready:
+            return False
+        self.early_verify = False
+        var txt = String("")
+        var lat = 0.0
+        try:
+            var tr = self.stt.result()
+            txt = tr.text
+            lat = tr.latency_ms
+        except e:
+            self._add_note(String("[stt] FAILED: ") + String(e) + String(" — the early transcript is kept"))
+            txt = self.early_text
+        self.heard = txt
+        self._add_note(String("[heard] ") + self.heard + String(" (") + _vl_f2(lat) + String(" ms )"))
+        if txt == self.early_text:
+            self._add_note(String("[early] the same words, ") + String(self.early_ahead) + String(" ms ahead"))
+            self.heard_new = self.heard
+            ev.text = self.heard
+            return True
+        try:
+            self.jev.cancel()
+        except:
+            pass
+        self._add_note(String("[early] the turn read « ") + txt + String(" » where the pause read « ")
+                       + self.early_text + String(" »: asked again"))
+        var letters = 0
+        for ch in txt.codepoints():
+            if ch.to_u32() > 64:
+                letters += 1
+        if letters < 3:
+            self.state = VL_ST_IDLE
+            return False
+        try:
+            self.heard_new = self.heard
+            self.state = VL_ST_DEST if self._first_request(ctx, self.heard.copy()) else VL_ST_JEV
+            self.t_wait = perf_counter_ns()
+            ev.text = self.heard
+        except e:
+            self.note = String("[jev] could not start: ") + String(e)
+            self.state = VL_ST_IDLE
+        return False
+
     def _say_part(mut self, piece: String):
         """One piece of the reply being written: the first cuts off whatever is
         being said (as `say` does), the next ones follow it. None once the
@@ -1738,9 +1984,24 @@ struct G1VoiceLoopOf[
         var said = String(String(self.stream_raw[byte = 0 : self.stream_used]).strip())
         var a = String(answer.strip())
         if not a.startswith(said):
-            self._add_note(String("[talk] the streamed text is not the answer's start: the rest is not said"))
+            self._add_note(String("[talk] the streamed text is not the answer's start: the rest is not said — streamed «")
+                           + said + String("» answer «") + a + String("»"))
             return String("")
         return spoken_text(String(a[byte = said.byte_length() :]))
+
+    def _llm_start(mut self, ref msgs: List[ChatMessage], system: String) raises:
+        """⚠ THE ONE WAY A REPLY MODEL IS STARTED: the call, its clock, and a
+        fresh stream. A second route (the commands request's `talk`) started
+        the model itself and kept the stream of the reply before: the robot said
+        that reply's sentence again before the new one (round 35, e2e_b3)."""
+        self.llm.start(msgs, system, List[ToolSpec](), False)
+        self.t_wait = perf_counter_ns()
+        self.reply_t0 = self.t_wait
+        self.audio_wait = not self.cfg.mute
+        self.stream_raw = String("")
+        self.stream_used = 0
+        self.stream_parts = 0
+        self.stream_cut = False
 
     def _reply(mut self, hint: String, note: String):
         """A spoken reply and nothing else: the robot's motion is unchanged.
@@ -1767,14 +2028,7 @@ struct G1VoiceLoopOf[
             var sys = self.cfg.chat_sys
             if hint != "":
                 sys += String(" ") + hint
-            self.llm.start(msgs, sys, List[ToolSpec](), False)
-            self.t_wait = perf_counter_ns()
-            self.reply_t0 = self.t_wait
-            self.audio_wait = not self.cfg.mute
-            self.stream_raw = String("")
-            self.stream_used = 0
-            self.stream_parts = 0
-            self.stream_cut = False
+            self._llm_start(msgs, sys)
             self.note = note
             self.state = VL_ST_CHAT
         except e:
@@ -1895,11 +2149,9 @@ struct G1VoiceLoopOf[
                     msgs.append(ChatMessage.user(self.heard))
                     if self.reply_override != "":
                         self.canned = self.reply_override   # computed: the model is not asked
+                        self.t_wait = perf_counter_ns()
                     else:
-                        self.llm.start(
-                            msgs, self.cfg.chat_sys, List[ToolSpec](), False
-                        )
-                    self.t_wait = perf_counter_ns()
+                        self._llm_start(msgs, self.cfg.chat_sys.copy())
                     self.note = (String("[talk] ") + _vl_f2(self.pick.conf)
                                  + self._jev_ms(ans.latency_ms, ans.input_tokens))
                     self.state = VL_ST_CHAT

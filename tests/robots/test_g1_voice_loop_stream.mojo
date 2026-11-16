@@ -20,6 +20,9 @@ before it. What this pins:
 5. A `say` from the caller cuts a streamed reply off: its waiting pieces are
    not said.
 6. Muted: nothing synthesised.
+8. Two replies in a row through the commands request's `talk` (not
+   `_reply`): the second says only its own sentences (it used to say the
+   first reply's again: that route kept the old stream, round 35).
 7. The FIRST piece may end at a comma (`first_clause`): a one-sentence reply
    starts before its sentence ends; only the first comma, only after 12
    bytes (« Oui, » stays whole), never inside `4,5`; 0 = sentences only.
@@ -36,7 +39,8 @@ from noeira.ai.jev import DecisionService, JevAnswers, JevQuestions
 from noeira.ai.speech import SpeechToTextService, TextToSpeechService, Transcript
 from noeira.envs.robots.g1_command_bank import G1CommandBank
 from noeira.envs.robots.g1_command_language import G1Context
-from noeira.envs.robots.g1_voice_loop import G1VoiceConfig, G1VoiceLoopOf, VL_ST_IDLE, VL_TALK
+from noeira.envs.robots.g1_voice_loop import G1VoiceConfig, G1VoiceLoopOf, VL_ST_IDLE, VL_ST_STT, VL_TALK
+from noeira.io.json import parse_json
 from noeira.io.wav import WavAudio
 from noeira.text.spoken import spoken_clause_end, spoken_sentence_end
 
@@ -223,6 +227,99 @@ struct RecTts(Movable, TextToSpeechService):
 comptime Loop = G1VoiceLoopOf[NoStt, RecTts, NoDecision, StreamChat]
 
 
+struct TextStt(Movable, SpeechToTextService):
+    var text: String
+
+    def __init__(out self):
+        self.text = String("")
+
+    @staticmethod
+    def from_spec(spec: String) raises -> Self:
+        return Self()
+
+    def set_language(mut self, lang: String):
+        pass
+
+    def set_hint(mut self, vocab: String) -> Bool:
+        return False
+
+    def loading(self) -> Bool:
+        return False
+
+    def warm_up(mut self):
+        pass
+
+    def start(mut self, ref audio: WavAudio) raises:
+        pass
+
+    def poll(mut self, timeout_ms: Int = 0) raises -> Bool:
+        return True
+
+    def result(mut self) raises -> Transcript:
+        return Transcript(self.text, 50.0)
+
+    def cancel(mut self) raises:
+        pass
+
+
+struct TalkDecision(Movable, DecisionService):
+    """Every request answers the commands question with `talk`."""
+
+    def __init__(out self):
+        pass
+
+    @staticmethod
+    def from_spec(spec: String) raises -> Self:
+        return Self()
+
+    def loading(self) -> Bool:
+        return False
+
+    def warm_up(mut self):
+        pass
+
+    def start(mut self, state_json: String, ref questions: JevQuestions) raises:
+        pass
+
+    def start_text(mut self, state_text: String, ref questions: JevQuestions) raises:
+        pass
+
+    def poll(mut self, timeout_ms: Int = 0) raises -> Bool:
+        return True
+
+    def result(mut self) raises -> JevAnswers:
+        var j = String('{"model":"script","usage":{"input_tokens":1228},"answers":{"command":{"choice":"talk",'
+                       '"probabilities":{"talk":0.9,"none":0.02}},"needs_world":{"noul":0.05},"addressed":{"noul":0.95},'
+                       '"extent":{"score":1.0}}}')
+        var b = List[UInt8]()
+        for x in j.as_bytes():
+            b.append(x)
+        return JevAnswers(parse_json(b^), 400.0)
+
+    def cancel(mut self) raises:
+        pass
+
+
+comptime TalkLoop = G1VoiceLoopOf[TextStt, RecTts, TalkDecision, StreamChat]
+
+
+def talk_turn(mut loop: TalkLoop, heard: String, var pieces: List[String], answer: String, ref bank: G1CommandBank) -> String:
+    """One turn through the commands request's `talk`; the notes it left."""
+    loop.stt.text = heard
+    loop.llm.pieces = pieces^
+    loop.llm.answer = answer
+    loop.state = VL_ST_STT
+    var ctx = G1Context()
+    var notes = String("")
+    for _ in range(40):
+        _ = loop.poll(ctx, bank)
+        var n = loop.take_note()
+        if n != "":
+            print("     ", n)
+            notes += n + String("\n")
+    return notes^
+
+
 def make_loop(stream: Bool, mute: Bool, ref bank: G1CommandBank) raises -> Loop:
     var cfg = G1VoiceConfig()
     cfg.mute = mute
@@ -383,6 +480,22 @@ def main() raises:
     var p7e: List[String] = ["Bonjour. Le frigo est devant moi, à", " gauche."]
     var q = run(True, False, p7e^, String("Bonjour. Le frigo est devant moi, à gauche."), bank)
     check(fails, _join(q.said) == "[Bonjour.][Le frigo est devant moi, à gauche.]", "a sentence's end before the comma wins: " + _join(q.said))
+
+    print("8. two replies in a row through the commands request's `talk`")
+    var cfg8 = G1VoiceConfig()
+    cfg8.tts_spec = String("test")
+    cfg8.tts_no_play = True
+    cfg8.chain = False
+    var t8 = TalkLoop(cfg8^, bank)
+    t8.mic_on = False
+    var q1: List[String] = ["Je vais bien.", " Et toi ?"]
+    var n81 = talk_turn(t8, String("Comment vas-tu ?"), q1^, String("Je vais bien. Et toi ?"), bank)
+    var q2: List[String] = ["Il fait beau.", " Oui."]
+    var n82 = talk_turn(t8, String("Il fait beau aujourd'hui."), q2^, String("Il fait beau. Oui."), bank)
+    var said8 = t8.tts.value().started.copy()
+    check(fails, _join(said8) == "[Je vais bien.][Et toi ?][Il fait beau.][Oui.]", "each reply its own sentences: " + _join(said8))
+    check(fails, n82.find("not the answer's start") < 0 and n82.find("first audio") >= 0,
+          "no mismatch, and the second reply's first audio timed too")
 
     print("ALL PASS" if fails == 0 else String(fails) + " FAILED")
     if fails != 0:
