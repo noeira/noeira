@@ -9,12 +9,16 @@ far the interface's action is from the tracker's own.
     pixi run mojo build -I . examples/g1/supermimic_object_trace_cpu.mojo -o build/sm_obj_trace
     pixi run ./build/sm_obj_trace --ckpt TRACKER.ckpt --store CARRY_50HZ.h5 --object-dir OBJECT_CSV_DIR \\
         --only NAME[,NAME…] --out-dir DIR [--interface INTERFACE.ckpt] [--gain 0.1]
-        [--squeeze 40] [--ref-squeeze 0.05] [--ref-lower 1.0]
+        [--squeeze 40] [--ref-squeeze 0.05] [--ref-lower 1.0] [--trials 8 --seed 0]
 
     --squeeze F      the scripted squeeze on the executed actions (`object_task.sm_squeeze_lane`), F newtons
     --ref-squeeze D  the reference's hands D metres toward the box while it is lifted (`sm_squeeze_reference`)
     --ref-lower S    … and DOWN by the share S of their height above the box's centre (the arms alone)
     The box's reference and the reward's reference grasp stay the ORIGINAL clip's under both edits.
+    --trials K       every clip K times, each from a start perturbed by the training's reset noise (the robot's
+                     root and joints; the box stays at its reference), as `sm_obj_benchmark`'s `trials`; the
+                     files are then NAME.tI.trace.tsv / NAME.tI.qpos.tsv. The draws are this process's, seeded
+                     by --seed: the same rule as the device benchmark's, not the same starts.
 
 Per clip, in `--out-dir`:
 
@@ -122,6 +126,8 @@ def main() raises:
     var squeeze = Float64(_opt(args, String("--squeeze"), String("0")))
     var ref_squeeze = Float64(_opt(args, String("--ref-squeeze"), String("0")))
     var ref_lower = Float64(_opt(args, String("--ref-lower"), String("0")))
+    var trials = Int(_opt(args, String("--trials"), String("1")))
+    var rng_seed = Int(_opt(args, String("--seed"), String("0")))
     if ckpt == "" or store == "" or object_dir == "" or only == "" or out_dir == "":
         raise Error("give --ckpt TRACKER.ckpt --store STORE.h5 --object-dir DIR --only NAME[,NAME…] --out-dir DIR [--interface CKPT]")
     var want = List[String]()
@@ -187,8 +193,8 @@ def main() raises:
     var rw = sm_obj_reward_params()
     var terms = List[Scalar[DT]](length=SM_OBJ_TERMS + 1, fill=0)
     var env = SMTrackingEnv[Robot](
-        1, SMMotionLibrary[Robot](rows^, lens, q0), dr=False, obs_noise=False, reset_noise=False, action_noise=0.0,
-        max_episode_steps=0,
+        1, SMMotionLibrary[Robot](rows^, lens, q0), dr=False, obs_noise=False, reset_noise=trials > 1, action_noise=0.0,
+        rng_seed=rng_seed, max_episode_steps=0,
     )
     var rb = SMReplayOf[Robot](1, 64)
     var hist = TensorImpl[DT].alloc(D.HIST * D.OBS)
@@ -204,125 +210,127 @@ def main() raises:
 
     for c in range(len(lens)):
         var f0 = env.lib.clip_start[c]
-        var first: List[Int] = [f0]
-        env.restart(first)
-        env.terminations = True
-        # the box at its reference state of the clip's first frame (the device env's reset)
-        var bq = List[Float64]()
-        var bv = List[Float64]()
-        for k in range(7):
-            bq.append(Float64(track[f0 * SM_OBJ + k]))
-        for k in range(6):
-            bv.append(Float64(track[f0 * SM_OBJ + 7 + k]))
-        env.lanes[0].sim.set_box(bq, bv)
-        var z0 = Float64(track[f0 * SM_OBJ + 2])
-        var trace = String(
-            "step\tframe\tref_carry\tref_rise\tbox_err\tbox_dz\tbox_dxy\tbox_tilt\tbox_rise\thand0_box\thand1_box\tref_hand0_box\tref_hand1_box\t"
-            + "da_arm\tda_arm_max\tda_rest\troot_speed\tref_root_speed\troot_z\tbox_speed\treward\tr_pos\tr_ori\tr_hands\thand_z\tref_hand_z\n"
-        )
-        var dump = String("")
-        var step = 0
-        var failed = False
-        while True:
-            env.next_frame[0] = f0
-            env.policy_inputs(hist, goals)
-            var fr = env.lanes[0].frame
-            for k in range(D.S):
-                s_t.data[k] = env.lanes[0].s[k]
+        for trial in range(max(trials, 1)):
+            var first: List[Int] = [f0]
+            env.restart(first)
+            env.terminations = True
+            # the box at its reference state of the clip's first frame (the device env's reset)
+            var bq = List[Float64]()
+            var bv = List[Float64]()
             for k in range(7):
-                o_t.data[k] = Scalar[DT](env.lanes[0].sim.box_qpos(k))
+                bq.append(Float64(track[f0 * SM_OBJ + k]))
             for k in range(6):
-                o_t.data[7 + k] = Scalar[DT](env.lanes[0].sim.box_qvel(k))
-            for k in range(SM_OREF):
-                oref_t.data[k] = orefs[fr * SM_OREF + k]
-            var a = tr.act[1](hist, goals, s_t, o_t, oref_t)
-            var ab = tr.base.act[1](hist, goals)
-            if squeeze > 0.0:
-                sm_squeeze_lane[Robot](
-                    ARM0, Scalar[DT](squeeze * sq_w[fr]), tr.base.tables.tree_ptr(), tr.base.tables.head_ptr(),
-                    ks.unsafe_ptr().as_unsafe_any_origin(), s_t.data.unsafe_ptr().as_unsafe_any_origin(),
-                    o_t.data.unsafe_ptr().as_unsafe_any_origin(), sq_scratch.unsafe_ptr().as_unsafe_any_origin(),
-                    a.data.unsafe_ptr().as_unsafe_any_origin(),
+                bv.append(Float64(track[f0 * SM_OBJ + 7 + k]))
+            env.lanes[0].sim.set_box(bq, bv)
+            var z0 = Float64(track[f0 * SM_OBJ + 2])
+            var trace = String(
+                "step\tframe\tref_carry\tref_rise\tbox_err\tbox_dz\tbox_dxy\tbox_tilt\tbox_rise\thand0_box\thand1_box\tref_hand0_box\tref_hand1_box\t"
+                + "da_arm\tda_arm_max\tda_rest\troot_speed\tref_root_speed\troot_z\tbox_speed\treward\tr_pos\tr_ori\tr_hands\thand_z\tref_hand_z\n"
+            )
+            var dump = String("")
+            var step = 0
+            var failed = False
+            while True:
+                env.next_frame[0] = f0
+                env.policy_inputs(hist, goals)
+                var fr = env.lanes[0].frame
+                for k in range(D.S):
+                    s_t.data[k] = env.lanes[0].s[k]
+                for k in range(7):
+                    o_t.data[k] = Scalar[DT](env.lanes[0].sim.box_qpos(k))
+                for k in range(6):
+                    o_t.data[7 + k] = Scalar[DT](env.lanes[0].sim.box_qvel(k))
+                for k in range(SM_OREF):
+                    oref_t.data[k] = orefs[fr * SM_OREF + k]
+                var a = tr.act[1](hist, goals, s_t, o_t, oref_t)
+                var ab = tr.base.act[1](hist, goals)
+                if squeeze > 0.0:
+                    sm_squeeze_lane[Robot](
+                        ARM0, Scalar[DT](squeeze * sq_w[fr]), tr.base.tables.tree_ptr(), tr.base.tables.head_ptr(),
+                        ks.unsafe_ptr().as_unsafe_any_origin(), s_t.data.unsafe_ptr().as_unsafe_any_origin(),
+                        o_t.data.unsafe_ptr().as_unsafe_any_origin(), sq_scratch.unsafe_ptr().as_unsafe_any_origin(),
+                        a.data.unsafe_ptr().as_unsafe_any_origin(),
+                    )
+                var da = 0.0
+                var da_max = 0.0
+                var da_rest = 0.0
+                for j in range(Robot.NDOF):
+                    var d = Float64(a.data[j]) - Float64(ab.data[j])
+                    if j >= ARM0:
+                        da += d * d
+                        da_max = max(da_max, abs(d))
+                    else:
+                        da_rest += d * d
+                _ = env.step(a.data, rb)
+                step += 1
+                if env.lanes[0].ep_len == 0:        # the clip ended (or the robot fell); the lane is back at its first frame
+                    failed = env.last_terminated[0]
+                    break
+                # after the step: the box against the row the step aimed at, the hands against the box
+                var sp = env.lanes[0].s.unsafe_ptr().as_unsafe_any_origin()
+                var pos = fk.unsafe_ptr().as_unsafe_any_origin()
+                sm_fk_lane[DT, D.NB](
+                    tr.base.tables.tree_ptr(), sp, sp.unsafe_offset(D.NQ), pos, pos.unsafe_offset(D.NB * 3), pos.unsafe_offset(D.NB * 7),
+                    pos.unsafe_offset(D.NB * 10),
                 )
-            var da = 0.0
-            var da_max = 0.0
-            var da_rest = 0.0
-            for j in range(Robot.NDOF):
-                var d = Float64(a.data[j]) - Float64(ab.data[j])
-                if j >= ARM0:
-                    da += d * d
-                    da_max = max(da_max, abs(d))
-                else:
-                    da_rest += d * d
-            _ = env.step(a.data, rb)
-            step += 1
-            if env.lanes[0].ep_len == 0:        # the clip ended (or the robot fell); the lane is back at its first frame
-                failed = env.last_terminated[0]
-                break
-            # after the step: the box against the row the step aimed at, the hands against the box
-            var sp = env.lanes[0].s.unsafe_ptr().as_unsafe_any_origin()
-            var pos = fk.unsafe_ptr().as_unsafe_any_origin()
-            sm_fk_lane[DT, D.NB](
-                tr.base.tables.tree_ptr(), sp, sp.unsafe_offset(D.NQ), pos, pos.unsafe_offset(D.NB * 3), pos.unsafe_offset(D.NB * 7),
-                pos.unsafe_offset(D.NB * 10),
-            )
-            var bx = List[Float64](length=7, fill=0.0)
-            for k in range(7):
-                bx[k] = env.lanes[0].sim.box_qpos(k)
-            var rf = fr * SM_OREF
-            var dx = bx[0] - Float64(orefs[rf])
-            var dy = bx[1] - Float64(orefs[rf + 1])
-            var dz = bx[2] - Float64(orefs[rf + 2])
-            var dot = 0.0
-            for k in range(4):
-                dot += bx[3 + k] * Float64(orefs[rf + 3 + k])
-            var hd = List[Float64](length=2, fill=0.0)
-            var rhd = List[Float64](length=2, fill=0.0)
-            for i in range(2):
-                var h2 = 0.0
-                var r2 = 0.0
+                var bx = List[Float64](length=7, fill=0.0)
+                for k in range(7):
+                    bx[k] = env.lanes[0].sim.box_qpos(k)
+                var rf = fr * SM_OREF
+                var dx = bx[0] - Float64(orefs[rf])
+                var dy = bx[1] - Float64(orefs[rf + 1])
+                var dz = bx[2] - Float64(orefs[rf + 2])
+                var dot = 0.0
+                for k in range(4):
+                    dot += bx[3 + k] * Float64(orefs[rf + 3 + k])
+                var hd = List[Float64](length=2, fill=0.0)
+                var rhd = List[Float64](length=2, fill=0.0)
+                for i in range(2):
+                    var h2 = 0.0
+                    var r2 = 0.0
+                    for k in range(3):
+                        var dh = Float64(fk[hb[i] * 3 + k]) - bx[k]
+                        h2 += dh * dh
+                        r2 += Float64(orefs[rf + SM_OBJ + 3 * i + k]) * Float64(orefs[rf + SM_OBJ + 3 * i + k])
+                    hd[i] = sqrt(h2)
+                    rhd[i] = sqrt(r2)
+                var vr = sqrt(
+                    Float64(env.lanes[0].s[D.NQ]) * Float64(env.lanes[0].s[D.NQ]) + Float64(env.lanes[0].s[D.NQ + 1]) * Float64(env.lanes[0].s[D.NQ + 1])
+                )
+                var rr = fr * D.S + D.NQ
+                var vref = sqrt(Float64(lib_rows[rr]) * Float64(lib_rows[rr]) + Float64(lib_rows[rr + 1]) * Float64(lib_rows[rr + 1]))
+                var bs = 0.0
                 for k in range(3):
-                    var dh = Float64(fk[hb[i] * 3 + k]) - bx[k]
-                    h2 += dh * dh
-                    r2 += Float64(orefs[rf + SM_OBJ + 3 * i + k]) * Float64(orefs[rf + SM_OBJ + 3 * i + k])
-                hd[i] = sqrt(h2)
-                rhd[i] = sqrt(r2)
-            var vr = sqrt(
-                Float64(env.lanes[0].s[D.NQ]) * Float64(env.lanes[0].s[D.NQ]) + Float64(env.lanes[0].s[D.NQ + 1]) * Float64(env.lanes[0].s[D.NQ + 1])
-            )
-            var rr = fr * D.S + D.NQ
-            var vref = sqrt(Float64(lib_rows[rr]) * Float64(lib_rows[rr]) + Float64(lib_rows[rr + 1]) * Float64(lib_rows[rr + 1]))
-            var bs = 0.0
-            for k in range(3):
-                bs += env.lanes[0].sim.box_qvel(k) * env.lanes[0].sim.box_qvel(k)
-            var rise = Float64(orefs[rf + 2]) - z0
-            # the object's three reward terms of this step, as the imagined rollout computes them
-            for k in range(7):
-                o_t.data[k] = Scalar[DT](bx[k])
-            _ = sm_obj_reward_lane[DT, Robot](
-                tr.base.tables.head_ptr(), pos, o_t.data.unsafe_ptr().as_unsafe_any_origin(),
-                orefs.unsafe_ptr().unsafe_offset(rf).as_unsafe_any_origin(), rw.unsafe_ptr().as_unsafe_any_origin(),
-                terms.unsafe_ptr().as_unsafe_any_origin(),
-            )
-            # the hands' mean height above the box's centre: simulated, and the reference's (its hand rows are in the box's frame)
-            var hz = (Float64(fk[hb[0] * 3 + 2]) + Float64(fk[hb[1] * 3 + 2])) / 2.0 - bx[2]
-            trace += (
-                String(step) + "\t" + String(fr - f0) + "\t" + ("1" if rise >= CARRY_RISE else "0") + "\t" + String(rise) + "\t"
-                + String(sqrt(dx * dx + dy * dy + dz * dz)) + "\t" + String(dz) + "\t" + String(sqrt(dx * dx + dy * dy)) + "\t"
-                + String(2.0 * acos(min(abs(dot), 1.0))) + "\t" + String(bx[2] - z0) + "\t" + String(hd[0]) + "\t" + String(hd[1]) + "\t"
-                + String(rhd[0]) + "\t" + String(rhd[1]) + "\t" + String(sqrt(da)) + "\t" + String(da_max) + "\t" + String(sqrt(da_rest)) + "\t"
-                + String(vr) + "\t" + String(vref) + "\t" + String(Float64(env.lanes[0].s[2])) + "\t" + String(sqrt(bs)) + "\t"
-                + String(env.last_reward[0]) + "\t" + String(Float64(terms[0])) + "\t" + String(Float64(terms[1])) + "\t"
-                + String(Float64(terms[2])) + "\t" + String(hz) + "\t0\n"
-            )
-            for k in range(D.NQ):
-                dump += String(Float64(env.lanes[0].s[k])) + "\t"
-            for k in range(7):
-                dump += String(bx[k]) + "\t"
-            for k in range(7):
-                dump += String(Float64(orefs[rf + k])) + "\t"
-            for k in range(D.NQ):
-                dump += String(Float64(lib_rows[fr * D.S + k])) + ("\n" if k == D.NQ - 1 else "\t")
-        write_text_atomic(out_dir + "/" + names[c] + ".trace.tsv", trace)
-        write_text_atomic(out_dir + "/" + names[c] + ".qpos.tsv", dump)
-        print("  ", names[c], "|", step, "steps of", lens[c], "| FELL" if failed else "| stood")
+                    bs += env.lanes[0].sim.box_qvel(k) * env.lanes[0].sim.box_qvel(k)
+                var rise = Float64(orefs[rf + 2]) - z0
+                # the object's three reward terms of this step, as the imagined rollout computes them
+                for k in range(7):
+                    o_t.data[k] = Scalar[DT](bx[k])
+                _ = sm_obj_reward_lane[DT, Robot](
+                    tr.base.tables.head_ptr(), pos, o_t.data.unsafe_ptr().as_unsafe_any_origin(),
+                    orefs.unsafe_ptr().unsafe_offset(rf).as_unsafe_any_origin(), rw.unsafe_ptr().as_unsafe_any_origin(),
+                    terms.unsafe_ptr().as_unsafe_any_origin(),
+                )
+                # the hands' mean height above the box's centre: simulated, and the reference's (its hand rows are in the box's frame)
+                var hz = (Float64(fk[hb[0] * 3 + 2]) + Float64(fk[hb[1] * 3 + 2])) / 2.0 - bx[2]
+                trace += (
+                    String(step) + "\t" + String(fr - f0) + "\t" + ("1" if rise >= CARRY_RISE else "0") + "\t" + String(rise) + "\t"
+                    + String(sqrt(dx * dx + dy * dy + dz * dz)) + "\t" + String(dz) + "\t" + String(sqrt(dx * dx + dy * dy)) + "\t"
+                    + String(2.0 * acos(min(abs(dot), 1.0))) + "\t" + String(bx[2] - z0) + "\t" + String(hd[0]) + "\t" + String(hd[1]) + "\t"
+                    + String(rhd[0]) + "\t" + String(rhd[1]) + "\t" + String(sqrt(da)) + "\t" + String(da_max) + "\t" + String(sqrt(da_rest)) + "\t"
+                    + String(vr) + "\t" + String(vref) + "\t" + String(Float64(env.lanes[0].s[2])) + "\t" + String(sqrt(bs)) + "\t"
+                    + String(env.last_reward[0]) + "\t" + String(Float64(terms[0])) + "\t" + String(Float64(terms[1])) + "\t"
+                    + String(Float64(terms[2])) + "\t" + String(hz) + "\t0\n"
+                )
+                for k in range(D.NQ):
+                    dump += String(Float64(env.lanes[0].s[k])) + "\t"
+                for k in range(7):
+                    dump += String(bx[k]) + "\t"
+                for k in range(7):
+                    dump += String(Float64(orefs[rf + k])) + "\t"
+                for k in range(D.NQ):
+                    dump += String(Float64(lib_rows[fr * D.S + k])) + ("\n" if k == D.NQ - 1 else "\t")
+            var stem = out_dir + "/" + names[c] + ((".t" + String(trial)) if trials > 1 else String(""))
+            write_text_atomic(stem + ".trace.tsv", trace)
+            write_text_atomic(stem + ".qpos.tsv", dump)
+            print("  ", names[c], "trial", trial, "|", step, "steps of", lens[c], "| FELL" if failed else "| stood")
