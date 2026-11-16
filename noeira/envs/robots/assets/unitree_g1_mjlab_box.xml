@@ -3,7 +3,7 @@
   <compiler angle="radian" meshdir="unitree_g1" autolimits="true"/>
 
   <!-- the reproduction's MujocoCfg; Euler, not mjlab's implicitfast: see the bake script -->
-  <option timestep="0.005" iterations="10" ls_iterations="20"/>
+  <option timestep="0.005" iterations="20" ls_iterations="40" cone="elliptic" impratio="10"/>
 
   <default>
     <default class="g1">
@@ -299,7 +299,7 @@
     <body name="box" pos="0.6 0 0.18049999999999999">
       <freejoint name="box_joint"/>
       <geom name="box_collision" type="box" size="0.16350000000000001 0.17249999999999999 0.18049999999999999" mass="1" contype="1" conaffinity="1"
-            condim="3" priority="1" friction="0.9 0.005 0.0001" group="3" rgba=".2 .5 .9 .6"/>
+            condim="4" priority="1" friction="0.9 0.02 0.0001" group="3" rgba=".2 .5 .9 .6"/>
     </body>
   </worldbody>
   <contact>

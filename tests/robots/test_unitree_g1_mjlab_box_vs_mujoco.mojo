@@ -10,9 +10,11 @@ MuJoCo's is `g1_mjlab_ref.ReferencePD`.
 
 WHAT THE BOX ADDS: a second free body; box-plane, box-capsule and box-sphere
 contacts; and MuJoCo's contact-parameter mixing by PRIORITY — the box geom is
-`condim 3`, `priority 1`, so its contacts with the robot's `condim 1` geoms
-are frictional with the box's friction, and with the feet (also priority 1)
-take the larger friction.
+`condim 4`, `priority 1`, so its contacts with the robot's `condim 1` geoms
+are frictional with the box's friction (sliding and torsional), and with the
+feet (also priority 1) take the larger friction. The model's option is
+`cone="elliptic" impratio="10"` (the bake script's THE HOLD), so every
+rollout here, the feet's contacts included, is the elliptic cone's.
 
     rest   the key pose, zero action: the box stays where it is
     drop   the box released tilted and spinning above the floor: it lands on a
@@ -23,6 +25,10 @@ take the larger friction.
            box's contacts land in contact slots the FEET held before — the
            case that showed a stale tangent hint under a box/capsule contact
            (`contact_detection._detect_contacts_env`'s note)
+    spun catch  `catch` with the box spinning about the vertical as it lands:
+           the arms' contact normals are near that axis, so it is the
+           TORSIONAL row that slows the spin (the row a model built at
+           `max_condim 3` silently drops)
 
 AGAINST THE CONVERGED REFERENCE (tolerance 0, 1000 iterations), over the
 first N_GATE control steps, as the robot's own test.
@@ -40,6 +46,7 @@ from noeira.envs.robots.unitree_g1_mjlab_box_xml import (
 from noeira.envs.robots.unitree_g1_mjlab_xml import UnitreeG1MjlabModel
 from noeira.envs.robots.unitree_g1_mjlab_pd import G1M_CONTROL_DECIMATION
 from noeira.physics3d.gpu.constants import META_IDX_NUM_CONTACTS
+from noeira.physics3d.types import ConeType
 
 
 comptime NQ = UnitreeG1MjlabBoxModel.NQ
@@ -77,7 +84,11 @@ def test_model_counts_and_slots() raises:
     assert_true(String(mujoco.mj_id2name(m, mujoco.mjtObj.mjOBJ_GEOM, G1M_BOX_GEOM)) == "box_collision", "the box geom is not geom " + String(G1M_BOX_GEOM))
     var j = Int(py=m.njnt) - 1
     assert_true(Int(py=m.jnt_qposadr[j]) == G1M_BOX_QPOS and Int(py=m.jnt_dofadr[j]) == G1M_BOX_QVEL, "the box's state slots")
-    assert_true(Int(py=m.geom_condim[G1M_BOX_GEOM]) == 3 and Int(py=m.geom_priority[G1M_BOX_GEOM]) == 1, "the box geom's condim / priority")
+    assert_true(Int(py=m.geom_condim[G1M_BOX_GEOM]) == 4 and Int(py=m.geom_priority[G1M_BOX_GEOM]) == 1, "the box geom's condim / priority")
+    # the model definition must follow the asset: a smaller MAX_CONDIM drops the torsional row without a word
+    assert_true(UnitreeG1MjlabBoxModel.MAX_CONDIM >= Int(py=m.geom_condim[G1M_BOX_GEOM]), "the model def's MAX_CONDIM is below the box's condim")
+    assert_true(Int(py=m.opt.cone) == 1 and UnitreeG1MjlabBoxModel.CONE_TYPE == ConeType.ELLIPTIC, "the cone is not elliptic on both sides")
+    assert_true(Float64(py=m.opt.impratio) == 10.0, "impratio is not 10")
     print("  counts and slots OK — nbody", Int(py=m.nbody), " nq", NQ, " nv", NV, " box qpos at", G1M_BOX_QPOS)
 
 
@@ -206,7 +217,7 @@ def test_drop_rollout() raises:
 
 def test_catch_rollout() raises:
     """Released above the forearms of the standing robot: lands on the arms
-    (capsules, condim 1 against the box's condim 3 / priority 1) and goes down
+    (capsules, condim 1 against the box's condim 4 / priority 1) and goes down
     with them."""
     var q: List[Float64] = [0.27, 0.0, 1.05, 1.0, 0.0, 0.0, 0.0]
     var v: List[Float64] = [0.0, 0.0, -0.5, 0.0, 0.0, 0.0]
@@ -231,6 +242,20 @@ def test_driven_catch_rollout() raises:
     var r = _rollout("driven catch", q, v, 0.3)
     assert_true(r[2] >= 3, "the box touched the robot on only " + String(r[2]) + " of the gated steps")
     assert_true(r[0] < 1e-5, "driven catch rollout residual " + String(r[0]))
+
+
+def test_spun_catch_rollout() raises:
+    """`catch` with the box spinning at 6 rad/s about the vertical when it
+    lands on the forearms and then on the floor: the spin is about the
+    contacts' normals, so only torsional friction opposes it. The scenario
+    is sensitive to that row: in MuJoCo the same rollout with the box at
+    `condim 3` ends with the box's qpos 9.5e-3 away (measured 2026-11-16),
+    a thousand times this gate's bound."""
+    var q: List[Float64] = [0.27, 0.0, 1.05, 1.0, 0.0, 0.0, 0.0]
+    var v: List[Float64] = [0.0, 0.0, -0.5, 0.0, 0.0, 6.0]
+    var r = _rollout("spun catch", q, v, 0.0)
+    assert_true(r[2] >= 3, "the box touched the robot on only " + String(r[2]) + " of the gated steps")
+    assert_true(r[0] < 1e-5, "spun catch rollout residual " + String(r[0]))
 
 
 def main() raises:

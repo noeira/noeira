@@ -25,8 +25,11 @@ answer within `ATOL + RTOL·|cpu64|`; float64 agreement must hold on at least
 
 WHAT IT GATES THAT THE ROBOT'S OWN DEVICE GATES DO NOT: a second free body on
 the batched path, box-capsule / box-sphere / box-plane contacts there, and the
-contact-parameter mixing by priority (the box geom is `condim 3`,
-`priority 1`) in the device's narrow phase and solver.
+contact-parameter mixing by priority (the box geom is `condim 4`,
+`priority 1`) in the device's narrow phase and solver; and, since the model's
+option became `cone="elliptic" impratio="10"` (2026-11-16, the bake script's
+THE HOLD), the elliptic cone with a torsional row on this robot's device
+lanes, feet included.
 
 ⚠ NVIDIA-ONLY, as every G1 device gate (nv 41 here): on Apple this SKIPS.
 """
