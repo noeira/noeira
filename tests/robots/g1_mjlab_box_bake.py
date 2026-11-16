@@ -25,6 +25,10 @@ friction from the higher-priority geom of a pair, so every contact of the box (h
 frictional one with the BOX's friction, and the robot's geoms are left as mjlab has them. Against the feet (also
 priority 1) MuJoCo takes the larger friction. `BOX_FRICTION` is then the grip's friction, and the one to randomise.
 
+IT IS DRAWN. The box has this one geom, so it is in group 2 with the robot's visual meshes (a viewer shows groups 0 to
+2, as MuJoCo does), where the robot's own collision capsules are in group 3 and hidden. Group and colour are display
+only: every other array of the compiled model is the same.
+
 THE HOLD (2026-11-16, `docs/OBJECT_INTERACTION_PLAN.md` §6, "Two diagnoses"). Until then the box was `condim 3` under
 MuJoCo's default option (pyramidal cone, `impratio 1`), and a carried box swung 50 degrees about the line between the
 two hands and hung 7 cm low:
@@ -85,7 +89,7 @@ def bake() -> str:
         '    <body name="box" pos="%g %g %.17g">\n'
         '      <freejoint name="box_joint"/>\n'
         '      <geom name="box_collision" type="box" size="%.17g %.17g %.17g" mass="%g" contype="1" conaffinity="1"\n'
-        '            condim="%d" priority="1" friction="%g %g %g" group="3" rgba=".2 .5 .9 .6"/>\n'
+        '            condim="%d" priority="1" friction="%g %g %g" group="2" rgba=".8 .55 .25 1"/>\n'
         '    </body>\n'
     ) % (BOX_REST_XY[0], BOX_REST_XY[1], half[2], half[0], half[1], half[2], BOX_MASS, BOX_CONDIM, *BOX_FRICTION)
     end = "  </worldbody>\n"
