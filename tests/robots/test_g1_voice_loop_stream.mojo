@@ -20,6 +20,9 @@ before it. What this pins:
 5. A `say` from the caller cuts a streamed reply off: its waiting pieces are
    not said.
 6. Muted: nothing synthesised.
+7. The FIRST piece may end at a comma (`first_clause`): a one-sentence reply
+   starts before its sentence ends; only the first comma, only after 12
+   bytes (« Oui, » stays whole), never inside `4,5`; 0 = sentences only.
 
 The loop is the real `G1VoiceLoopOf` with `tts_no_play` (synthesised, played in
 silence), its microphone closed; the reply model and the synthesiser are
@@ -35,7 +38,7 @@ from noeira.envs.robots.g1_command_bank import G1CommandBank
 from noeira.envs.robots.g1_command_language import G1Context
 from noeira.envs.robots.g1_voice_loop import G1VoiceConfig, G1VoiceLoopOf, VL_ST_IDLE, VL_TALK
 from noeira.io.wav import WavAudio
-from noeira.text.spoken import spoken_sentence_end
+from noeira.text.spoken import spoken_clause_end, spoken_sentence_end
 
 
 def check(mut fails: Int, ok: Bool, what: String):
@@ -250,12 +253,13 @@ struct Run(Movable):
 
 def run(
     stream: Bool, mute: Bool, var pieces: List[String], answer: String, ref bank: G1CommandBank, say_at: Int = -1,
-    tts_polls: Int = 2,
+    tts_polls: Int = 2, first_clause: Int = 12,
 ) raises -> Run:
     """A reply streamed as `pieces`; `say_at` >= 0: the caller says something at that poll; a synthesis takes
     `tts_polls` polls."""
     var loop = make_loop(stream, mute, bank)
     loop.tts.value().polls = tts_polls
+    loop.cfg.first_clause = first_clause
     loop.llm.pieces = pieces^
     loop.llm.answer = answer
     loop.heard = String("Comment tu t'appelles ?")
@@ -354,6 +358,31 @@ def main() raises:
     var e = run(True, True, p6^, String("Un. Deux."), bank)
     check(fails, len(e.said) == 0 and e.notes.find("first audio") < 0, "nothing synthesised: " + _join(e.said))
     check(fails, e.event == "Un. Deux.", "the event still carries the answer")
+
+    print("7. the first piece may end at a comma")
+    check(fails, spoken_clause_end(String("Le frigo est devant moi, à 4,5"), 0, 12) == 24, "after « moi, »: "
+          + String(spoken_clause_end(String("Le frigo est devant moi, à 4,5"), 0, 12)))
+    check(fails, spoken_clause_end(String("Oui, bien sûr"), 0, 12) == -1, "« Oui, » is under 12 bytes")
+    check(fails, spoken_clause_end(String("à 4,5 m"), 0, 1) == -1 and spoken_clause_end(String("Il est 10:30 ou"), 0, 1) == -1,
+          "`4,5` and `10:30` are not cut")
+    check(fails, spoken_clause_end(String(" Bon, alors"), 0, 4) == 5, "leading blanks are not counted")
+    var p7: List[String] = ["Le frigo est", " devant moi,", " à 4,5", " mètres."]
+    var g = run(True, False, p7^, String("Le frigo est devant moi, à 4,5 mètres."), bank)
+    check(fails, _join(g.said) == "[Le frigo est devant moi,][à 4,5 mètres.]", "a one-sentence reply in two pieces: " + _join(g.said))
+    check(fails, g.first_before_done, "the first one before the reply was finished")
+    var p7b: List[String] = ["Le frigo est devant moi,", " à gauche,", " à 4,5 mètres."]
+    var h = run(True, False, p7b^, String("Le frigo est devant moi, à gauche, à 4,5 mètres."), bank)
+    check(fails, _join(h.said) == "[Le frigo est devant moi,][à gauche, à 4,5 mètres.]", "only the first comma: " + _join(h.said))
+    var p7c: List[String] = ["Oui, je suis", " là."]
+    var k = run(True, False, p7c^, String("Oui, je suis là."), bank)
+    check(fails, _join(k.said) == "[Oui, je suis là.]", "« Oui, » too short to be a piece: " + _join(k.said))
+    var p7d: List[String] = ["Le frigo est", " devant moi,", " à 4,5", " mètres."]
+    var m = run(True, False, p7d^, String("Le frigo est devant moi, à 4,5 mètres."), bank, -1, 2, 0)
+    check(fails, _join(m.said) == "[Le frigo est devant moi, à 4,5 mètres.]", "first_clause 0: sentences only: " + _join(m.said))
+
+    var p7e: List[String] = ["Bonjour. Le frigo est devant moi, à", " gauche."]
+    var q = run(True, False, p7e^, String("Bonjour. Le frigo est devant moi, à gauche."), bank)
+    check(fails, _join(q.said) == "[Bonjour.][Le frigo est devant moi, à gauche.]", "a sentence's end before the comma wins: " + _join(q.said))
 
     print("ALL PASS" if fails == 0 else String(fails) + " FAILED")
     if fails != 0:

@@ -124,3 +124,25 @@ def spoken_sentence_end(text: String, start: Int) -> Int:
             seen_word = True
         i += mlen if mark else 1
     return -1
+
+
+def spoken_clause_end(text: String, start: Int, min_bytes: Int) -> Int:
+    """Where the first clause of `text[start:]` ends (a byte index past its `,`
+    `;` or `:`), or -1: a mark FOLLOWED BY A BLANK (so `4,5` and `10:30` are
+    not cut) after at least `min_bytes` bytes of text (so « Oui, » is not a
+    piece of its own: too short to cover the synthesis of the next piece).
+    For the FIRST piece of a reply only (a one-sentence reply would otherwise
+    wait for its whole sentence); a sentence's end is `spoken_sentence_end`."""
+    var b = text.as_bytes()
+    var n = len(b)
+    var i = start
+    while i < n and (Int(b[i]) == 32 or Int(b[i]) == 10 or Int(b[i]) == 9):
+        i += 1
+    var first = i
+    while i < n:
+        var c = Int(b[i])
+        if (c == 44 or c == 59 or c == 58) and i - first + 1 >= min_bytes:
+            if i + 1 < n and (Int(b[i + 1]) == 32 or Int(b[i + 1]) == 10 or Int(b[i + 1]) == 9):
+                return i + 1
+        i += 1
+    return -1

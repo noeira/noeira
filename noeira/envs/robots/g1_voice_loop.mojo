@@ -86,7 +86,7 @@ from noeira.ai.speech import (
 )
 from noeira.io.fileio import remove_file, write_file_atomic
 from noeira.io.wav import WavAudio
-from noeira.text.spoken import spoken_sentence_end, spoken_text
+from noeira.text.spoken import spoken_clause_end, spoken_sentence_end, spoken_text
 from noeira.envs.robots.g1_command_bank import G1CommandBank
 from noeira.envs.robots.g1_command_language import (
     g1_command_questions, g1_decide, g1_decide_chain, g1_command_state,
@@ -271,6 +271,12 @@ struct G1VoiceConfig(Copyable, Movable):
     (docs/NN_MODEL_PORTS_PLAN.md §12.8.7, L2). On by default; off = the whole
     reply, synthesised once it is written (as before). The OS voice says the
     whole reply either way."""
+    var first_clause: Int
+    """`stream_reply`: the reply's FIRST piece may end at a comma (`,` `;` `:`
+    then a blank) when no sentence has ended yet, once it has at least this
+    many bytes; 0 = sentences only. A one-sentence reply otherwise waits for
+    its whole sentence (§12.8.7, L2: « Le frigo est devant moi, à 4,5 mètres. »
+    876 ms to its first audio). 12 keeps « Oui, » whole."""
     var tts_no_play: Bool
     """Synthesise but do not play: each piece "plays" for its WAV's length, in
     silence, and the microphone is never gated by it. For timing the voice on a
@@ -374,6 +380,7 @@ struct G1VoiceConfig(Copyable, Movable):
         self.tts_voice = String("")
         self.tts_dl = VL_TTS_DEADLINE_S
         self.stream_reply = True
+        self.first_clause = 12
         self.tts_no_play = False
         self.dec_spec = String("")
         self.memory_route = False
@@ -442,6 +449,11 @@ struct G1VoiceLoopOf[
     """The reply's first audio has not started yet: the note says when it does."""
     var reply_t0: Int
     """When the reply model was asked (the first audio is timed from it)."""
+    var pieces_played: Int
+    """Pieces of the current utterance that have started playing."""
+    var gap_t0: Int
+    """When the voice fell silent with a piece still to come (0 = not silent):
+    the note names a gap of more than 100 ms between two pieces."""
     var stt: Self.STT
     var jev: Self.DEC
     var llm: Self.LLM
@@ -588,6 +600,8 @@ struct G1VoiceLoopOf[
         self.stream_cut = False
         self.audio_wait = False
         self.reply_t0 = 0
+        self.pieces_played = 0
+        self.gap_t0 = 0
         # ⚠ the capture is NOT opened here: `poll` opens it the first time it
         # runs (the `mic` field's note). A device that cannot be opened is
         # reported there, in `mic_dead` and the note, as a dead one is.
@@ -692,6 +706,8 @@ struct G1VoiceLoopOf[
         self.stream_cut = move.stream_cut
         self.audio_wait = move.audio_wait
         self.reply_t0 = move.reply_t0
+        self.pieces_played = move.pieces_played
+        self.gap_t0 = move.gap_t0
         self.stt = move.stt^
         self.jev = move.jev^
         self.llm = move.llm^
@@ -778,6 +794,7 @@ struct G1VoiceLoopOf[
         # off the one playing AND the one still being synthesised, AND the
         # pieces of a streamed reply still waiting
         self._tts_cancel()
+        self.pieces_played = 0
         if not reply:
             self.audio_wait = False
         try:
@@ -848,6 +865,7 @@ struct G1VoiceLoopOf[
         self.tts_ready = List[String]()
         self.tts_ready_s = List[Float64]()
         self.play_until = 0
+        self.gap_t0 = 0
 
     def _playing(mut self) -> Bool:
         """A piece is playing (or, `tts_no_play`, would be)."""
@@ -906,9 +924,19 @@ struct G1VoiceLoopOf[
                         self._tts_fallback(String("[tts] FAILED: ") + String(e) + String(" — OS voice"))
         if not self.tts_busy and len(self.tts_queue) > 0:
             self._tts_next()
+        if (self.gap_t0 == 0 and self.pieces_played > 0 and len(self.tts_ready) == 0
+                and (self.tts_busy or len(self.tts_queue) > 0) and not self._playing()):
+            self.gap_t0 = perf_counter_ns()     # silent, with a piece still to come
         if len(self.tts_ready) > 0 and not self._playing():
             var path = self.tts_ready.pop(0)
             var secs = self.tts_ready_s.pop(0)
+            if self.gap_t0 > 0:
+                var gap = Int(Float64(perf_counter_ns() - self.gap_t0) / 1e6)
+                if gap > 100:
+                    self._add_note(String("[voice] a gap of ") + String(gap) + String(" ms before piece ")
+                                   + String(self.pieces_played + 1))
+                self.gap_t0 = 0
+            self.pieces_played += 1
             if self.cfg.tts_no_play:
                 self.play_until = perf_counter_ns() + Int(secs * 1e9)
             else:
@@ -1690,6 +1718,11 @@ struct G1VoiceLoopOf[
         the voice (`spoken_sentence_end`, `spoken_text`)."""
         while True:
             var e = spoken_sentence_end(self.stream_raw, self.stream_used)
+            if self.stream_parts == 0 and self.cfg.first_clause > 0:
+                # the first piece may end at a comma, if that comes before a sentence's end
+                var c = spoken_clause_end(self.stream_raw, self.stream_used, self.cfg.first_clause)
+                if c >= 0 and (e < 0 or c < e):
+                    e = c
             if e < 0:
                 return
             var piece = spoken_text(String(self.stream_raw[byte = self.stream_used : e]))
