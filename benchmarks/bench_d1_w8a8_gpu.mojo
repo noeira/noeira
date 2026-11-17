@@ -17,9 +17,9 @@ in each of `W8A8_VARIANTS` (comma-separated, default `w8,0,128`), `reps`
 times each:
 
   - `w8`: int8 weights dequantized for the bf16 GEMM (the weights' error alone);
-  - a number: W8A8 with those `Lfm3Text.debug` bits — `0` as the demo runs it,
-    `16` / `32` / `64` a group of linears on bf16 activations (the diagnosis
-    that chose which stay bf16), `128` the MLP unfused.
+  - a number: W8A8 — `0` as the demo runs it, `16` / `32` / `64` a group of
+    linears on bf16 activations (`Lfm3Text.w8a8_bf16_act` 1 / 2 / 4, the
+    diagnosis that chose which stay bf16), `128` the MLP unfused (`debug`).
 
 Per request: tokens, the median ms of each, and against bf16 the largest
 difference of any probability / confidence and the picks that differ (a
@@ -158,7 +158,8 @@ def main() raises:
     var reps = Int(String(args[1]))
     var dir = getenv("HOME") + "/.cache/noeira/local-ai/d1/d1-2B"
     # `W8A8_VARIANTS`: the columns after bf16, comma-separated: `w8` (int8 weights, bf16 GEMM) or a number, W8A8
-    # with those `Lfm3Text.debug` bits (16 / 32 / 64: a group of linears on bf16 activations). `W8A8_SAVE`: a
+    # with 16 / 32 / 64 (`w8a8_bf16_act` 1 / 2 / 4: a group of linears on bf16 activations) and 128 (`debug`:
+    # the MLP unfused). `W8A8_SAVE`: a
     # folder for the answers of every request where a pick moved (`ans_<k>_bf16.json`, `ans_<k>_<variant>.json`).
     var spec = getenv("W8A8_VARIANTS")
     if spec == "":
@@ -222,7 +223,9 @@ def main() raises:
             for vi in range(nv):
                 d1.lm.q8_on = True
                 d1.lm.w8a8 = variants[vi] != "w8"
-                d1.lm.debug = 0 if variants[vi] == "w8" else Int(variants[vi])
+                var bits = 0 if variants[vi] == "w8" else Int(variants[vi])
+                d1.lm.debug = bits & 128
+                d1.lm.w8a8_bf16_act = (bits >> 4) & 7
                 var rv = answer(d1, state, is_json, q, reps)
                 var dv = 0.0
                 var mv = 0
@@ -242,6 +245,7 @@ def main() raises:
             d1.lm.q8_on = False
             d1.lm.w8a8 = False
             d1.lm.debug = 0
+            d1.lm.w8a8_bf16_act = 0
             if i0 >= 0 and i128 >= 0:
                 var a = numbers(outs[i0])
                 var c = numbers(outs[i128])

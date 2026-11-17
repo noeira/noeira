@@ -4,6 +4,7 @@
 """The reply model's side of a turn (docs/NN_MODEL_PORTS_PLAN.md §12.8, S0 and S1).
 
     pixi run -e nvidia mojo build -D LFM3_BF16=1 -I . benchmarks/bench_turn_latency_gpu.mojo -o build/bench_turn
+    # the reply model's chunks in W8A8 (§12.8.9): add -D LFM3_W8A8=1 [-D LFM3_W8A8_BF16_ACT=N]
     ./build/bench_turn [LFM3-1.7B dir] [tests/brain] [items, 0 = all] [reps]
 
 1. A chunk's cost by its length, int8 weights, after a 300-token prompt: 1 to
@@ -76,7 +77,7 @@ def chunk_costs(mut chat: Lfm3Chat, system: String, reps: Int) raises:
     _ = forward_cached(chat.lm, prompt, chat.cache)
     chat.lm.ctx.synchronize()
     var base = chat.cache.mark(chat.lm)
-    print("  a chunk after", base.pos, "tokens (forward only, int8):")
+    print("  a chunk after", base.pos, "tokens (forward only,", "W8A8):" if chat.lm.w8a8 else "int8):")
     var sizes: List[Int] = [1, 2, 3, 4, 5, 8, 16, 32, 64]
     for n in sizes:
         var ids = List[Int]()
@@ -118,7 +119,8 @@ def main() raises:
     var chat = Lfm3Chat.load(DeviceContext(), dir, 4096, True)
     var settings = ChatSettings()
     settings.max_tokens = 120
-    print("A turn's reply: LFM3-1.7B int8, Liquid's sampler;", len(set.items), "BB-1 items over", len(set.scenarios), "scenarios")
+    print("A turn's reply: LFM3-1.7B", "W8A8 (bf16 activations: " + String(chat.lm.w8a8_bf16_act) + ")" if chat.lm.w8a8 else "int8",
+          "Liquid's sampler;", len(set.items), "BB-1 items over", len(set.scenarios), "scenarios")
 
     # the prompts, once: the demo's view, in the question's language
     var systems = List[String]()

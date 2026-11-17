@@ -190,6 +190,18 @@ def q8_rms_kernel(x: Ptr, y: Ptr, q: QPtr, scale: Ptr, w: HPtr, dim_n: Int64, ep
         d += TPB
 
 
+comptime Q8_GEMM_MIN_ROWS: Int = 32
+"""Rows the int8 GEMM is given at least: a chunk with fewer is padded (rows past its own are allocated, not
+written, and their results never read). cuBLAS picks slow int8 kernels under 20 rows on the Orin: a forward's
+GEMMs take 35 ms at 5 rows, 83 at 12, 74 at 16, and 16-17 ms from 20 to 48 (`bench_w8a8_gemm_gpu`, 2026-11-16)."""
+
+
+def q8_gemm_rows(t: Int) -> Int:
+    """The rows `cublas_gemm_i8` runs for a chunk of `t`: at least Q8_GEMM_MIN_ROWS. An int8 operand for it is
+    allocated with that many rows."""
+    return max(t, Q8_GEMM_MIN_ROWS)
+
+
 comptime Q8_OUT_W: Int = 4
 """Outputs a thread of `q8_out_kernel` writes (one 16-byte load and store; `n` a multiple of 4)."""
 

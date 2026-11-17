@@ -39,7 +39,8 @@ tests/llm/test_d1_system_one_gpu.mojo
 # W8A8's kernels (noeira/llm/lfm3/int8_kernels.mojo) and cuBLAS's int8 GEMM
 # against the host: the per-token int8 rows and scales exact, the norm-fused
 # quantization exact, the int32 sums exact, the scaled output within 8e-8,
-# the fused SwiGLU equal to the unfused chain bit for bit; five mutants caught.
+# the fused SwiGLU equal to the unfused chain bit for bit, a short chunk padded
+# to 32 rows (`q8_gemm_rows`) giving the unpadded sums; six mutants caught.
 # No reference needed; NVIDIA only (cuBLAS), build with `-D LFM3_BF16=1`.
 tests/llm/test_lfm3_w8a8_gpu.mojo
 

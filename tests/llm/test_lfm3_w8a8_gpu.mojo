@@ -24,6 +24,9 @@ On random rows with a few outlier columns (as an LLM's activations have):
    unfused chain on the device — `q8_out` of w1's and w3's int32 sums,
    `swiglu_kernel`, `q8_act` — every int8 value and every scale EQUAL: the
    same floats in the same order.
+6. A short chunk padded to `q8_gemm_rows` (cuBLAS's int8 kernels are slow
+   under 20 rows): 5 rows run as 32, the 27 extra rows never written —
+   the 5 rows' int32 sums equal the unpadded GEMM's.
 """
 
 from std.math import sqrt
@@ -35,7 +38,7 @@ from noeira.nn.constants import DT
 from noeira.nn.core.cublas_gemm import cublas_gemm_i8
 from noeira.llm.lfm3.kernels import TPB, swiglu_kernel
 from noeira.llm.lfm3.int8_kernels import (
-    q8_quantize_kernel, q8_act_kernel, q8_rms_kernel, q8_out_kernel, Q8_OUT_W, q8_swiglu_kernel,
+    q8_quantize_kernel, q8_act_kernel, q8_rms_kernel, q8_out_kernel, Q8_OUT_W, q8_swiglu_kernel, q8_gemm_rows,
 )
 
 
@@ -259,6 +262,29 @@ def main() raises:
           "| rows with a nonzero scale", nonzero)
     if bad_hs != 0 or bad_hq != 0 or nonzero < T - 1:
         print("  FAIL q8_swiglu_kernel")
+        fails += 1
+
+    # ── 6. a short chunk, padded
+    var tp = q8_gemm_rows(5)
+    var xp = ctx.enqueue_create_buffer[DType.int8](tp * K)
+    xp.enqueue_fill(Int8(77))  # what the unwritten rows may hold
+    ctx.enqueue_copy(xp.create_sub_buffer[DType.int8](0, 5 * K), xq.create_sub_buffer[DType.int8](0, 5 * K))
+    var acc_p = ctx.enqueue_create_buffer[DType.int32](tp * N)
+    var acc_5 = ctx.enqueue_create_buffer[DType.int32](5 * N)
+    cublas_gemm_i8(ctx, acc_p, xp, wq, tp, N, K)
+    cublas_gemm_i8(ctx, acc_5, xq, wq, 5, N, K)
+    var h_p = ctx.enqueue_create_host_buffer[DType.int32](tp * N)
+    var h_5 = ctx.enqueue_create_host_buffer[DType.int32](5 * N)
+    ctx.enqueue_copy(h_p, acc_p)
+    ctx.enqueue_copy(h_5, acc_5)
+    ctx.synchronize()
+    var bad_p = 0
+    for i in range(5 * N):
+        if h_p[i] != h_5[i]:
+            bad_p += 1
+    print("6. 5 rows padded to", tp, ": sums differ", bad_p, "of", 5 * N)
+    if tp < 20 or bad_p != 0:
+        print("  FAIL the padded GEMM")
         fails += 1
     if fails > 0:
         raise Error(String(fails) + " FAILED")

@@ -45,31 +45,38 @@ from max.gpu.host import DeviceContext, DeviceBuffer
 from noeira.io.json import load_json
 from noeira.io.npy import load_npy_f64
 from noeira.llm.lfm3 import Lfm3Chat, ChatSettings, Lfm3Cache, forward_cached, last_logits, choose
-from noeira.llm.lfm3.model import LF_BF16, LF_INT8
+from noeira.llm.lfm3.model import LF_BF16, LF_INT8, LF_W8A8
 from noeira.nn.constants import DT
 
 
-comptime STAGE_BOUND: Float64 = 0.2 if LF_INT8 else (3e-2 if LF_BF16 else 1e-4)
-"""Max |d| / max |reference| over a prefill stage."""
-comptime LOGIT_BOUND: Float64 = 0.1 if LF_INT8 else (3e-2 if LF_BF16 else 1e-4)
+comptime STAGE_BOUND: Float64 = 0.4 if LF_W8A8 else (0.2 if LF_INT8 else (3e-2 if LF_BF16 else 1e-4))
+"""Max |d| / max |reference| over a prefill stage. W8A8 (`-D LFM3_W8A8=1`, with LFM3_INT8: the chunks on int8
+activations, docs/NN_MODEL_PORTS_PLAN.md §12.8.9): measured 0.29 at the final norm (the Orin, 2026-11-16).
+W8A8's bounds hold the code to the size of its measured error; whether that error costs the replies is BB-1's
+question (`benchmarks/bench_turn_latency_gpu.mojo`), not this file's."""
+comptime LOGIT_BOUND: Float64 = 0.2 if LF_W8A8 else (0.1 if LF_INT8 else (3e-2 if LF_BF16 else 1e-4))
 """Max |d| / max |reference| over one step's logits."""
 comptime TIE: Float64 = 1.0 if LF_BF16 else 0.0
 """A reference top-2 margin (in logits, after the penalty) under which bf16 may flip the token."""
-comptime CACHE_BOUND: Float64 = 0.1 if LF_INT8 else (6e-2 if LF_BF16 else 1e-4)
+comptime CACHE_BOUND: Float64 = 0.3 if LF_W8A8 else (0.1 if LF_INT8 else (6e-2 if LF_BF16 else 1e-4))
 """Cached chunks vs one causal pass, max |d| / max |rows|. In bf16 these are two
 bf16 computations, each ~2e-2 from the fp32 truth at the final norm (the prefill
 stage above), so up to twice that apart (4.5e-2 measured): the check is decisive
 in fp32 only, and the mutants run there."""
-comptime PREFIX_BOUND: Float64 = 3e-2 if (LF_INT8 or LF_BF16) else 1e-4
+comptime PREFIX_BOUND: Float64 = 0.15 if LF_W8A8 else (3e-2 if (LF_INT8 or LF_BF16) else 1e-4)
 """A reply's first logits on a reused prompt prefix vs the same prompt computed
 whole, max |d| / max |logits| (`prefix_checks`). Tighter than CACHE_BOUND: both
 sides are chunks of eight tokens or more, on the same route. Measured on the
 Orin: 2.5e-6 fp32, 7.1e-3 bf16, 4.9e-3 int8; the four mutants move the logits by
-0.094 to 0.17 in every build."""
+0.094 to 0.17 in every build. W8A8: up to 0.11 — a fully reused prompt's last
+token takes the one-token route (int8 weights, fp32 activations), the cold one
+the W8A8 chunk, so the two sides differ by W8A8's own error; the mutants (cache
+logic, not precision) are judged in the other builds."""
 comptime FALSIFY: Float64 = 10.0
-comptime KL_BOUND: Float64 = 0.01 if LF_INT8 else (5e-3 if LF_BF16 else 1e-6)
-"""Mean KL(reference || ours) per teacher-forced step, nats, over the raw logits."""
-comptime TOP1_MIN: Float64 = 0.9 if LF_INT8 else 1.0
+comptime KL_BOUND: Float64 = 0.03 if LF_W8A8 else (0.01 if LF_INT8 else (5e-3 if LF_BF16 else 1e-6))
+"""Mean KL(reference || ours) per teacher-forced step, nats, over the raw logits.
+Measured: int8 0.0009-0.002; W8A8 0.008 / 0.020 / 0.010 on the three cases."""
+comptime TOP1_MIN: Float64 = 0.85 if LF_W8A8 else (0.9 if LF_INT8 else 1.0)
 """Teacher-forced steps whose greedy choice is the reference's (penalty included).
 int8 changes the numbers: its gate is this agreement and the KL, not equal
 tokens (bf16 near-ties aside, the fp32 / bf16 builds must agree everywhere)."""
@@ -340,7 +347,12 @@ def prefix_checks(mut chat: Lfm3Chat, system: String, turn1: String, mut fails: 
           "prefix cache, prepare then the request: the prompt computed ahead from token " + String(prep_kept)
           + ", then all " + String(chat.reused) + " found; logits within " + String(e4))
 
-    # mutants
+    # mutants (not in W8A8: PREFIX_BOUND there is W8A8's own error, the size of a mutant's; see PREFIX_BOUND)
+    comptime if LF_W8A8:
+        print("  (the prefix-cache mutants run in the bf16 and int8 builds)")
+        chat.keep_system = False
+        chat.reset(String(""))
+        return bitwise
     chat.cache.debug = 8
     var m8 = rel_err32(_first_logits(chat, system, turn1), again)
     chat.cache.debug = 0
@@ -382,7 +394,8 @@ def main() raises:
     var model_dir = String(args[1]) if len(args) > 1 else home + "/.cache/noeira/local-ai/lfm3/LFM3-1.7B"
     var ref_dir = String(args[2]) if len(args) > 2 else home + "/.cache/noeira/lfm3/chat_ref"
     var fails = 0
-    print("LFM3-1.7B generation vs Liquid's own code", "(LFM3_BF16)" if LF_BF16 else "(fp32)")
+    print("LFM3-1.7B generation vs Liquid's own code", "(LFM3_BF16)" if LF_BF16 else "(fp32)",
+          "(LFM3_INT8)" if LF_INT8 else "", "(LFM3_W8A8)" if LF_W8A8 else "")
     var t0 = perf_counter_ns()
     var chat = Lfm3Chat.load(DeviceContext(), model_dir, 1024)
     print("  loaded in", (perf_counter_ns() - t0) // 1_000_000, "ms")

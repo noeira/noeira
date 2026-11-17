@@ -40,9 +40,14 @@ from max.gpu.host import DeviceContext, DeviceBuffer
 from noeira.nn.constants import DT
 from noeira.io.json import load_json
 from noeira.text.bpe import ByteLevelBPE
-from .model import Lfm3Text, LF_INT8
+from std.sys.defines import get_defined_int
+from .model import Lfm3Text, LF_INT8, LF_W8A8
 from .generate import Lfm3Cache, Lfm3CacheMark, forward_cached, forward_cached_marks, last_logits
 
+
+comptime CHAT_W8A8_BF16_ACT: Int = get_defined_int["LFM3_W8A8_BF16_ACT", 0]()
+"""The reply model's linears that keep bf16 activations under W8A8 (`Lfm3Text.w8a8_bf16_act`);
+`-D LFM3_W8A8_BF16_ACT=N` for the measurement that chose it (docs/NN_MODEL_PORTS_PLAN.md §12.8.9)."""
 
 comptime BOS = "<|startoftext|>"
 comptime IM_START = "<|im_start|>"
@@ -244,12 +249,20 @@ struct Lfm3Chat(Movable):
     @staticmethod
     def load(
         var ctx: DeviceContext, dir: String, cap: Int = 4096, int8: Bool = LF_INT8, q8_levels: Int = 127,
+        w8a8: Bool = LF_W8A8, w8a8_bf16_act: Int = CHAT_W8A8_BF16_ACT,
     ) raises -> Lfm3Chat:
         """`dir`: an LFM3 text checkpoint (config, safetensors, tokenizer,
         generation_config). `cap`: the conversation's length in tokens.
         `int8`: the weights loaded as int8 (`Lfm3Text.load(int8=True)`, no bf16
-        copy kept; the default is the build's `-D LFM3_INT8=1`)."""
+        copy kept; the default is the build's `-D LFM3_INT8=1`). `w8a8` (with
+        `int8`): a chunk of two tokens or more runs W8A8 (`Lfm3Text.w8a8`,
+        the default the build's `-D LFM3_W8A8=1`), `w8a8_bf16_act`'s linears on
+        bf16 activations. Decoding (one token) reads the int8 weights either way."""
+        if w8a8 and not int8:
+            raise Error("lfm3 chat: W8A8 needs the int8 weights")
         var lm = Lfm3Text.load(ctx^, dir, int8, q8_levels)
+        lm.w8a8 = w8a8
+        lm.w8a8_bf16_act = w8a8_bf16_act
         var tok = ByteLevelBPE.load(dir + "/tokenizer.json")
         var cache = Lfm3Cache.make(lm, cap)
         var gc = load_json(dir + "/generation_config.json")

@@ -136,19 +136,21 @@ def _stream_piece(ring: SharedRing, ref c: Lfm3Chat, sid: Int, mut sent: Int):
 struct Lfm3ChatModel(LocalModel):
     var dir: String
     var int8: Bool
+    var w8a8: Bool
     var chat: Optional[Lfm3Chat]
     var stream: SharedRing
     """The reply's text as it is written (the module note); the service reads it."""
 
-    def __init__(out self, var dir: String, int8: Bool, stream: SharedRing):
+    def __init__(out self, var dir: String, int8: Bool, stream: SharedRing, w8a8: Bool = False):
         self.dir = dir^
         self.int8 = int8
+        self.w8a8 = w8a8
         self.chat = None
         self.stream = stream
 
 
     def load(mut self) raises:
-        var c = Lfm3Chat.load(DeviceContext(), self.dir, CS_CAP, self.int8)
+        var c = Lfm3Chat.load(DeviceContext(), self.dir, CS_CAP, self.int8, w8a8=self.w8a8)
         c.keep_system = True
         self.chat = Optional(c^)
 
@@ -241,12 +243,12 @@ struct Lfm3ChatService(Movable, ChatService):
     var preparing: Bool
     """A `prepare` is in flight (its reply is read and dropped)."""
 
-    def __init__(out self, var dir: String = String(""), int8: Bool = True) raises:
+    def __init__(out self, var dir: String = String(""), int8: Bool = True, w8a8: Bool = False) raises:
         if dir.byte_length() == 0:
             dir = getenv("HOME") + "/.cache/noeira/local-ai/lfm3/LFM3-1.7B"
         var call = LocalCall(CS_REQ_SLOT, CS_REP_SLOT)
         var stream = SharedRing(CS_STREAM_SLOTS, CS_STREAM_SLOT)
-        var bg = BackgroundThread(LocalWorker(Lfm3ChatModel(dir^, int8, stream), call))
+        var bg = BackgroundThread(LocalWorker(Lfm3ChatModel(dir^, int8, stream, w8a8), call))
         self.call = call^
         self.stream = stream
         self.sid = 0
@@ -257,17 +259,22 @@ struct Lfm3ChatService(Movable, ChatService):
         self.preparing = False
 
     @staticmethod
-    def from_spec(spec: String) raises -> Lfm3ChatService:
-        """`native` / `native:<dir>` (int8 weights), `native-bf16` / `native-bf16:<dir>`."""
+    def from_spec(full: String) raises -> Lfm3ChatService:
+        """`native` / `native:<dir>` (int8 weights), `native-bf16` / `native-bf16:<dir>`; the int8 ones with
+        `+w8a8` at the end: a chunk's linears on int8 activations too (`Lfm3Chat.load`'s `w8a8`)."""
+        var w8 = full.endswith("+w8a8")
+        var spec = String(full[byte=0:full.byte_length() - 5]) if w8 else full.copy()
         if spec == "native":
-            return Lfm3ChatService()
+            return Lfm3ChatService(String(""), True, w8)
         if spec.startswith("native:"):
-            return Lfm3ChatService(String(spec[byte=7:]))
+            return Lfm3ChatService(String(spec[byte=7:]), True, w8)
+        if w8:
+            raise Error("chat: '+w8a8' needs the int8 weights ('native' or 'native:<dir>'), not '" + full + "'")
         if spec == "native-bf16":
             return Lfm3ChatService(String(""), False)
         if spec.startswith("native-bf16:"):
             return Lfm3ChatService(String(spec[byte=12:]), False)
-        raise Error("chat: Lfm3ChatService takes 'native[-bf16]' or 'native[-bf16]:<dir>', not '" + spec + "'")
+        raise Error("chat: Lfm3ChatService takes 'native[-bf16][:<dir>]' or 'native[:<dir>]+w8a8', not '" + full + "'")
 
     def state(self) -> Int:
         return self.call.state()
