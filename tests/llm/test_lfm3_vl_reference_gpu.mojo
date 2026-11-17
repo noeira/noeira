@@ -2,7 +2,7 @@
 against d1-2B's own code (docs/NN_MODEL_PORTS_PLAN.md §12.5, step 6).
 
     build on the Orin: build-jetson tests/llm/test_lfm3_vl_reference_gpu.mojo [-D LFM3_BF16=1]
-    ./test_lfm3_vl_reference_gpu [d1 dir] [ref dir]
+    ./test_lfm3_vl_reference_gpu [--w8a8] [d1 dir] [ref dir]
       defaults: ~/.cache/noeira/local-ai/d1/d1-2B and ~/.cache/noeira/d1/ref_vl
 
 The reference is `tools/d1/dump_d1_vl_reference.py` (d1's System One in fp32,
@@ -25,6 +25,14 @@ patches): patches in raster order, the conv's neighbours in token order, the
 RoPE's axes swapped — each must move the projector's output ten times past the
 bound; and the features left out (the text embeddings of `<|image|>` instead)
 must move the slots ten times past theirs.
+
+`--w8a8` (the bf16 build): d1 loaded as the demo loads it,
+`D1.load(vision=True, w8a8=True)` — the backbone's linears on int8 weights and
+int8 activations, the image rows included (docs/NN_MODEL_PORTS_PLAN.md
+§12.8.10). The tower is not W8A8: 1 and 2 hold their bounds. 3 is exact. 4's
+stages and slots are printed, not gated (W8A8's own error, ~10x bf16's); 5
+holds the picks and every probability to W8A8_BOUND of d1's fp32 answers; the
+features left out must move the slots ten times past W8A8's own slot error.
 """
 
 from std.os import getenv
@@ -65,6 +73,9 @@ comptime SLOT_BOUND: Float64 = 5e-3 if LF_BF16 else 1e-4
 """bf16: measured <= 1.1e-3."""
 comptime PROB_BOUND: Float64 = 5e-3 if LF_BF16 else 1e-4
 """bf16: measured <= 2.6e-3 (TF32 tower: 1.1e-3)."""
+comptime W8A8_BOUND: Float64 = 0.1
+"""`--w8a8`: the answers' probabilities against d1's fp32 answers, the text
+gate's W8A8 bound (`test_d1_system_one_gpu --w8a8`)."""
 comptime FALSIFY_FACTOR: Float64 = 10.0
 comptime VL_ONE_STATE = "The robot's head camera sees this."
 comptime VL_ONE_Q = """{"door_open": {"type": "noul", "instructions": "Is there an open door in the picture?"}, "furniture": {"type": "choice", "instructions": "Which of these is in the picture?", "criteria": {"sofa": "a sofa", "bed": "a bed", "fridge": "a fridge", "car": "a car"}}, "light": {"type": "score", "instructions": "How bright is the room?", "criteria": ["dark", "dim", "bright"]}}"""
@@ -148,13 +159,24 @@ def pictures_of(dir: String) raises -> List[Picture]:
 def main() raises:
     var home = getenv("HOME")
     var args = argv()
-    var model_dir = String(args[1]) if len(args) > 1 else home + "/.cache/noeira/local-ai/d1/d1-2B"
-    var ref_dir = String(args[2]) if len(args) > 2 else home + "/.cache/noeira/d1/ref_vl"
+    var pos = List[String]()
+    var w8a8 = False
+    for i in range(1, len(args)):
+        if String(args[i]) == "--w8a8":
+            w8a8 = True
+        else:
+            pos.append(String(args[i]))
+    var model_dir = pos[0] if len(pos) > 0 else home + "/.cache/noeira/local-ai/d1/d1-2B"
+    var ref_dir = pos[1] if len(pos) > 1 else home + "/.cache/noeira/d1/ref_vl"
     var fails = 0
     print("LFM3-VL vision tower + d1 with pictures vs d1's own code",
-          "(fp32)" if not LF_BF16 else ("(LFM3_BF16, TF32 tower)" if LF_VIS_TF32 else "(LFM3_BF16)"))
+          "(fp32)" if not LF_BF16 else ("(LFM3_BF16, TF32 tower)" if LF_VIS_TF32 else "(LFM3_BF16)"),
+          "W8A8" if w8a8 else "")
+    if w8a8 and not LF_BF16:
+        raise Error("--w8a8 runs in the bf16 build (-D LFM3_BF16=1)")
+    var prob_bound = W8A8_BOUND if w8a8 else PROB_BOUND
     var t0 = perf_counter_ns()
-    var d1 = D1.load(DeviceContext(), model_dir, vision=True)
+    var d1 = D1.load(DeviceContext(), model_dir, vision=True, w8a8=w8a8)
     print("  d1 + vision loaded in", (perf_counter_ns() - t0) // 1_000_000, "ms")
     var dm = d1.vision.value().cfg.hidden
     var th = d1.vision.value().cfg.text_hidden
@@ -247,7 +269,7 @@ def main() raises:
             var gp = got.field(g, "probabilities")
             for j in range(want.size(wp)):
                 worst_p = max(worst_p, abs(got.number(got.field(gp, want.key_at(wp, j))) - want.number(want.at(wp, j))))
-        check(fails, picks and worst_p <= PROB_BOUND, String(want.size(wa)) + " answers, same picks, worst probability |d| = "
+        check(fails, picks and worst_p <= prob_bound, String(want.size(wa)) + " answers, same picks, worst probability |d| = "
               + String(worst_p))
         # 4. the backbone with the features in place
         var feats = d1.vision.value().encode_all(pics)
@@ -273,8 +295,11 @@ def main() raises:
             if se[1] > wt:
                 wt = se[1]
                 wt_at = at
-        check(fails, wt <= STAGE_BOUND, "backbone, TEXT rows: embedding, 24 layers, final norm; worst " + wt_at
-              + "  rel err = " + String(wt))
+        if w8a8:
+            print("  (not gated, W8A8) backbone, TEXT rows: worst", wt_at, " rel err =", wt)
+        else:
+            check(fails, wt <= STAGE_BOUND, "backbone, TEXT rows: embedding, 24 layers, final norm; worst " + wt_at
+                  + "  rel err = " + String(wt))
         comptime if not LF_BF16:
             check(fails, wi <= IMAGE_ROW_BOUND, "backbone, IMAGE rows (features in place); worst " + wi_at
                   + "  rel err = " + String(wi))
@@ -282,7 +307,10 @@ def main() raises:
             print("  (not gated) backbone, IMAGE rows: worst", wi_at, " rel err =", wi, "- the tower's drift, carried")
         var want_logz = load_npy_f64(dir + "/row0_slot_logz.npy")
         var es = rel_err(d1.lm.slot_logz(h, t, r0.slots), want_logz)
-        check(fails, es <= SLOT_BOUND, "slots' log-softmax over the vocabulary  rel err = " + String(es))
+        if w8a8:
+            print("  (not gated, W8A8) slots' log-softmax over the vocabulary  rel err =", es)
+        else:
+            check(fails, es <= SLOT_BOUND, "slots' log-softmax over the vocabulary  rel err = " + String(es))
 
         if c == 0:
             var tu = d1.vision.value().unused()
@@ -305,11 +333,16 @@ def main() raises:
             var none2 = List[DeviceBuffer[DT]]()
             var h0 = d1.lm.forward(r0.ids, r0.groups, r0.state_len, none2)
             var e0 = rel_err(d1.lm.slot_logz(h0, t, r0.slots), want_logz)
-            check(fails, e0 >= FALSIFY_FACTOR * SLOT_BOUND, "defect caught: the features left out  slots rel err = " + String(e0))
-        # timing (warm)
-        var t1 = perf_counter_ns()
-        _ = d1.system_one(states[c], is_json[c], questions[c], pics)
-        print("     system_one with", len(pics), "picture(s),", t, "tokens, warm:", Float64(perf_counter_ns() - t1) / 1e6, "ms")
+            var own = es if w8a8 else SLOT_BOUND
+            check(fails, e0 >= FALSIFY_FACTOR * own, "defect caught: the features left out  slots rel err = " + String(e0)
+                  + (" (W8A8's own " + String(es) + ")" if w8a8 else String("")))
+        # timing (warm, the best of three)
+        var best = 1e18
+        for _ in range(3):
+            var t1 = perf_counter_ns()
+            _ = d1.system_one(states[c], is_json[c], questions[c], pics)
+            best = min(best, Float64(perf_counter_ns() - t1) / 1e6)
+        print("     system_one with", len(pics), "picture(s),", t, "tokens, warm (best of 3):", best, "ms")
     if fails > 0:
         raise Error(String(fails) + " FAILED")
     print("ALL PASS")

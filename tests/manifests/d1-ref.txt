@@ -94,5 +94,8 @@ tests/llm/test_d1_service_gpu.mojo
 # bf16 tower drifts 0.05-0.12 on the same pictures — answers within 2.6e-3,
 # 307 ms for a 640x480 picture and three questions on the Orin;
 # `-D LFM3_VIS_TF32=1` keeps the tower's activations fp32 (0.02-0.03, answers
-# 1.1e-3, +56 ms a picture).
+# 1.1e-3, +56 ms a picture). Its `--w8a8` leg (by hand, the bf16 build:
+# `./build/t --w8a8`) loads d1 as the demo does (`vision=True, w8a8=True`,
+# docs/NN_MODEL_PORTS_PLAN.md §12.8.10): the same picks, probabilities within
+# 0.1 of fp32 (measured 0.018 / 0.010); 306 -> 250 ms with one picture.
 tests/llm/test_lfm3_vl_reference_gpu.mojo
