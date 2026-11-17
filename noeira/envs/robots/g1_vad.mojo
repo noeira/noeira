@@ -278,6 +278,25 @@ struct G1Vad(Movable):
         self.missed = 0
         self.calm = 0
 
+    def speech_seconds(self, ref pcm: List[Int16]) -> Float64:
+        """Seconds of `pcm`'s whole frames over the open threshold; nothing of
+        the detector changes. For a replay with the echo gate in silence
+        (`G1VoiceConfig.tts_no_play_gated`): how much of the input's speech the
+        gate threw away. Live, that audio is the robot's own voice to the gate
+        and cannot be counted this way."""
+        var open_at = g1_vad_open_at(self.floor)
+        var n = 0
+        var i = 0
+        while i + VL_FRAME <= len(pcm):
+            var acc = 0.0
+            for k in range(VL_FRAME):
+                var v = Float64(pcm[i + k]) / 32768.0
+                acc += v * v
+            if (acc / Float64(VL_FRAME)) ** 0.5 > open_at:
+                n += 1
+            i += VL_FRAME
+        return Float64(n * VL_FRAME) / 16000.0
+
     def skip(mut self, samples: Int) -> G1VadEvent:
         """`samples` were read and DISCARDED (the robot is speaking: the echo
         gate). Nothing of them is levelled or kept, and the pre-roll is

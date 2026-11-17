@@ -292,6 +292,14 @@ struct G1VoiceConfig(Copyable, Movable):
     silence, and the microphone is never gated by it. For timing the voice on a
     headless replay (`--mic-input`): the note says when the first audio would
     have started."""
+    var tts_no_play_gated: Bool
+    """With `tts_no_play`: the microphone IS gated while a piece "plays" in
+    silence (and `VL_ECHO_TAIL_S` after), as it is live. A replay then loses
+    what a live session would lose: a sentence begun over the robot's reply is
+    discarded, or heard from where the gate reopened. Each time the gate
+    reopens, `[echo] X s of speech while the robot spoke` says how much of the
+    input's speech it threw away (counted on the replay's clean input,
+    `G1Vad.speech_seconds`; live that audio is the robot's own voice)."""
     var dec_spec: String
     """The decision backend's spec (`DEC.from_spec`): for `JevClient`, "" =
     hosted Jev or `JEV_URL`; for `D1Service`, `native` / `native:<dir>`."""
@@ -403,6 +411,7 @@ struct G1VoiceConfig(Copyable, Movable):
         self.stream_reply = True
         self.first_clause = 12
         self.tts_no_play = False
+        self.tts_no_play_gated = False
         self.dec_spec = String("")
         self.memory_route = False
         self.dest_words = List[String]()
@@ -553,6 +562,9 @@ struct G1VoiceLoopOf[
     """The detector: levels, the pre-roll, the segment in hand (`g1_vad.mojo`)."""
     var seg_keep: List[Int16]
     """The utterance last sent to the recogniser, until `take_segment`."""
+    var echo_speech_s: Float64
+    """`tts_no_play_gated`: the input's speech thrown away by the echo gate
+    since it closed (reported, then reset, when it reopens)."""
     var missed_s: Float64
     """Speech not listened to because the loop was busy, in seconds, until
     `take_missed`."""
@@ -739,6 +751,7 @@ struct G1VoiceLoopOf[
         self.mute_until = perf_counter_ns()
         self.seg_keep = List[Int16]()
         self.missed_s = 0.0
+        self.echo_speech_s = 0.0
         self.reply_override = String("")
         self.override_final = True
         self.heard_given = False
@@ -821,6 +834,7 @@ struct G1VoiceLoopOf[
         self.vad = move.vad^
         self.seg_keep = move.seg_keep^
         self.missed_s = move.missed_s
+        self.echo_speech_s = move.echo_speech_s
         self.reply_override = move.reply_override^
         self.override_final = move.override_final
         self.heard_given = move.heard_given
@@ -1201,9 +1215,13 @@ struct G1VoiceLoopOf[
         """⚠ A GATE THAT RAISES WOULD TAKE THE LOOP DOWN, and the safe default
         is to assume we ARE talking rather than open the microphone onto our
         own voice. A piece being synthesised or waiting to play counts: the
-        robot is about to say it. `tts_no_play`: never (nothing is heard)."""
+        robot is about to say it. `tts_no_play`: never (nothing is heard),
+        unless `tts_no_play_gated`: then as live, for the silent pieces."""
         if self.cfg.tts_no_play:
-            return False
+            if not self.cfg.tts_no_play_gated:
+                return False
+            return (self.tts_busy or len(self.tts_queue) > 0 or len(self.tts_ready) > 0
+                    or perf_counter_ns() < self.play_until)
         if self.tts_busy or len(self.tts_queue) > 0 or len(self.tts_ready) > 0:
             return True
         try:
@@ -1278,6 +1296,8 @@ struct G1VoiceLoopOf[
                     # ⚠ AND THE PRE-ROLL GOES WITH THEM (`G1Vad.skip`): it would
                     # hand the recogniser the tail of the robot's own sentence
                     # as the first syllable of yours.
+                    if self.cfg.tts_no_play and self.cfg.tts_no_play_gated:
+                        self.echo_speech_s += self.vad.speech_seconds(pcm)
                     ve = self.vad.skip(len(pcm))
                 else:
                     # ⚠ VAD OPENS ONLY FROM IDLE. While a transcription or a
@@ -1321,6 +1341,11 @@ struct G1VoiceLoopOf[
                 if ve.note != "":
                     self.note = ve.note
                 self.missed_s += ve.missed_s
+                if not echoing and self.echo_speech_s > 0.0:
+                    if self.echo_speech_s >= 0.1:
+                        self._add_note(String("[echo] ") + _vl_f2(self.echo_speech_s)
+                                       + String(" s of speech while the robot spoke — not heard"))
+                    self.echo_speech_s = 0.0
                 if self.state == VL_ST_REC and not ve.done:
                     self._early_step(ctx)
                 if self.state == VL_ST_REC and ve.done:

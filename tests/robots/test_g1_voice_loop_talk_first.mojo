@@ -34,6 +34,9 @@ said while d1 still decides, and the decision still acts.
     utterance (a caller that takes the words a poll late): never said.
 12. (S3 item 2) the two-place request carries no triage `kind`; the
     destination request keeps it.
+13. (`tts_no_play_gated`, a replay's echo gate) a piece "playing" in
+    silence counts as speaking only when gated: the microphone is then muted
+    as it is live.
 
 The loop is the real `G1VoiceLoopOf`, its microphone closed, a stand-in
 recogniser handing it the sentence, a stand-in decision answering from a
@@ -41,6 +44,7 @@ script, and a stand-in reply model.
 """
 
 from std.sys import exit
+from std.time import perf_counter_ns
 
 from noeira.ai.chat import ChatMessage, ChatResponse, ChatService, ToolSpec
 from noeira.ai.jev import DecisionService, JevAnswers, JevQuestions
@@ -508,6 +512,18 @@ def main() raises:
     var w2 = JsonWriter()
     tp.dest_q.write_to_json(w2)
     check(fails, w2.done().find("\"kind\"") >= 0, "the destination request keeps it")
+
+    print("13. a silent piece and the echo gate")
+    var sg = make_loop(0.7, bank)
+    sg.cfg.tts_no_play = True
+    sg.play_until = perf_counter_ns() + 2_000_000_000
+    check(fails, not sg.speaking(), "--tts-no-play: a silent piece does not mute the microphone")
+    sg.cfg.tts_no_play_gated = True
+    check(fails, sg.speaking(), "--tts-no-play-gated: it does, as a piece played live")
+    sg.play_until = 0
+    check(fails, not sg.speaking(), "and not once it has ended")
+    sg.tts_queue.append(String("Une phrase."))
+    check(fails, sg.speaking(), "a piece still to synthesise counts, as live")
 
     print("ALL PASS" if fails == 0 else String(fails) + " FAILED")
     if fails != 0:

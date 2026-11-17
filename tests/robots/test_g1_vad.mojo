@@ -385,6 +385,23 @@ def main() raises:
     check(fails, vk.pause_seq == 0 and vf.pause_seq == 0 and evk.note.startswith("[vad] dropped") and evf.note.startswith("[vad] dropped"),
           "what it drops never pauses: a knock under 1.2 s, a faint sound")
 
+    # `speech_seconds` (a replay's echo gate in silence counts the speech it throws away): 1.5 s of tone in 3.5 s
+    # of audio, against the floor a quiet room settles to; nothing of the detector changes
+    var cnt = G1Vad(0.6, 0.35, 10.0)
+    var calm = List[Int16]()
+    room(calm, 2.0, rng)
+    _ = cnt.feed(calm, False)
+    var mix = List[Int16]()
+    room(mix, 1.0, rng)
+    speech(mix, 1.5, rng)
+    room(mix, 1.0, rng)
+    var floor0 = cnt.floor
+    var consumed0 = cnt.consumed
+    var under = cnt.speech_seconds(mix)
+    check(fails, abs(under - 1.5) <= 0.04, "speech_seconds: 1.5 s of speech counted as " + String(under))
+    check(fails, cnt.floor == floor0 and cnt.consumed == consumed0 and not cnt.recording, "and the detector is unchanged")
+    check(fails, cnt.speech_seconds(calm) == 0.0, "a quiet room: 0 s")
+
     print("ALL PASS" if fails == 0 else String(fails) + " FAILED")
     if fails != 0:
         exit(1)
