@@ -8,7 +8,7 @@ randomisation, every clip to its end or to a fall, and for the box the counts
     pixi run -e nvidia mojo build -I . -D SM_PAPER=1 examples/g1/supermimic_object_eval.mojo -o /tmp/sm_obj_eval
     /tmp/sm_obj_eval --ckpt TRACKER.ckpt --store CARRY_50HZ.h5 --object-dir OBJECT_CSV_DIR --clips CLIPS.tsv \\
         [--interface INTERFACE.ckpt] [--split eval] [--gain 0.1] [--csv OUT.csv]
-        [--trials 8] [--seed 0] [--honesty 500] [--squeeze 40] [--w-pos 1.0] [--std-pos 0.2] [--w-ori 0.5] [--std-ori 0.4] [--w-hands 1.0] [--std-hands 0.1]
+        [--trials 8] [--seed 0] [--honesty 500] [--squeeze 40] [--lead-in 50] [--w-pos 1.0] [--std-pos 0.2] [--w-ori 0.5] [--std-ori 0.4] [--w-hands 1.0] [--std-hands 0.1]
 
     --interface  `supermimic_object_train.mojo --out`'s checkpoint. WITHOUT it the object encoder is at
                  its zero start and the score is the BLIND tracker's on the same clips: the number to beat.
@@ -16,6 +16,8 @@ randomisation, every clip to its end or to a fall, and for the box the counts
     --trials     every clip this many times, each start perturbed by the training's reset noise (1: the
                  deterministic benchmark). The summary then gives the share of carry steps held per trial
                  (mean, lowest, highest) and how many runs pass; rank arms on these, not on one trial.
+    --lead-in N  N frames of standing at each clip's first pose before the clip (`object_task.sm_lead_in`; 50 = 1 s).
+                  Half the carry clips lift the box within a second of their first frame; train and score with the same N.
     --squeeze    the benchmark with the scripted squeeze of this many newtons on every lane
                  (`object_agent_gpu.SMObjSqueeze`): a probe of that exploration prior, not a score of the interface
     --honesty    INSTEAD of the benchmark: O1.4's gate, the imagined rollout's return against the simulator's
@@ -40,7 +42,7 @@ from noeira.deep_agents.supermimic.object_env_gpu import sm_object_track
 from noeira.deep_agents.supermimic.object_eval import SM_OBJ_HELD_SHARE, SMObjHonesty, sm_obj_benchmark, sm_obj_honesty
 from noeira.deep_agents.supermimic.object_policy import SMObjConfig
 from noeira.deep_agents.supermimic.object_task import (
-    SM_OSTD_HANDS, SM_OSTD_ORI, SM_OSTD_POS, SM_OW_HANDS, SM_OW_ORI, SM_OW_POS, sm_object_ref_rows, sm_obj_reward_params,
+    SM_OSTD_HANDS, SM_OSTD_ORI, SM_OSTD_POS, SM_OW_HANDS, SM_OW_ORI, SM_OW_POS, sm_lead_in, sm_object_ref_rows, sm_obj_reward_params,
 )
 from noeira.deep_agents.supermimic.object_trainer import SMObjTrainer
 from noeira.deep_agents.supermimic.robot import G1MjlabBoxBatchedSim, G1MjlabBoxRobot, SMDims
@@ -190,6 +192,10 @@ def main() raises:
         o += l
     if len(lens) != len(want):
         raise Error("the store holds " + String(len(lens)) + " of the " + String(len(want)) + " `" + split + "` clips named")
+    var lead = Int(_opt(args, String("--lead-in"), String("0")))
+    if lead > 0:
+        sm_lead_in[Robot](rows, lens, poses, lead)
+        print("lead-in:", lead, "frames of standing at each clip's first pose before it")
     var track = sm_object_track(poses, lens)
 
     var ctx = DeviceContext()

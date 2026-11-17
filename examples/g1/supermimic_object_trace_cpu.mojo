@@ -9,12 +9,14 @@ far the interface's action is from the tracker's own.
     pixi run mojo build -I . examples/g1/supermimic_object_trace_cpu.mojo -o build/sm_obj_trace
     pixi run ./build/sm_obj_trace --ckpt TRACKER.ckpt --store CARRY_50HZ.h5 --object-dir OBJECT_CSV_DIR \\
         --only NAME[,NAME…] --out-dir DIR [--interface INTERFACE.ckpt] [--gain 0.1]
-        [--squeeze 40] [--ref-squeeze 0.05] [--ref-lower 1.0] [--trials 8 --seed 0]
+        [--squeeze 40] [--ref-squeeze 0.05] [--ref-lower 1.0] [--trials 8 --seed 0] [--lead-in 50]
 
     --squeeze F      the scripted squeeze on the executed actions (`object_task.sm_squeeze_lane`), F newtons
     --ref-squeeze D  the reference's hands D metres toward the box while it is lifted (`sm_squeeze_reference`)
     --ref-lower S    … and DOWN by the share S of their height above the box's centre (the arms alone)
     The box's reference and the reward's reference grasp stay the ORIGINAL clip's under both edits.
+    --lead-in N      N frames of standing at each clip's first pose before the clip (`object_task.sm_lead_in`; 50 = 1 s).
+                  Half the carry clips lift the box within a second of their first frame; train and score with the same N.
     --trials K       every clip K times, each from a start perturbed by the training's reset noise (the robot's
                      root and joints; the box stays at its reference), as `sm_obj_benchmark`'s `trials`; the
                      files are then NAME.tI.trace.tsv / NAME.tI.qpos.tsv. The draws are this process's, seeded
@@ -55,7 +57,7 @@ from noeira.deep_agents.supermimic.object_policy import SMObjConfig
 from noeira.deep_agents.supermimic.object_spec import SM_OBJ
 from noeira.deep_agents.supermimic.object_task import (
     SM_OBJ_TERMS, SM_OREF, sm_obj_reward_lane, sm_obj_reward_params, sm_object_ref_rows, sm_squeeze_lane, sm_squeeze_reference,
-    sm_squeeze_weights,
+    sm_lead_in, sm_squeeze_weights,
 )
 from noeira.deep_agents.supermimic.object_trainer import SMObjTrainer
 from noeira.deep_agents.supermimic.robot import G1MjlabBoxRobot, SMDims
@@ -161,6 +163,10 @@ def main() raises:
         o += l
     if len(lens) != len(want):
         raise Error("the store holds " + String(len(lens)) + " of the " + String(len(want)) + " clips named")
+    var lead = Int(_opt(args, String("--lead-in"), String("0")))
+    if lead > 0:
+        sm_lead_in[Robot](rows, lens, poses, lead)
+        print("lead-in:", lead, "frames of standing at each clip's first pose before it")
     var track = sm_object_track(poses, lens)
 
     var base = SuperMimicTrainer[C].for_robot(Robot.SIM.create())

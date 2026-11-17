@@ -12,12 +12,15 @@ G1 with one free box; the object's pose is the simulator's (no perception).
         [--seed 0] [--utd 0.4] [--warmup 40] [--lr 2e-4] [--om-lr 5e-5] [--gain 0.1] [--replay 1000]
         [--w-pos 1.0] [--std-pos 0.2] [--w-ori 0.5] [--std-ori 0.4] [--w-hands 1.0] [--std-hands 0.1]
         [--no-noise 1] [--resume INTERFACE.ckpt] [--squeeze-copies 0.10] [--squeeze-force 40] [--squeeze-until 6000]
+        [--lead-in 50]
 
     --ckpt         the tracker's checkpoint (its world model, encoder, decoder: none of them is written)
     --object-ckpt  the object network alone, as `supermimic_object_fit.mojo --out` saves it;
                    without it the object network starts at zero (a box at constant velocity)
     --clips        a TSV with `name` and `split` columns; the `train` rows are used
     the six reward numbers are data: a revision is a run, not a build
+    --lead-in N    N frames of standing at each clip's first pose before the clip (`object_task.sm_lead_in`; 50 = 1 s).
+                  Half the carry clips lift the box within a second of their first frame; train and score with the same N.
     --squeeze-copies D  the library is the train clips TWICE: as they are, and with the hands aimed D metres
                    into the box while the reference box is lifted (`object_task.sm_squeeze_reference`). The
                    tracker presses on the box on the second half's lanes, so the replay and the object network
@@ -60,7 +63,7 @@ from noeira.deep_agents.supermimic.object_env_gpu import sm_object_track
 from noeira.deep_agents.supermimic.object_policy import SMObjConfig
 from noeira.deep_agents.supermimic.object_task import (
     SM_OSTD_HANDS, SM_OSTD_ORI, SM_OSTD_POS, SM_OW_HANDS, SM_OW_ORI, SM_OW_POS, sm_object_ref_rows, sm_obj_reward_params,
-    sm_squeeze_reference,
+    sm_lead_in, sm_squeeze_reference,
 )
 from noeira.deep_agents.supermimic.object_spec import SM_OBJ
 from noeira.deep_agents.supermimic.object_trainer import SMObjTrainer
@@ -210,6 +213,10 @@ def main() raises:
         o += l
     if len(lens) != len(want):
         raise Error("the store holds " + String(len(lens)) + " of the " + String(len(want)) + " train clips named")
+    var lead = Int(_opt(args, String("--lead-in"), String("0")))
+    if lead > 0:
+        sm_lead_in[Robot](rows, lens, poses, lead)
+        print("lead-in:", lead, "frames of standing at each clip's first pose before it")
     var track = sm_object_track(poses, lens)
     print(
         "clips: train", len(lens), "(", len(rows) // D.S, "frames ) | lanes", LANES, "| object-network batch", WB, "| imagined starts", PB,

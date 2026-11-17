@@ -230,6 +230,55 @@ def sm_object_ref_rows[R: TrackingRobot](
     return out^
 
 
+# ── a lead-in before each clip ──────────────────────────────────────────────
+def sm_lead_in[R: TrackingRobot](
+    mut rows: List[Scalar[DT]], mut lens: List[Int], mut poses: List[Float64], frames: Int
+) raises:
+    """Each clip of `lens` gets `frames` more frames at its start: the robot
+    standing at the clip's first pose with zero velocity, the box at its first
+    pose. In place: `rows` (S a frame, the clips of `lens` first; later rows
+    keep their place after them), `lens`, and `poses` (the box's 7 numbers a
+    frame, as the drivers read them, BEFORE `sm_object_track` turns them into
+    a track, which then gives the box zero velocity over the lead-in).
+
+    Why (`docs/OBJECT_INTERACTION_PLAN.md` §6, 16 Nov): half the carry clips
+    lift the box less than a second after their first frame, some after a
+    sixth of a second. A start perturbed there (the training's reset noise
+    includes a velocity of up to 0.5 m/s) has no time to settle before the
+    grasp, and those are the trials that lose the box. With a lead-in the
+    clip's first frame is a stand, as a carry begins in practice.
+
+    The reference's velocity is zero through the lead-in and the clip's own
+    from its first frame on: a step in velocity there, as at any clip's start."""
+    comptime D = SMDims[R]
+    var total = 0
+    for c in range(len(lens)):
+        total += lens[c]
+    if frames < 0 or total * D.S > len(rows) or total * 7 != len(poses):
+        raise Error("sm_lead_in: " + String(total) + " frames named, " + String(len(rows) // D.S) + " rows, " + String(len(poses) // 7) + " box poses")
+    if frames == 0:
+        return
+    var new_rows = List[Scalar[DT]](capacity=len(rows) + len(lens) * frames * D.S)
+    var new_poses = List[Float64](capacity=len(poses) + len(lens) * frames * 7)
+    var off = 0
+    for c in range(len(lens)):
+        for _ in range(frames):
+            for k in range(D.S):
+                new_rows.append(rows[off * D.S + k] if k < D.NQ else Scalar[DT](0))
+            for k in range(7):
+                new_poses.append(poses[off * 7 + k])
+        for i in range(lens[c] * D.S):
+            new_rows.append(rows[off * D.S + i])
+        for i in range(lens[c] * 7):
+            new_poses.append(poses[off * 7 + i])
+        off += lens[c]
+        lens[c] += frames
+    for i in range(off * D.S, len(rows)):            # rows of clips not named
+        new_rows.append(rows[i])
+    rows = new_rows^
+    poses = new_poses^
+
+
 # ── a squeezed copy of the reference ────────────────────────────────────────
 comptime SM_SQ_LEAD: Int = 10         # frames before the reference lifts at which the squeeze starts (and its ramp)
 comptime SM_SQ_REACH: Float64 = 0.45  # a hand farther than this from the box's centre is left alone (m)

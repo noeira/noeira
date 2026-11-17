@@ -8,12 +8,14 @@ noise, no randomisation), one lane of the CPU env with the box, drawn.
     pixi run mojo build -I . -Xlinker -ld_classic examples/g1/supermimic_object_viewer.mojo -o build/sm_obj_view
     pixi run ./build/sm_obj_view --ckpt TRACKER.ckpt --store CARRY_50HZ.h5 --object-dir OBJECT_CSV_DIR \\
         --only NAME[,NAME…] [--interface INTERFACE.ckpt] [--gain 0.1] [--fps 50] [--record demo.mp4]
-        [--trials 3 --seed 0]
+        [--trials 3 --seed 0] [--lead-in 50]
 
     --interface  `supermimic_object_train.mojo --out`'s checkpoint. WITHOUT it the object encoder is at its
                  zero start: the blind tracker, which goes through the motions and leaves the box on the floor.
     --trials K   every clip K times, each from a start perturbed by the training's reset noise (the robot's
                  root and joints; the box stays at its reference)
+    --lead-in N  N frames of standing at each clip's first pose before the clip (`object_task.sm_lead_in`; 50 = 1 s).
+                  Half the carry clips lift the box within a second of their first frame; train and score with the same N.
     --record     every drawn frame to PATH (mp4 or gif, needs `ffmpeg`) at the playback rate
 
 The window's text and each run's printed line give what the benchmark counts (`object_eval.sm_obj_benchmark`): the
@@ -40,7 +42,7 @@ from noeira.deep_agents.supermimic.motion_library import SMMotionLibrary
 from noeira.deep_agents.supermimic.object_env_gpu import sm_object_track
 from noeira.deep_agents.supermimic.object_policy import SMObjConfig
 from noeira.deep_agents.supermimic.object_spec import SM_OBJ
-from noeira.deep_agents.supermimic.object_task import SM_OREF, sm_object_ref_rows
+from noeira.deep_agents.supermimic.object_task import SM_OREF, sm_lead_in, sm_object_ref_rows
 from noeira.deep_agents.supermimic.object_trainer import SMObjTrainer
 from noeira.deep_agents.supermimic.robot import G1MjlabBoxRobot, SMDims
 from noeira.io.fileio import read_file_bytes
@@ -140,6 +142,10 @@ def main() raises:
             o += l
         if not hit:
             raise Error("the store holds no clip named " + want[k])
+    var lead = Int(_opt(args, String("--lead-in"), String("0")))
+    if lead > 0:
+        sm_lead_in[Robot](rows, lens, poses, lead)
+        print("lead-in:", lead, "frames of standing at each clip's first pose before it")
     var track = sm_object_track(poses, lens)
 
     var base = SuperMimicTrainer[C].for_robot(Robot.SIM.create())

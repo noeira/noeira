@@ -18,6 +18,11 @@ rollout's oracle, `test_supermimic_obj_imag`.)
 [4] the reference rows on the G1 with its box: with the robot at a library
     row and the object on its track row, the hands term is at its maximum in
     every frame; the first 13 numbers are the track's.
+[5] the lead-in (`sm_lead_in`): two clips of 5 and 3 frames and one more not
+    named, 4 frames of lead-in: the named clips are 9 and 7 frames; each
+    starts with 4 copies of its first pose at zero velocity and its first box
+    pose; its own frames follow bit for bit; the clip not named keeps its
+    rows. 0 frames changes nothing.
 
 Run: pixi run mojo run -I . tests/deep_agents/supermimic/test_supermimic_obj_task.mojo
 """
@@ -31,7 +36,7 @@ from noeira.deep_agents.supermimic.object_spec import SM_OBJ, SM_OBJ_FEAT, sm_ob
 from noeira.deep_agents.supermimic.object_task import (
     OT_HANDS, OT_ORI, OT_POS, SM_OBJ_TERMS, SM_OE_FEAT, SM_OE_SCRATCH, SM_OREF, SM_ORW, SM_OSTD_HANDS, SM_OSTD_ORI,
     SM_OSTD_POS, SM_OW_HANDS, SM_OW_ORI, SM_OW_POS, sm_object_ref_rows, sm_obj_reward_lane, sm_obj_reward_params,
-    sm_obj_reward_vjp_lane, sm_oe_feat_lane, sm_oe_feat_vjp_lane,
+    sm_lead_in, sm_obj_reward_vjp_lane, sm_oe_feat_lane, sm_oe_feat_vjp_lane,
 )
 from noeira.deep_agents.supermimic.robot import G1MjlabBoxRobot, SMDims
 from noeira.deep_agents.supermimic.tables import sm_tables
@@ -388,12 +393,71 @@ def test_ref_rows(mut t: Tally) raises:
     t.truth(e_hands <= 1e-6 and far > 0.1, "robot at the library row, object on its track: the hands term is dt·w in every frame: max |d| " + String(e_hands))
 
 
+def test_lead_in(mut t: Tally) raises:
+    print("\n[5] the lead-in")
+    seed(5)
+    comptime LEAD = 4
+    var lens: List[Int] = [5, 3]
+    var extra = 2                      # one more clip in `rows`, not named in `lens`
+    var rows = List[Scalar[DT]]()
+    for _ in range((5 + 3 + extra) * D.S):
+        rows.append(Scalar[DT](random_float64(-1.0, 1.0)))
+    var poses = List[Float64]()
+    for _ in range((5 + 3) * 7):
+        poses.append(random_float64(-1.0, 1.0))
+    var rows0 = rows.copy()
+    var poses0 = poses.copy()
+    var same_r = rows.copy()
+    var same_l = lens.copy()
+    var same_p = poses.copy()
+    sm_lead_in[R](same_r, same_l, same_p, 0)
+    var d0 = 0.0
+    for i in range(len(rows0)):
+        d0 = max(d0, abs(Float64(same_r[i]) - Float64(rows0[i])))
+    t.truth(d0 == 0.0 and len(same_r) == len(rows0) and same_l[0] == 5 and len(same_p) == len(poses0), "0 frames: nothing changes")
+    sm_lead_in[R](rows, lens, poses, LEAD)
+    t.truth(
+        lens[0] == 5 + LEAD and lens[1] == 3 + LEAD and len(rows) == (8 + extra + 2 * LEAD) * D.S and len(poses) == (8 + 2 * LEAD) * 7,
+        "two clips of 5 and 3 frames become " + String(lens[0]) + " and " + String(lens[1]) + "; rows and box poses grow by 2 x " + String(LEAD) + " frames",
+    )
+    var lead_q = 0.0        # the lead-in's qpos against the clip's first frame
+    var lead_v = 0.0        # its velocities
+    var lead_p = 0.0        # its box poses
+    var body = 0.0          # the clip's own frames, shifted
+    var o_old = 0
+    var o_new = 0
+    var olds: List[Int] = [5, 3]
+    for c in range(2):
+        for f in range(LEAD):
+            for k in range(D.S):
+                var v = Float64(rows[(o_new + f) * D.S + k])
+                if k < D.NQ:
+                    lead_q = max(lead_q, abs(v - Float64(rows0[o_old * D.S + k])))
+                else:
+                    lead_v = max(lead_v, abs(v))
+            for k in range(7):
+                lead_p = max(lead_p, abs(poses[(o_new + f) * 7 + k] - poses0[o_old * 7 + k]))
+        for f in range(olds[c]):
+            for k in range(D.S):
+                body = max(body, abs(Float64(rows[(o_new + LEAD + f) * D.S + k]) - Float64(rows0[(o_old + f) * D.S + k])))
+            for k in range(7):
+                body = max(body, abs(poses[(o_new + LEAD + f) * 7 + k] - poses0[(o_old + f) * 7 + k]))
+        o_old += olds[c]
+        o_new += olds[c] + LEAD
+    var tail = 0.0
+    for i in range(extra * D.S):
+        tail = max(tail, abs(Float64(rows[o_new * D.S + i]) - Float64(rows0[o_old * D.S + i])))
+    t.truth(lead_q == 0.0 and lead_v == 0.0 and lead_p == 0.0, "each lead-in frame is the clip's first pose at zero velocity, with the box's first pose")
+    t.truth(body == 0.0 and tail == 0.0, "the clips' own frames follow bit for bit, and the clip not named keeps its rows")
+
+
 def main() raises:
     var t = Tally()
     test_known(t)
     test_reward_vjp(t)
     test_features(t)
     test_ref_rows(t)
+    test_lead_in(t)
     print("\n=== " + String(t.checks - t.fails) + " / " + String(t.checks) + " passed ===")
     if t.fails > 0:
         raise Error("test_supermimic_obj_task: " + String(t.fails) + " failed")
