@@ -82,6 +82,13 @@ tests/robots/test_g1_vad.mojo
 # loop is too busy for costs one log line, not a clip of its last syllable.
 tests/robots/test_g1_voice_loop_listen.mojo
 
+# the order of a turn's answers, with stand-in models (CPU, ~1 s): `talk_first`
+# (a chat turn replied after one request, the commands request still asked and
+# acting) and `computed_first` (« As-tu fini ? » answered while d1 decides, a
+# command in the sentence still acting; an unfinished or stale answer never
+# said); the two-place request without the triage `kind`.
+tests/robots/test_g1_voice_loop_talk_first.mojo
+
 # AMASS step 1 — the `[N, 36]` layout of the retargeted dump. Steps 2-5 are
 # `convert_frames`, held by the oracle gate above; step 1 is new and every
 # way it can be wrong is SILENT (XYZW read as WXYZ is a valid rotation, a

@@ -325,6 +325,16 @@ struct G1VoiceConfig(Copyable, Movable):
     bouges pas" 0.58 (RB-1/RB-2 logs), so skipping it would have lost two
     stops. A `talk` answer there is not replied twice. 0 = off (the default:
     every bench measured the order commands, then reply)."""
+    var computed_first: Bool
+    """A computed answer (`set_reply_override`: « As-tu fini ? », « Comment je
+    m'appelle ? ») is said as soon as the caller has it for this utterance and
+    calls it final, while the decision's requests are still running
+    (docs/NN_MODEL_PORTS_PLAN.md §12.8.11, S3 item 4). Without it the answer
+    waited for both of d1's requests (~0.75 s), and was not said at all when
+    d1 routed the sentence to a command (« As-tu fini ce que je t'ai demandé ? »
+    picked `stand` in the `--see` replays). ⚠ THE DECISION IS NOT SKIPPED: its
+    requests run as before and a command or a walk in it still acts; a `talk`
+    route says nothing more (one reply a decision). Off by default."""
     var dest_chain: Bool
     """`request_wording` only: "go to the table, then to the door". The
     destination request gets one yes/no question (are two places asked for,
@@ -398,6 +408,7 @@ struct G1VoiceConfig(Copyable, Movable):
         self.dest_words = List[String]()
         self.triage = G1_TRIAGE_OFF
         self.talk_first = 0.0
+        self.computed_first = False
         self.dest_chain = False
         self.miss_kind = False
         self.name_desc = False
@@ -548,6 +559,12 @@ struct G1VoiceLoopOf[
     var reply_override: String
     """What to say INSTEAD of asking the reply model, when not empty
     (`set_reply_override`)."""
+    var override_final: Bool
+    """The caller's answer will not change (`set_reply_override`'s `final`):
+    `computed_first` may say it."""
+    var heard_given: Bool
+    """The caller has taken this decision's utterance (`take_heard`): an
+    override set after that is about it, not about the turn before."""
     var canned: String
     """A computed reply on its way out (one poll)."""
     var mic_on: Bool
@@ -670,7 +687,9 @@ struct G1VoiceLoopOf[
                 self.trail_q = g1_trail_questions(self.cfg.destinations, self.cfg.name_desc)
             if self.cfg.dest_chain:
                 g1_add_two_places_gate(self.dest_q)
-                self.chain_q = g1_two_places_questions(self.cfg.destinations, self.cfg.name_desc)
+                # without the triage `kind`: `g1_route_two_places` does not read it, 355 of 1211 tokens, the same
+                # answers on all 216 rows of `bench_brain_dest_chain_gpu` (docs/NN_MODEL_PORTS_PLAN.md §12.8.6)
+                self.chain_q = g1_two_places_questions(self.cfg.destinations, self.cfg.name_desc, with_kind=False)
             self.quest = g1_command_questions(
                 bank, True, List[String](), List[String](), self.cfg.chain,
                 name_desc=self.cfg.name_desc,
@@ -721,6 +740,8 @@ struct G1VoiceLoopOf[
         self.seg_keep = List[Int16]()
         self.missed_s = 0.0
         self.reply_override = String("")
+        self.override_final = True
+        self.heard_given = False
         self.canned = String("")
         self.mic_on = True
         self.mic_dead = String("")
@@ -801,6 +822,8 @@ struct G1VoiceLoopOf[
         self.seg_keep = move.seg_keep^
         self.missed_s = move.missed_s
         self.reply_override = move.reply_override^
+        self.override_final = move.override_final
+        self.heard_given = move.heard_given
         self.canned = move.canned^
         self.mic_on = move.mic_on
         self.mic_dead = move.mic_dead^
@@ -1080,7 +1103,7 @@ struct G1VoiceLoopOf[
         the state changes. A reply already started keeps the one it had."""
         self.cfg.chat_sys = text^
 
-    def set_reply_override(mut self, var text: String):
+    def set_reply_override(mut self, var text: String, final: Bool = True):
         """A reply the caller has COMPUTED for the utterance being handled: when
         a reply is due and this is not empty, it is said as it is and the reply
         model is not asked. "" (the default) = the model replies.
@@ -1090,8 +1113,13 @@ struct G1VoiceLoopOf[
         Told to say that sentence in its prompt, the reply model still answered
         « Je m'appelle Noé » when the question came through the no-command
         route and its hint. Set it before `poll`, each frame, as
-        `set_reply_system`."""
+        `set_reply_system`.
+
+        `final`: the answer will not change for this utterance. False while
+        the caller is still working it out (the voice check behind « Comment
+        je m'appelle ? »): `computed_first` waits for it."""
         self.reply_override = text^
+        self.override_final = final
 
     def take_segment(mut self) -> List[Int16]:
         """The samples (16 kHz mono) of the utterance last sent to the
@@ -1108,6 +1136,8 @@ struct G1VoiceLoopOf[
         `recently_heard` never holds the sentence being decided."""
         var h = self.heard_new
         self.heard_new = String("")
+        if h != "":
+            self.heard_given = True
         return h
 
     def take_missed(mut self) -> Float64:
@@ -1394,6 +1424,16 @@ struct G1VoiceLoopOf[
         elif (self.state == VL_ST_DEST or self.state == VL_ST_JEV) and self.early_verify:
             _ = self._early_verified(ctx, ev)
 
+        # ── a computed answer, before the decision (`computed_first`) ──
+        elif self._computed_due():
+            var ctxt = spoken_text(self.reply_override)
+            self.replied = True     # the decision goes on; a `talk` route says nothing more
+            self._add_note(String("[said] ") + ctxt + String("  (computed, before the decision)"))
+            if not self.cfg.mute:
+                self.say(ctxt)
+            ev.kind = VL_TALK
+            ev.text = ctxt
+
         # ── deciding: the destination request (`request_wording`) ──────
         elif self.state == VL_ST_DEST:
             var el = Float64(perf_counter_ns() - self.t_wait) / 1e9
@@ -1586,6 +1626,17 @@ struct G1VoiceLoopOf[
             self._add_note(String("[see] the frame is ") + _vl_f2(age) + String(" s older than the utterance — asking blind"))
             return
         self.asked_view.append(self.view[0].copy())
+
+    def _computed_due(self) -> Bool:
+        """`computed_first`: a decision is in flight for an utterance the caller
+        has taken, its computed answer is set and final, and nothing was said
+        for it yet."""
+        if not self.cfg.computed_first or not self.heard_given or self.replied:
+            return False
+        if self.reply_override == "" or not self.override_final:
+            return False
+        return (self.state == VL_ST_DEST or self.state == VL_ST_JEV or self.state == VL_ST_CHAIN
+                or self.state == VL_ST_TRAIL or self.state == VL_ST_SPEC)
 
     def _add_note(mut self, msg: String):
         """`msg` after whatever this poll noted already (the caller prints
@@ -1786,6 +1837,7 @@ struct G1VoiceLoopOf[
         self.dest_tok = 0
         self.then_decide = False
         self.replied = False
+        self.heard_given = False
         var dest = self._two_requests()
         self._ask(_VL_Q_DEST if dest else _VL_Q_CMD)
         return dest

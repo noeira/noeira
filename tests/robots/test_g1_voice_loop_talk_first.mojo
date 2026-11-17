@@ -21,6 +21,20 @@ its decision acts as before. What this pins:
 7. (the start-up fault, not `talk_first`) a model that failed to load is named by `failed()`,
    and the listening line says so instead of "every model ready".
 
+`computed_first` (docs/NN_MODEL_PORTS_PLAN.md §12.8.11): a computed answer is
+said while d1 still decides, and the decision still acts.
+
+8. « As-tu fini ? », the commands answer `talk`: the answer comes out BEFORE
+   either of d1's answers, both requests are still asked, the reply model is
+   never asked, and d1's `talk` says nothing more.
+9. The same, d1 picks `stand` (the `--see` replays): the answer, then the stop.
+10. Not final yet (the voice check behind « Comment je m'appelle ? »): nothing
+    said until it is, then the final answer, once.
+11. The previous turn's answer, still set while the loop decides the new
+    utterance (a caller that takes the words a poll late): never said.
+12. (S3 item 2) the two-place request carries no triage `kind`; the
+    destination request keeps it.
+
 The loop is the real `G1VoiceLoopOf`, its microphone closed, a stand-in
 recogniser handing it the sentence, a stand-in decision answering from a
 script, and a stand-in reply model.
@@ -274,8 +288,9 @@ struct Run(Movable):
         self.idle = False
 
 
-def make_loop(talk_first: Float64, ref bank: G1CommandBank) raises -> G1VoiceLoopOf[TextStt, NoTts, ScriptDecision, ScriptChat]:
+def make_loop(talk_first: Float64, ref bank: G1CommandBank, dest_chain: Bool = False) raises -> G1VoiceLoopOf[TextStt, NoTts, ScriptDecision, ScriptChat]:
     var cfg = G1VoiceConfig()
+    cfg.dest_chain = dest_chain
     cfg.mute = True
     cfg.request_wording = True
     cfg.chain = False
@@ -320,6 +335,69 @@ def run(talk_first: Float64, talk_p: Float64, second: String, ref bank: G1Comman
     r.replies = loop.llm.asked
     r.same_state = len(loop.jev.states) == 2 and loop.jev.states[0] == loop.jev.states[1]
     r.idle = loop.state == VL_ST_IDLE
+    return r^
+
+
+struct CRun(Movable):
+    var order: String
+    """`T` the computed answer, `t` one of d1's answers consumed, `C<name>` a command."""
+    var said: List[String]
+    var notes: List[String]
+    var asked: String
+    var replies: Int
+
+    def __init__(out self):
+        self.order = String("")
+        self.said = List[String]()
+        self.notes = List[String]()
+        self.asked = String("")
+        self.replies = 0
+
+
+def run_computed(
+    second: String, ref bank: G1CommandBank, final_at: Int, stale: Bool = False, take_from: Int = 0,
+) raises -> CRun:
+    """« As-tu fini ? » with `computed_first`, driven as the demo drives the loop: before each poll the caller
+    sets its computed answer from the words it has TAKEN (`take_heard` after each poll). `final_at`: the first
+    poll from which the answer is final (« Un instant. » and final=False before). `stale`: the previous turn's
+    answer is set until the caller has taken the new words, and nothing after (they are not a computed question).
+    `take_from`: the caller takes the words from that poll on (a caller a poll late)."""
+    var loop = make_loop(0.7, bank)
+    loop.cfg.computed_first = True
+    loop.stt.text = String("As-tu fini ce que je t'ai demandé ?")
+    loop.jev.script.append(first_answer(0.5))
+    loop.jev.script.append(command_answer(second))
+    loop.state = VL_ST_STT
+    var ctx = G1Context()
+    var r = CRun()
+    var taken = False
+    var answers_left = 2
+    for i in range(40):
+        if stale:
+            loop.set_reply_override(String("") if taken else String("Oui, j'ai fini ce que tu m'as demandé."))
+        elif taken:
+            if i < final_at:
+                loop.set_reply_override(String("Un instant."), False)
+            else:
+                loop.set_reply_override(String("Oui, j'ai fini ce que tu m'as demandé."), True)
+        var ev = loop.poll(ctx, bank)
+        if len(loop.jev.script) < answers_left:
+            answers_left = len(loop.jev.script)
+            r.order += String("t")
+        if ev.kind == VL_TALK:
+            r.order += String("T")
+            r.said.append(ev.text)
+        elif ev.kind == VL_COMMAND:
+            r.order += String("C") + ev.name
+        if i >= take_from and loop.take_heard() != "":
+            taken = True
+        var n = loop.take_note()
+        if n != "":
+            print("     ", n)
+            if not n.startswith("[heard]"):
+                r.notes.append(n)
+    r.asked = loop.jev.asked
+    r.replies = loop.llm.asked
     return r^
 
 
@@ -392,6 +470,44 @@ def main() raises:
     g.stop()
     check(fails, line.find("FAILED TO LOAD: decide") >= 0 and line.find("every model ready") < 0,
           "the listening line names it: " + line)
+
+    print("8. computed_first: « As-tu fini ? », d1 answers `talk`")
+    var h = run_computed(String("talk"), bank, 0)
+    check(fails, h.order == "Ttt" and len(h.said) == 1,
+          "the answer first, then d1's two answers, and nothing more said: " + h.order)
+    check(fails, h.asked == "DC" and h.replies == 0, "both requests asked, the reply model never: " + h.asked
+          + " (" + String(h.replies) + ")")
+    check(fails, len(h.notes) > 0 and h.notes[0].find("(computed, before the decision)") >= 0,
+          "the log says it was said before the decision: " + (h.notes[0] if len(h.notes) > 0 else String("")))
+    var hl = h.notes[len(h.notes) - 1] if len(h.notes) > 0 else String("")
+    check(fails, hl.find("replied already") >= 0, "d1's `talk` adds nothing: " + hl)
+
+    print("9. computed_first: d1 picks `stand` (the --see replays)")
+    var k = run_computed(String("stand"), bank, 0)
+    check(fails, k.order == "TttCstand", "the answer, then the stop still acts: " + k.order)
+
+    print("10. computed_first: the answer is final only at poll 4")
+    var m = run_computed(String("talk"), bank, 4)
+    check(fails, len(m.said) == 1 and m.said[0] == "Oui, j'ai fini ce que tu m'as demandé.",
+          "said once, the final answer: " + String(len(m.said)) + " " + (m.said[0] if len(m.said) > 0 else String("")))
+    check(fails, m.order.startswith("t"), "not before it was final (d1's first answer came first): " + m.order)
+
+    print("11. computed_first: the previous turn's answer, still set")
+    # a caller that takes the words a poll late: at poll 1 the loop decides and the answer set is the last turn's
+    var st = run_computed(String("talk"), bank, 0, True, 2)
+    check(fails, len(st.said) == 1 and st.said[0] == "Bonjour !" and st.replies == 1,
+          "never said: the model replied to the new words: " + (st.said[0] if len(st.said) > 0 else String("nothing")))
+
+    print("12. the two-place request without the triage `kind`")
+    var tp = make_loop(0.7, bank, True)
+    var w = JsonWriter()
+    tp.chain_q.write_to_json(w)
+    var qs = w.done()
+    check(fails, qs.find("\"kind\"") < 0 and qs.find("destination_then") >= 0,
+          "its questions: no `kind`, `destination_then` there")
+    var w2 = JsonWriter()
+    tp.dest_q.write_to_json(w2)
+    check(fails, w2.done().find("\"kind\"") >= 0, "the destination request keeps it")
 
     print("ALL PASS" if fails == 0 else String(fails) + " FAILED")
     if fails != 0:

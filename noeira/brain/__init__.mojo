@@ -38,5 +38,5 @@ from .tasks import (
     ExecAction, give_task, cancel_task, refuse_step, tick_tasks, notice_text,
     EX_NONE, EX_START, EX_NOTICE, STOP_COMMAND, NOTICE_NOT_REACHED, NOTICE_REFUSED, NOTICE_ALL_DONE,
 )
-from .answers import asks_task_done, task_done_answer, computed_reply
+from .answers import asks_task_done, task_done_answer, computed_reply, computed_reply_final
 from .views import ReplyView, reply_view, reply_stable, reply_live, task_sentences, speaker_sentence, memory_section, metres, language_name, REPLY_VIEW_LINES, REPLY_VIEW_SENTENCES

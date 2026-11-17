@@ -5,7 +5,7 @@
 (docs/ROBOT_BRAIN_PLAN.md §16):
 
     ws.asked = heard                       # the utterance being answered
-    voice.set_reply_override(computed_reply(ws))     # "" = the model replies
+    voice.set_reply_override(computed_reply(ws), computed_reply_final(ws))     # "" = the model replies
 
 Two questions today:
 
@@ -130,6 +130,15 @@ def task_done_answer(ref ws: WorldState) -> String:
             return "No, I could not reach " + word + "."
         return String("Non, je n'ai pas su le faire.") if fr else String("No, I could not do it.")
     return String("")
+
+
+def computed_reply_final(ref ws: WorldState) -> Bool:
+    """Whether `computed_reply(ws)` is the answer for good: False while the
+    voice behind « Comment je m'appelle ? » is still being checked (its answer
+    is then « Un instant… », and the next frames give the name). For
+    `G1VoiceLoopOf.set_reply_override`'s `final`: the loop's `computed_first`
+    says only a final answer."""
+    return not (ws.people_on and asks_identity(ws.asked) and ws.speaker_pending)
 
 
 def computed_reply(ref ws: WorldState) -> String:
