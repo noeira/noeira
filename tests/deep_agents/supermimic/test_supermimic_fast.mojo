@@ -181,7 +181,7 @@ def main() raises:
     var t = Tally()
 
     print("\n[1] the lr ramp")
-    var st = SMFastState(SMFastOpts(0.0, 0, 4.0, 0.75, 300, 1400, -1.0, False, False, 0.0, False, 0.0))
+    var st = SMFastState(SMFastOpts(0.0, 0, 4.0, 0.75, 300, 1400, -1.0, False, False, 0.0, False, 0.0, 0.0))
     t.truth(st.pi_mult(0) == 4.0 and st.pi_mult(900) == 4.0, "x 4 until the trigger")
     st.note_episode(0.9)
     t.truth(not st.tick(49) and st.decay_at < 0, "no test between two multiples of 50, whatever the return")
@@ -190,7 +190,7 @@ def main() raises:
     st.note_episode(0.8)
     t.truth(st.tick(100) and st.decay_at == 100, "a test at 0.8 starts it, at update 100")
     t.truth(_near(st.pi_mult(100), 4.0) and _near(st.pi_mult(250), 2.5) and _near(st.pi_mult(400), 1.0) and _near(st.pi_mult(5000), 1.0), "linear 4 -> 1 over 300 updates, then 1")
-    var dl = SMFastState(SMFastOpts(0.0, 0, 4.0, 0.75, 300, 1400, -1.0, False, False, 0.0, False, 0.0))
+    var dl = SMFastState(SMFastOpts(0.0, 0, 4.0, 0.75, 300, 1400, -1.0, False, False, 0.0, False, 0.0, 0.0))
     t.truth(not dl.tick(1350) and dl.tick(1400) and dl.decay_at == 1400, "without the return, the deadline starts it at update 1400")
     var off = SMFastState(SMFastOpts.off())
     t.truth(off.pi_mult(7) == 1.0 and not off.tick(50) and off.wm_batches(10) == 10, "off: x 1, no ramp, the config's world-model batches")
@@ -296,7 +296,7 @@ def main() raises:
     var a_read = reader.trainer.act[LANES](hist, goals)
     t.truth(_max_diff_t(a_read, a_dep_s, LANES * R.NDOF) == 0.0, "a plain reader deploys the AVERAGE (its act = the trainer's act(deployed))")
     var resumed = sm_agent[C](sm_stand_library[R](2, 200, 0.05, sim0.qpos(2)), 2000, False, 0)
-    resumed.set_fast(SMFastOpts(DECAY, 0, 1.0, 0.0, 300, 0, -1.0, False, False, 0.0, False, 0.0))
+    resumed.set_fast(SMFastOpts(DECAY, 0, 1.0, 0.0, 300, 0, -1.0, False, False, 0.0, False, 0.0, 0.0))
     _ = resumed.trainer.load_state(path)
     var r_live = resumed.trainer.act[LANES](hist, goals)
     var r_dep = resumed.trainer.act[LANES](hist, goals, deployed=True)
@@ -465,7 +465,7 @@ def main() raises:
     print("\n[6] the loop")
     var looped = sm_agent[C](sm_stand_library[R](2, 200, 0.05, sim0.qpos(2)), 2000, True, 0, utd=1.0, warmup=14)
     t.truth(looped.env.action_noise == 0.1, "with noise, collection's action noise starts at 0.1")
-    looped.set_fast(SMFastOpts(0.995, 3, 4.0, 0.0, 4, 50, 0.0, True, True, 10.0, True, 0.0))
+    looped.set_fast(SMFastOpts(0.995, 3, 4.0, 0.0, 4, 50, 0.0, True, True, 10.0, True, 0.0, 0.5))
     looped.train(65, 0)                      # 52 updates: the deadline's test is at update 50
     var u = looped.updates
     t.truth(u == 52, "52 updates (" + String(u) + ")")
@@ -481,6 +481,7 @@ def main() raises:
     )
     t.truth(looped.trainer.ema_n == u and looped.trainer.ref_skip and looped.env.action_noise == 0.0, "the average, the skip and the action noise reached the trainer and the env")
     t.truth(looped.trainer.analytic_term and looped.trainer.v_max == 10.0, "and the analytic termination and the value ceiling too")
+    t.truth(looped.trainer.mirror_share == 0.5 and looped.trainer.wm_blk.muon_on and looped.trainer.wm_blk.muon.steps == 3 * u, "and the mirror share and Muon (3 Muon steps per update on the world model)")
 
     print("\n===", t.checks - t.fails, "/", t.checks, "passed ===")
     if t.fails > 0:

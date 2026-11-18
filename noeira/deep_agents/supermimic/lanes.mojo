@@ -1006,3 +1006,89 @@ def sm_cap_back[target: StaticString](ctx: Optional[DeviceContext], n: Int, p: F
         for i in range(n):
             if p[unsafe_offset=i] >= c:
                 g[unsafe_offset=i] = 0
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# The left-right mirror of world-model windows (BlinkMimic's `--wm_mirror`):
+# the reflection y → −y of a transition is a transition of the same robot
+# ════════════════════════════════════════════════════════════════════════════
+@always_inline
+def _mirror_joints[R: TrackingRobot](x: FP[DT], tab: FP[DT]):
+    """x[j] ← sign_j · x[partner(j)], in place. `tab` = [partner n, sign n];
+    partners form pairs (or a joint is its own), with one sign per pair."""
+    comptime n = R.NDOF
+    for j in range(n):
+        var pj = Int(tab[unsafe_offset=j])
+        var sg = tab[unsafe_offset=n + j]
+        if pj > j:
+            var a = x[unsafe_offset=j]
+            x[unsafe_offset=j] = sg * x[unsafe_offset=pj]
+            x[unsafe_offset=pj] = sg * a
+        elif pj == j:
+            x[unsafe_offset=j] = sg * x[unsafe_offset=j]
+
+
+@always_inline
+def _mirror_root(r: FP[DT]):
+    """A root pose [p 3, q WXYZ 4] reflected in the world's xz plane:
+    p_y ← −p_y; a rotation of θ about n becomes one of θ about (−n_x, n_y, −n_z)."""
+    r[unsafe_offset=1] = -r[unsafe_offset=1]
+    r[unsafe_offset=4] = -r[unsafe_offset=4]
+    r[unsafe_offset=6] = -r[unsafe_offset=6]
+
+
+@always_inline
+def _mirror_state[R: TrackingRobot](s: FP[DT], tab: FP[DT]):
+    """A state [p 3, q 4, qj n, v 3 (world), w 3 (body), qd n], reflected:
+    the linear velocity as a vector, the angular one as a pseudo-vector (the
+    same rule in the body frame, which is reflected with the body)."""
+    comptime NQ = R.NQ
+    _mirror_root(s)
+    _mirror_joints[R](s.unsafe_offset(7), tab)
+    s[unsafe_offset=NQ + 1] = -s[unsafe_offset=NQ + 1]
+    s[unsafe_offset=NQ + 3] = -s[unsafe_offset=NQ + 3]
+    s[unsafe_offset=NQ + 5] = -s[unsafe_offset=NQ + 5]
+    _mirror_joints[R](s.unsafe_offset(NQ + 6), tab)
+
+
+@always_inline
+def _mirror_window_lane[R: TrackingRobot](
+    l: Int, k: Int, nb: Int, states: FP[DT], a_exec: FP[DT], xi: FP[DT], ref_root: FP[DT], tab: FP[DT],
+):
+    """Lane l of a k-step window batch of nb lanes, reflected in place."""
+    comptime D = SMDims[R]
+    comptime n = R.NDOF
+    for t in range(k + 1):
+        _mirror_state[R](states.unsafe_offset((t * nb + l) * D.S), tab)
+    for t in range(k):
+        _mirror_joints[R](a_exec.unsafe_offset((t * nb + l) * n), tab)
+        _mirror_root(ref_root.unsafe_offset((t * nb + l) * 7))
+    # the sim context [friction 1, encoder bias n, CoM offset 3]: the biases as joints, the CoM's y
+    _mirror_joints[R](xi.unsafe_offset(l * D.X + 1), tab)
+    xi[unsafe_offset=l * D.X + 1 + n + 1] = -xi[unsafe_offset=l * D.X + 1 + n + 1]
+
+
+def _k_mirror_windows[R: TrackingRobot](
+    nm: Int64, k: Int64, nb: Int64, states: FP[DT], a_exec: FP[DT], xi: FP[DT], ref_root: FP[DT], tab: FP[DT],
+):
+    var l = Int(global_idx.x)
+    if l < Int(nm):
+        _mirror_window_lane[R](l, Int(k), Int(nb), states, a_exec, xi, ref_root, tab)
+
+
+def sm_mirror_windows[target: StaticString, R: TrackingRobot](
+    ctx: Optional[DeviceContext], nm: Int, k: Int, nb: Int,
+    states: FP[DT], a_exec: FP[DT], xi: FP[DT], ref_root: FP[DT], tab: FP[DT],
+) raises:
+    """The first `nm` lanes of a k-step window batch of `nb` lanes replaced
+    by their left-right mirror image, in place: states [(k+1)·nb·S], executed
+    actions [k·nb·n], sim context [nb·X], reference roots [k·nb·7]. `tab` is
+    the robot's joint mirror table [partner n, sign n]
+    (`SuperMimicTrainer.set_mirror`). The termination labels need no change."""
+    comptime if target == "gpu":
+        ctx.value().enqueue_function[_k_mirror_windows[R]](
+            Int64(nm), Int64(k), Int64(nb), states, a_exec, xi, ref_root, tab, grid_dim=_grid(nm), block_dim=SM_TPB,
+        )
+    else:
+        for l in range(nm):
+            _mirror_window_lane[R](l, k, nb, states, a_exec, xi, ref_root, tab)

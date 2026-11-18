@@ -16,6 +16,7 @@ the block and copies the actions back, so the same agent runs either way.
 A device env and replay will hand device tensors over directly.
 """
 
+from std.math import abs
 from std.os.path import exists
 
 from max.gpu.host import DeviceContext
@@ -24,7 +25,7 @@ from noeira.deep_agents.supermimic.blocks import ActStep, ActorStep, CriticFitSt
 from noeira.deep_agents.supermimic.config import SMConfigT, SMCriticOf, SMPolicyOf, SMWorldModelOf
 from noeira.deep_agents.supermimic.imagination import SMImagBatch
 from noeira.deep_agents.supermimic.kinematics import FP
-from noeira.deep_agents.supermimic.lanes import tp
+from noeira.deep_agents.supermimic.lanes import sm_mirror_windows, tp
 from noeira.deep_agents.supermimic.state_spec import SM_WM_DRIFT_MILLI
 from noeira.deep_agents.supermimic.tables import SMTables, sm_tables
 from noeira.deep_agents.supermimic.world_model import SMWindowBatch, SMWMLoss
@@ -88,6 +89,8 @@ struct SuperMimicTrainer[C: SMConfigT](Movable):
     var skip_k: TensorImpl[DT]          # 1 / action scale per joint, on the config's target
     var analytic_term: Bool             # imagination terminates on the real thresholds, not on the learned head
     var v_max: Float64                  # the value ceiling in the bootstrap and the critic's targets (0 = none)
+    var mirror_share: Float64           # share of each world-model batch replaced by its left-right mirror (0 = none)
+    var mirror_tab: TensorImpl[DT]      # [partner n, sign n] per joint, host and (on "gpu") device
 
     def __init__(out self, var tables: SMTables[DT], ctx: Optional[DeviceContext] = None) raises:
         """Fresh networks (Kaiming; the dynamics' last layer zero, the
@@ -119,6 +122,8 @@ struct SuperMimicTrainer[C: SMConfigT](Movable):
         self.skip_k = TensorImpl[DT].alloc(Self.C.ROBOT.NDOF)
         self.analytic_term = False
         self.v_max = 0.0
+        self.mirror_share = 0.0
+        self.mirror_tab = TensorImpl[DT].alloc(2 * Self.C.ROBOT.NDOF)
 
     def __init__(out self, *, deinit move: Self):
         self.wm = move.wm^
@@ -137,6 +142,8 @@ struct SuperMimicTrainer[C: SMConfigT](Movable):
         self.skip_k = move.skip_k^
         self.analytic_term = move.analytic_term
         self.v_max = move.v_max
+        self.mirror_share = move.mirror_share
+        self.mirror_tab = move.mirror_tab^
 
     # ── the fast-training options ──
     def set_ema(mut self, decay: Float64):
@@ -163,6 +170,54 @@ struct SuperMimicTrainer[C: SMConfigT](Movable):
             comptime if Self.C.TARGET == "gpu":
                 self.skip_k.upload_resident(self.ctx.value())
         self.ref_skip = on
+
+    def set_mirror(mut self, share: Float64) raises:
+        """Replace this share of every world-model batch by its left-right
+        mirror image (BlinkMimic's `--wm_mirror 0.5`): the robot is
+        symmetric, so the reflection of a logged transition is another valid
+        one, and the world model sees twice the states for the same
+        simulation. The joint table comes from the robot's joint names:
+        `left_` pairs with `right_`, `_roll_` and `_yaw_` joints change sign.
+        It refuses a robot whose names, default pose or action scales are
+        not mirror-consistent."""
+        comptime n = Self.C.ROBOT.NDOF
+        if share < 0.0 or share > 1.0:
+            raise Error("SuperMimicTrainer.set_mirror: a share in [0, 1], not " + String(share))
+        if share > 0.0:
+            var names = List[String]()
+            for j in range(n):
+                var nm = Self.C.ROBOT.joint_name(j)
+                if nm.byte_length() == 0:
+                    raise Error("SuperMimicTrainer.set_mirror: this robot declares no joint names (`TrackingRobot.joint_name`)")
+                names.append(nm^)
+            for j in range(n):
+                var partner = names[j].copy()
+                if names[j].startswith("left_"):
+                    partner = String("right_") + String(names[j].removeprefix("left_"))
+                elif names[j].startswith("right_"):
+                    partner = String("left_") + String(names[j].removeprefix("right_"))
+                var pj = -1
+                for i in range(n):
+                    if names[i] == partner:
+                        pj = i
+                if pj < 0:
+                    raise Error("SuperMimicTrainer.set_mirror: " + names[j] + " has no partner " + partner)
+                var flip = names[j].find("_roll_") >= 0 or names[j].find("_yaw_") >= 0
+                self.mirror_tab.data[j] = Scalar[DT](pj)
+                self.mirror_tab.data[n + j] = Scalar[DT](-1.0) if flip else Scalar[DT](1.0)
+            for j in range(n):
+                var pj = Int(self.mirror_tab.data[j])
+                var sg = Float64(self.mirror_tab.data[n + j])
+                if Int(self.mirror_tab.data[pj]) != j or Float64(self.mirror_tab.data[n + pj]) != sg:
+                    raise Error("SuperMimicTrainer.set_mirror: the joint pairs are not symmetric at " + names[j])
+                # the action a commands q0 + scale·a: its mirror is only the mirrored action if both are symmetric
+                if abs(sg * Self.C.ROBOT.default_joint_pos(pj) - Self.C.ROBOT.default_joint_pos(j)) > 1e-9:
+                    raise Error("SuperMimicTrainer.set_mirror: the default pose is not mirror-symmetric at " + names[j])
+                if abs(Self.C.ROBOT.action_scale(pj) - Self.C.ROBOT.action_scale(j)) > 1e-12 or Self.C.ROBOT.action_scale(j) <= 0.0:
+                    raise Error("SuperMimicTrainer.set_mirror: the action scale is not mirror-symmetric (or not declared) at " + names[j])
+            comptime if Self.C.TARGET == "gpu":
+                self.mirror_tab.upload_resident(self.ctx.value())
+        self.mirror_share = share
 
     def set_muon(mut self, on: Bool, wd: Float64 = 0.0) raises:
         """Muon (`nn/optimizer/muon.mojo`) on the hidden weight matrices of
@@ -289,7 +344,19 @@ struct SuperMimicTrainer[C: SMConfigT](Movable):
         return a^
 
     def wm_update[B: Int](mut self, mut w: SMWindowBatch[Self.C.ROBOT], resident: Bool = False) raises -> SMWMLoss:
-        """`resident`: the windows are already on the device."""
+        """`resident`: the windows are already on the device. With a mirror
+        share (`set_mirror`), the first share·B windows are reflected IN
+        PLACE first, where the batch lives."""
+        var nm = Int(self.mirror_share * Float64(B))
+        comptime if Self.C.TARGET == "gpu":
+            if resident and nm > 0:
+                sm_mirror_windows["gpu", Self.C.ROBOT](
+                    self.ctx, nm, w.k, B, tp["gpu"](w.states), tp["gpu"](w.a_exec), tp["gpu"](w.xi), tp["gpu"](w.ref_root), tp["gpu"](self.mirror_tab),
+                )
+        if nm > 0 and not (resident and Self.C.TARGET == "gpu"):
+            sm_mirror_windows["cpu", Self.C.ROBOT](
+                None, nm, w.k, B, tp["cpu"](w.states), tp["cpu"](w.a_exec), tp["cpu"](w.xi), tp["cpu"](w.ref_root), tp["cpu"](self.mirror_tab),
+            )
         comptime if Self.C.TARGET == "gpu":
             if not resident:
                 w.to_device(self.ctx.value())

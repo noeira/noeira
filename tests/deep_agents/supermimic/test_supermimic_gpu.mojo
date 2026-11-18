@@ -21,7 +21,9 @@ optimiser and reductions agree there.
       (and, on mjlab's G1, the reference skip): the policy's step agrees
       with the CPU's, the average's first step is a copy on both targets,
       its second step satisfies its identity, the deployed policy's actions
-      agree, and the device average is not the device's live policy
+      agree, and the device average is not the device's live policy; on
+      mjlab's G1 the device's left-right mirror of a window batch is the
+      host's, to the bit
 
 Vectors compare by cosine >= 0.99999 and max err <= 1e-4 of the largest.
 
@@ -36,6 +38,7 @@ from max.gpu.host import DeviceContext
 from noeira.deep_agents.supermimic.blocks import sm_random_perm
 from noeira.deep_agents.supermimic.config import SMConfig
 from noeira.deep_agents.supermimic.imagination import SMImagBatch, sm_imagine
+from noeira.deep_agents.supermimic.lanes import sm_mirror_windows, tp
 from noeira.deep_agents.supermimic.params import sm_restore, sm_snapshot
 from std.sys import get_defined_int
 
@@ -507,6 +510,49 @@ def test_fast(ctx: DeviceContext, mut tl: Tally) raises:
         if ag.data[i] != al.data[i]:
             differ = True
     tl.check(differ, "on the device, act(deployed) is not act")
+    comptime if TEST_MJLAB:          # the mirror needs the robot's joint names
+        # the left-right mirror of a window batch: the device kernel against the host loop, to the bit
+        tg.set_mirror(0.5)
+        comptime MK = 3
+        comptime MB = 6
+        var w = SMWindowBatch[R](MK, MB)
+        var h = SMWindowBatch[R](MK, MB)
+        for i in range(w.states.n):
+            w.states.data[i] = _u(-1, 1)
+            h.states.data[i] = w.states.data[i]
+        for i in range(w.a_exec.n):
+            w.a_exec.data[i] = _u(-1, 1)
+            h.a_exec.data[i] = w.a_exec.data[i]
+        for i in range(w.xi.n):
+            w.xi.data[i] = _u(-1, 1)
+            h.xi.data[i] = w.xi.data[i]
+        for i in range(w.ref_root.n):
+            w.ref_root.data[i] = _u(-1, 1)
+            h.ref_root.data[i] = w.ref_root.data[i]
+        w.to_device(ctx)
+        sm_mirror_windows["gpu", R](
+            Optional(ctx), 4, MK, MB, tp["gpu"](w.states), tp["gpu"](w.a_exec), tp["gpu"](w.xi), tp["gpu"](w.ref_root), tp["gpu"](tg.mirror_tab),
+        )
+        sm_mirror_windows["cpu", R](
+            None, 4, MK, MB, tp["cpu"](h.states), tp["cpu"](h.a_exec), tp["cpu"](h.xi), tp["cpu"](h.ref_root), tp["cpu"](tg.mirror_tab),
+        )
+        w.states.download(ctx)
+        w.a_exec.download(ctx)
+        w.xi.download(ctx)
+        w.ref_root.download(ctx)
+        var bad = 0
+        var moved = 0
+        for i in range(w.states.n):
+            bad += 0 if w.states.data[i] == h.states.data[i] else 1
+        for i in range(w.a_exec.n):
+            bad += 0 if w.a_exec.data[i] == h.a_exec.data[i] else 1
+        for i in range(w.xi.n):
+            bad += 0 if w.xi.data[i] == h.xi.data[i] else 1
+        for i in range(w.ref_root.n):
+            bad += 0 if w.ref_root.data[i] == h.ref_root.data[i] else 1
+        for i in range(MB * D.S):
+            moved += 1 if h.states.data[i] < 0.0 else 0      # a mirrored batch is not degenerate: it keeps both signs
+        tl.check(bad == 0 and moved > 0, "the device mirrors 4 of 6 windows as the host does: " + String(bad) + " mismatching entries")
 
 
 def main() raises:

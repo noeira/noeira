@@ -274,6 +274,7 @@ struct SuperMimicAgent[C: SMConfigT](Movable):
         self.trainer.analytic_term = opts.analytic_term
         self.trainer.v_max = opts.v_max
         self.trainer.set_muon(opts.muon, opts.muon_wd)
+        self.trainer.set_mirror(opts.wm_mirror)
         if opts.action_noise >= 0.0:
             self.env.action_noise = opts.action_noise
 

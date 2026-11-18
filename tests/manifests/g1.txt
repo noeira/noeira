@@ -166,6 +166,10 @@ tests/deep_agents/supermimic/test_supermimic_drift.mojo
 # (the device build of the same gate: `mojo build -D MUON_GPU=1`, to run on an
 # NVIDIA box before any training: its cuBLAS path cannot run on a Mac)
 tests/nn/test_muon.mojo /tmp/muon_oracle
+# The left-right mirror of world-model windows (`--wm-mirror`): the joint table
+# from the names, twice = identity, and the CPU simulator as the reference (a
+# mirrored step is the mirror of the step, in the air and on the floor)
+tests/deep_agents/supermimic/test_supermimic_mirror.mojo
 # The shared per-env episodic window replay (deep_agents/data), against the
 # SuperMimic reproduction's ReplayBuffer (same dump as test_supermimic_lib)
 tests/deep_agents/data/test_episodic_replay.mojo /tmp/sm_lib
