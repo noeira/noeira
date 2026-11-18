@@ -12,6 +12,10 @@ off by default (`docs/SUPERMIMIC_FAST_TRAINING_PLAN.md` §4):
     action_noise  collection's action noise                   the official code dropped it (7e94b07)
     ref_skip      action = decoder output + the action that   BlinkMimic `--pi_ref_skip`
                   commands the target pose
+    analytic_term imagination terminates on the real          the official code's 98ee3ec; the
+                  thresholds, not on the learned head         recipes' `soft_termination`
+    v_max         V capped at the reward ceiling in the       the official code's 133c0f0
+                  bootstrap and the critic's targets
 
 Both agents hold one `SMFastState` and ask it for the policy's lr multiplier
 and the world-model batch count; the averaged policy and the reference skip
@@ -37,18 +41,22 @@ struct SMFastOpts(Copyable, Movable):
     var lr_decay_by: Int          # the ramp starts at this update at the latest; 0 = no deadline
     var action_noise: Float64     # collection's action noise std; < 0 = the schedule's (0.1 with noise)
     var ref_skip: Bool
+    var analytic_term: Bool
+    var v_max: Float64            # the value ceiling; 0 = none (10 = 0.1 / (1 − 0.99) for this reward)
 
     @staticmethod
     def off() -> Self:
         """The reproduction's loop."""
-        return Self(0.0, 0, 1.0, 0.0, 300, 0, -1.0, False)
+        return Self(0.0, 0, 1.0, 0.0, 300, 0, -1.0, False, False, 0.0)
 
     @staticmethod
     def blink() -> Self:
-        """BlinkMimic's `PRESET[main]` values for these knobs. Its lr 4e-4 is
-        the schedule's `lr`, its 1024³ world model and batch 2048 are the
-        config's widths."""
-        return Self(0.995, 5, 4.0, 0.75, 300, 1400, -1.0, True)
+        """BlinkMimic's `PRESET[main]` values for these knobs, with the
+        analytic termination its code line always has. Its lr 4e-4 is the
+        schedule's `lr`, its 1024³ world model and batch 2048 are the
+        config's widths. The value ceiling is the official code's, not
+        BlinkMimic's: off here."""
+        return Self(0.995, 5, 4.0, 0.75, 300, 1400, -1.0, True, True, 0.0)
 
 
 struct SMFastState(Copyable, Movable):

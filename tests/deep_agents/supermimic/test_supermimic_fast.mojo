@@ -25,17 +25,30 @@ WHAT EACH SECTION CAN CATCH
 [6] the loop: the world model takes `wm_batches` steps per update, the
     policy's lr is the base × the multiplier while the others keep the base,
     and the deadline starts the ramp at update 50.
+[7] analytic termination: the logit is 0 on a threshold and −1 at 95 % of
+    it, its gradient goes to the larger ratio; in a rollout started 0.2 m
+    above the reference (80 % of the height threshold) the policy gradient
+    equals a finite difference, and the learned head's gradient does not.
+[8] the value ceiling: J with the ceiling is J without it plus
+    γᴴ·mean(c_H·(min(V, cap) − V)), with some lanes capped and some not; the
+    policy gradient equals a finite difference; the critic's values in an
+    update stay under the ceiling when it is on and exceed it when it is off.
+[9] the drift weight's guard: a checkpoint written under another weight is
+    refused.
 """
 
 from std.math import abs
 
-from noeira.deep_agents.supermimic.agent import sm_agent
+from noeira.deep_agents.supermimic.agent import SuperMimicAgent, sm_agent
 from noeira.deep_agents.supermimic.config import SMConfig
 from noeira.deep_agents.supermimic.fast import SMFastOpts, SMFastState
-from noeira.deep_agents.supermimic.imagination import sm_imagine
+from noeira.deep_agents.supermimic.imagination import SMImagBatch, sm_imagine
+from noeira.deep_agents.supermimic.lanes import sm_cap, sm_cap_back, sm_term_analytic, sm_term_analytic_back, tp
 from noeira.deep_agents.supermimic.params import sm_restore, sm_snapshot
 from noeira.deep_agents.supermimic.prompt_eval import sm_stand_library
 from noeira.deep_agents.supermimic.robot import G1MjlabRobot, G1Robot, SMDims
+from noeira.deep_agents.supermimic.state_spec import SM_WM_DRIFT_MILLI
+from noeira.nn.core.checkpoint import CheckpointScalars, save_params_multi
 from noeira.nn.constants import DT
 from noeira.nn.core.tensor import TensorImpl
 
@@ -99,11 +112,57 @@ def _goals() -> TensorImpl[DT]:
     return goals^
 
 
+comptime FD_EPS = 0.02
+
+
+def _bias_grads(mut agent: SuperMimicAgent[C], mut ib: SMImagBatch[R], analytic: Bool, v_max: Float64) raises -> List[Float64]:
+    """d(−J/H) / d(decoder's last bias) at joints 0, 7, 20, by the reverse scan."""
+    agent.trainer.pol.zero_grad["cpu"](None)
+    _ = sm_imagine[C, 8, "cpu"](agent.trainer.wm, agent.trainer.pol, agent.trainer.critic, agent.trainer.tables, ib, 0.99, True, 0, None, None, analytic, v_max)
+    var g = sm_snapshot["cpu"](agent.trainer.pol, None, True)
+    var last = len(g) - 1
+    return [Float64(g[last][0]), Float64(g[last][7]), Float64(g[last][20])]
+
+
+def _bias_fd(mut agent: SuperMimicAgent[C], mut ib: SMImagBatch[R], analytic: Bool, v_max: Float64) raises -> List[Float64]:
+    """The same three derivatives by central finite differences of −J/H."""
+    var w0 = sm_snapshot["cpu"](agent.trainer.pol, None)
+    var last = len(w0) - 1
+    var out = List[Float64]()
+    for e in range(3):
+        var k = [0, 7, 20][e]
+        var wp = w0.copy()
+        wp[last][k] += Scalar[DT](FD_EPS)
+        sm_restore["cpu"](agent.trainer.pol, wp^, None)
+        var op = sm_imagine[C, 8, "cpu"](agent.trainer.wm, agent.trainer.pol, agent.trainer.critic, agent.trainer.tables, ib, 0.99, False, 0, None, None, analytic, v_max)
+        var wm_ = w0.copy()
+        wm_[last][k] -= Scalar[DT](FD_EPS)
+        sm_restore["cpu"](agent.trainer.pol, wm_^, None)
+        var om = sm_imagine[C, 8, "cpu"](agent.trainer.wm, agent.trainer.pol, agent.trainer.critic, agent.trainer.tables, ib, 0.99, False, 0, None, None, analytic, v_max)
+        out.append(-(op.j - om.j) / (2.0 * FD_EPS * Float64(H)))
+    sm_restore["cpu"](agent.trainer.pol, w0.copy(), None)
+    return out^
+
+
+def _worst(a: List[Float64], b: List[Float64]) -> Float64:
+    var m = 0.0
+    for i in range(len(a)):
+        m = max(m, abs(a[i] - b[i]))
+    return m
+
+
+def _largest(a: List[Float64]) -> Float64:
+    var m = 0.0
+    for i in range(len(a)):
+        m = max(m, abs(a[i]))
+    return m
+
+
 def main() raises:
     var t = Tally()
 
     print("\n[1] the lr ramp")
-    var st = SMFastState(SMFastOpts(0.0, 0, 4.0, 0.75, 300, 1400, -1.0, False))
+    var st = SMFastState(SMFastOpts(0.0, 0, 4.0, 0.75, 300, 1400, -1.0, False, False, 0.0))
     t.truth(st.pi_mult(0) == 4.0 and st.pi_mult(900) == 4.0, "x 4 until the trigger")
     st.note_episode(0.9)
     t.truth(not st.tick(49) and st.decay_at < 0, "no test between two multiples of 50, whatever the return")
@@ -112,7 +171,7 @@ def main() raises:
     st.note_episode(0.8)
     t.truth(st.tick(100) and st.decay_at == 100, "a test at 0.8 starts it, at update 100")
     t.truth(_near(st.pi_mult(100), 4.0) and _near(st.pi_mult(250), 2.5) and _near(st.pi_mult(400), 1.0) and _near(st.pi_mult(5000), 1.0), "linear 4 -> 1 over 300 updates, then 1")
-    var dl = SMFastState(SMFastOpts(0.0, 0, 4.0, 0.75, 300, 1400, -1.0, False))
+    var dl = SMFastState(SMFastOpts(0.0, 0, 4.0, 0.75, 300, 1400, -1.0, False, False, 0.0))
     t.truth(not dl.tick(1350) and dl.tick(1400) and dl.decay_at == 1400, "without the return, the deadline starts it at update 1400")
     var off = SMFastState(SMFastOpts.off())
     t.truth(off.pi_mult(7) == 1.0 and not off.tick(50) and off.wm_batches(10) == 10, "off: x 1, no ramp, the config's world-model batches")
@@ -218,17 +277,130 @@ def main() raises:
     var a_read = reader.trainer.act[LANES](hist, goals)
     t.truth(_max_diff_t(a_read, a_dep_s, LANES * R.NDOF) == 0.0, "a plain reader deploys the AVERAGE (its act = the trainer's act(deployed))")
     var resumed = sm_agent[C](sm_stand_library[R](2, 200, 0.05, sim0.qpos(2)), 2000, False, 0)
-    resumed.set_fast(SMFastOpts(DECAY, 0, 1.0, 0.0, 300, 0, -1.0, False))
+    resumed.set_fast(SMFastOpts(DECAY, 0, 1.0, 0.0, 300, 0, -1.0, False, False, 0.0))
     _ = resumed.trainer.load_state(path)
     var r_live = resumed.trainer.act[LANES](hist, goals)
     var r_dep = resumed.trainer.act[LANES](hist, goals, deployed=True)
     t.truth(_max_diff_t(r_live, a_live_s, LANES * R.NDOF) == 0.0, "a resume with the average on restores the live policy from .live")
     t.truth(_max_diff_t(r_dep, a_dep_s, LANES * R.NDOF) == 0.0, "and the average from the file")
 
+    agent.trainer.set_ref_skip(False)
+
+    print("\n[7] analytic termination")
+    var tin = TensorImpl[DT].alloc(8)
+    var lg = TensorImpl[DT].alloc(2)
+    tin.data[2] = 1.0                        # lane 0: the height ratio on its threshold
+    tin.data[3] = 0.3
+    tin.data[6] = 0.5                        # lane 1: the tilt ratio at 95 % of its threshold
+    tin.data[7] = 0.95
+    sm_term_analytic["cpu"](None, 2, tp["cpu"](tin), tp["cpu"](lg))
+    t.truth(abs(Float64(lg.data[0])) < 1e-6 and abs(Float64(lg.data[1]) + 1.0) < 1e-5, "logit 0 on a threshold, -1 at 95 % of it (" + String(Float64(lg.data[0])) + ", " + String(Float64(lg.data[1])) + ")")
+    var glg = TensorImpl[DT].alloc(2)
+    var gtin = TensorImpl[DT].alloc(8)
+    glg.data[0] = 2.0
+    glg.data[1] = 3.0
+    for i in range(8):
+        gtin.data[i] = 99.0
+    sm_term_analytic_back["cpu"](None, 2, tp["cpu"](tin), tp["cpu"](glg), tp["cpu"](gtin))
+    var want_g: List[Float64] = [0.0, 0.0, 40.0, 0.0, 0.0, 0.0, 0.0, 60.0]
+    var gt_ok = True
+    for i in range(8):
+        gt_ok = gt_ok and abs(Float64(gtin.data[i]) - want_g[i]) < 1e-4
+    t.truth(gt_ok, "its gradient is glg / 0.05 on the larger ratio and 0 elsewhere")
+    var ib7 = agent.start_batch()
+    for b in range(8):
+        ib7.state.data[b * D.S + 2] += Scalar[DT](0.2)      # 0.2 m above the reference: 80 % of the height threshold
+    var probe = sm_imagine[C, 8, "cpu"](agent.trainer.wm, agent.trainer.pol, agent.trainer.critic, agent.trainer.tables, ib7, 0.99, False, 0, None, None, True, 0.0)
+    var d_lo = 1.0
+    var d_hi = 0.0
+    for i in range(8, (H + 1) * 8):
+        d_lo = min(d_lo, Float64(probe.dhat.data[i]))
+        d_hi = max(d_hi, Float64(probe.dhat.data[i]))
+    t.truth(d_lo > 1e-4 and d_hi < 0.9, "the rollout's termination probabilities are in the sigmoid's live range (" + String(d_lo) + " .. " + String(d_hi) + ")")
+    var g7 = _bias_grads(agent, ib7, True, 0.0)
+    var g7_head = _bias_grads(agent, ib7, False, 0.0)
+    var fd7 = _bias_fd(agent, ib7, True, 0.0)
+    print("    finite differences", fd7[0], fd7[1], fd7[2], "| analytic", g7[0], g7[1], g7[2], "| learned head", g7_head[0], g7_head[1], g7_head[2])
+    t.truth(_worst(g7, fd7) <= 0.03 * _largest(fd7), "the gradient with the analytic termination is the finite difference (worst " + String(_worst(g7, fd7)) + " of " + String(_largest(fd7)) + ")")
+    t.truth(_worst(g7_head, fd7) > 0.2 * _largest(fd7), "the learned head's gradient is not (worst " + String(_worst(g7_head, fd7)) + ")")
+
+    print("\n[8] the value ceiling")
+    var cv = TensorImpl[DT].alloc(3)
+    var cg = TensorImpl[DT].alloc(3)
+    cv.data[0] = 0.5
+    cv.data[1] = 2.0
+    cv.data[2] = -1.0
+    cg.data[0] = 7.0
+    cg.data[1] = 8.0
+    cg.data[2] = 9.0
+    sm_cap["cpu"](None, 3, tp["cpu"](cv), Scalar[DT](1.0))
+    sm_cap_back["cpu"](None, 3, tp["cpu"](cv), Scalar[DT](1.0), tp["cpu"](cg))
+    t.truth(cv.data[0] == 0.5 and cv.data[1] == 1.0 and cv.data[2] == -1.0, "min(V, cap): only the value above the cap moves")
+    t.truth(cg.data[0] == 7.0 and cg.data[1] == 0.0 and cg.data[2] == 9.0, "and only that value loses its gradient")
+    var ib8 = agent.start_batch()
+    var plain = sm_imagine[C, 8, "cpu"](agent.trainer.wm, agent.trainer.pol, agent.trainer.critic, agent.trainer.tables, ib8, 0.99, False)
+    var vmean = 0.0
+    for b in range(8):
+        vmean += Float64(plain.value_h.data[b]) / 8.0
+    var cap = vmean if vmean > 1e-3 else 1e-3          # between the lanes' values: some capped, some not
+    var gH = 1.0
+    for _ in range(H):
+        gH *= 0.99
+    var want_j = plain.j
+    var n_capped = 0
+    for b in range(8):
+        var v = Float64(plain.value_h.data[b])
+        if v > cap:
+            n_capped += 1
+            want_j += gH * Float64(plain.survival.data[H * 8 + b]) * (cap - v) / 8.0
+    var capped = sm_imagine[C, 8, "cpu"](agent.trainer.wm, agent.trainer.pol, agent.trainer.critic, agent.trainer.tables, ib8, 0.99, False, 0, None, None, False, cap)
+    t.truth(n_capped > 0 and n_capped < 8, String(n_capped) + " of 8 lanes above the cap " + String(cap))
+    t.truth(abs(capped.j - want_j) <= 1e-5 * max(abs(want_j), 1e-3) and abs(capped.j - plain.j) > 1e-6, "J with the cap = J + g^H mean(c_H (cap - V)) over the capped lanes (" + String(capped.j) + " against " + String(plain.j) + " without)")
+    var g8 = _bias_grads(agent, ib8, False, cap)
+    var fd8 = _bias_fd(agent, ib8, False, cap)
+    print("    finite differences", fd8[0], fd8[1], fd8[2], "| with the cap", g8[0], g8[1], g8[2])
+    t.truth(_worst(g8, fd8) <= 0.03 * _largest(fd8), "the gradient with the cap is the finite difference (worst " + String(_worst(g8, fd8)) + " of " + String(_largest(fd8)) + ")")
+    var vals = List[Float64]()
+    var tgts = List[Float64]()
+    var none = List[Int]()
+    agent.trainer.v_max = 0.0
+    _ = agent.trainer.policy_update[8](ib8, none, vals, tgts)
+    var v_hi = 0.0
+    for i in range(len(vals)):
+        v_hi = max(v_hi, vals[i])
+    var cap2 = 0.5 * v_hi
+    agent.trainer.v_max = cap2
+    _ = agent.trainer.policy_update[8](ib8, none, vals, tgts)
+    var v_hi2 = -1e9
+    var t_hi2 = -1e9
+    for i in range(len(vals)):
+        v_hi2 = max(v_hi2, vals[i])
+    for i in range(len(tgts)):
+        t_hi2 = max(t_hi2, tgts[i])
+    t.truth(v_hi > 0.0 and v_hi2 <= cap2 * (1.0 + 1e-6), "in an update, the critic's values reach " + String(v_hi) + " without the cap and stay under " + String(cap2) + " with it (" + String(v_hi2) + ")")
+    t.truth(t_hi2 <= cap2 + 0.1 * Float64(H), "and its targets stay under the cap plus the horizon's rewards (" + String(t_hi2) + ")")
+    agent.trainer.v_max = 0.0
+
+    print("\n[9] the drift weight's guard")
+    var other = 625 if SM_WM_DRIFT_MILLI != 625 else 1000
+    var sc9 = CheckpointScalars()
+    sc9.set_int("iteration", 1)
+    sc9.set_int("updates", 1)
+    sc9.set_int("wm_drift_milli", other)
+    var path9 = String("/tmp/sm_fast_test_drift.ckpt")
+    save_params_multi["cpu"](path9, None, False, agent.trainer.wm, agent.trainer.pol, agent.trainer.critic, scalars=sc9)
+    var refused = False
+    try:
+        _ = reader.trainer.load_state(path9)
+    except e:
+        refused = True
+        print("   ", e)
+    t.truth(refused, "a checkpoint written under the weight " + String(other) + "/1000 is refused by this build (" + String(SM_WM_DRIFT_MILLI) + "/1000)")
+
     print("\n[6] the loop")
     var looped = sm_agent[C](sm_stand_library[R](2, 200, 0.05, sim0.qpos(2)), 2000, True, 0, utd=1.0, warmup=14)
     t.truth(looped.env.action_noise == 0.1, "with noise, collection's action noise starts at 0.1")
-    looped.set_fast(SMFastOpts(0.995, 3, 4.0, 0.0, 4, 50, 0.0, True))
+    looped.set_fast(SMFastOpts(0.995, 3, 4.0, 0.0, 4, 50, 0.0, True, True, 10.0))
     looped.train(65, 0)                      # 52 updates: the deadline's test is at update 50
     var u = looped.updates
     t.truth(u == 52, "52 updates (" + String(u) + ")")
@@ -243,6 +415,7 @@ def main() raises:
         "the world model's and the critic's keep the base",
     )
     t.truth(looped.trainer.ema_n == u and looped.trainer.ref_skip and looped.env.action_noise == 0.0, "the average, the skip and the action noise reached the trainer and the env")
+    t.truth(looped.trainer.analytic_term and looped.trainer.v_max == 10.0, "and the analytic termination and the value ceiling too")
 
     print("\n===", t.checks - t.fails, "/", t.checks, "passed ===")
     if t.fails > 0:

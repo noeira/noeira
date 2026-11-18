@@ -152,8 +152,13 @@ tests/deep_agents/supermimic/test_supermimic_lib.mojo /tmp/sm_lib
 tests/deep_agents/supermimic/test_supermimic_env.mojo
 # SuperMimic's fast-training options (fast.mojo; all off by default): the lr
 # ramp, the reference skip (its gradient against a finite difference), the
-# averaged policy and its checkpoint. Known answers, no dump.
+# averaged policy and its checkpoint, the analytic termination, the value
+# ceiling, the drift weight's checkpoint guard. Known answers, no dump.
 tests/deep_agents/supermimic/test_supermimic_fast.mojo
+# The world model's pose update under the build's drift weight (float64 known
+# answers + its VJP against finite differences). Default build = weight 1; the
+# 0.625 build is `mojo build -D SM_WM_DRIFT_MILLI=625` of the same file.
+tests/deep_agents/supermimic/test_supermimic_drift.mojo
 # The shared per-env episodic window replay (deep_agents/data), against the
 # SuperMimic reproduction's ReplayBuffer (same dump as test_supermimic_lib)
 tests/deep_agents/data/test_episodic_replay.mojo /tmp/sm_lib

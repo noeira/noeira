@@ -75,6 +75,13 @@ Options
 --action-noise S collection's action noise std (default 0.1 with noise)
 --ref-skip       action = decoder output + the action that commands the target
                  pose (--no-ref-skip turns the preset's off); kept in the checkpoint
+--analytic-term  imagination terminates on the real thresholds through a sigmoid,
+                 not on the learned head (--learned-term turns the preset's off)
+--v-max V        cap V at V in the bootstrap and the critic's targets (10 is this
+                 reward's ceiling 0.1 / (1 - 0.99); default 0 = no cap; not in --fast)
+A BUILD constant, not a flag: `-D SM_WM_DRIFT_MILLI=625` makes the world model
+advance poses with 0.625 of the new velocity and 0.375 of the old one (default
+1000: the new velocity only). Checkpoints carry it and refuse the other build.
 
 THE RUN IS AN OBJECT ON DISK: `runs/<id>/` holds `run.kv`, `metrics.csv` (the
 `SMMetrics` bundle every `--log` steps) and the checkpoint `last` (world
@@ -96,6 +103,7 @@ from noeira.core.run import RunContext, register_run
 from noeira.core.run_session import RunLogger, finish_run, run_logger
 from noeira.deep_agents.supermimic import SMConfig, sm_agent, sm_agent_gpu
 from noeira.deep_agents.supermimic.fast import SMFastOpts
+from noeira.deep_agents.supermimic.state_spec import SM_WM_DRIFT_MILLI
 from noeira.deep_agents.supermimic.eval import SMInRunBench
 from noeira.io.artifact_sink import ArtifactSink, sink_for_run
 from noeira.deep_agents.supermimic.motion_library import SMMotionLibrary, SMResetSampler
@@ -417,6 +425,11 @@ def main() raises:
         fast.ref_skip = True
     if _flag(args, String("--no-ref-skip")):
         fast.ref_skip = False
+    if _flag(args, String("--analytic-term")):
+        fast.analytic_term = True
+    if _flag(args, String("--learned-term")):
+        fast.analytic_term = False
+    fast.v_max = Float64(_opt(args, String("--v-max"), String(fast.v_max)))
     if bench_every > 0 and MODE != 2:
         raise Error("--bench-every needs the device env (-D SM_GPU=2)")
 
@@ -451,6 +464,9 @@ def main() raises:
     logger.set_config("lr_decay", String(fast.lr_decay_ret) + String(" / ") + String(fast.lr_decay_len) + String(" / by ") + String(fast.lr_decay_by))
     logger.set_config("action_noise", String(fast.action_noise) if fast.action_noise >= 0.0 else String("default"))
     logger.set_config("ref_skip", String(fast.ref_skip))
+    logger.set_config("analytic_term", String(fast.analytic_term))
+    logger.set_config("v_max", String(fast.v_max))
+    logger.set_config("wm_drift_milli", String(SM_WM_DRIFT_MILLI))
     logger.set_config("utd", String(C.DEF_UTD))
     logger.set_config("noise", String(noise))
     logger.set_config("library_frames", String(lib.num_frames))

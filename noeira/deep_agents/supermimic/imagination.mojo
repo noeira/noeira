@@ -37,7 +37,7 @@ from noeira.deep_agents.supermimic.config import SMConfigT, SMCriticOf, SMPolicy
 from noeira.deep_agents.supermimic.lanes import (
     SM_TERM_IN, SMImagScratch, sm_copy, sm_critic_in, sm_dec_back, sm_dec_in, sm_enc_in, sm_imag_chain,
     sm_imag_heads_back, sm_imag_init, sm_imag_j, sm_imag_step, sm_imag_surv, sm_imag_v_back, sm_imag_wm_back,
-    sm_ref_skip, sm_wm_in, talloc, tp,
+    sm_cap, sm_cap_back, sm_ref_skip, sm_term_analytic, sm_term_analytic_back, sm_wm_in, talloc, tp,
 )
 from noeira.deep_agents.supermimic.kinematics import FP
 from noeira.deep_agents.supermimic.robot import SMDims, TrackingRobot
@@ -181,6 +181,8 @@ def sm_imagine[C: SMConfigT, N: Int, target: StaticString = "cpu"](
     noise_seed: UInt32 = 0,
     ctx: Optional[DeviceContext] = None,
     skip: Optional[FP[DT]] = None,
+    analytic_term: Bool = False,
+    v_max: Float64 = 0.0,
 ) raises -> SMImagOut[C.ROBOT]:
     """The rollout; with `grad`, ADDS d(−J/H)/d params into the policy's grads
     (zero them first). The world model's and critic's grads are polluted.
@@ -190,7 +192,10 @@ def sm_imagine[C: SMConfigT, N: Int, target: StaticString = "cpu"](
     is data, so the gradient path is unchanged. With `skip` (1 / action scale
     per joint, on `target`), every action is the decoder's output plus the
     action that commands the step's target pose (`lanes.sm_ref_skip`): data
-    too, so the reverse scan below is the same."""
+    too, so the reverse scan below is the same. `analytic_term`: d̂ comes
+    from the real thresholds (`lanes.sm_term_analytic`), not from the learned
+    head, in the rollout and in its gradient. `v_max` > 0 caps V(s_H) there
+    (a capped lane's bootstrap carries no gradient into the critic's input)."""
     comptime R = C.ROBOT
     comptime D = SMDims[R]
     comptime n = R.NDOF
@@ -242,7 +247,10 @@ def sm_imagine[C: SMConfigT, N: Int, target: StaticString = "cpu"](
             tp[target](o.actions), tp[target](ib.prev_action), tp[target](ib.xi), tp[target](ib.refs), tp[target](O),
             tp[target](scratch), tp[target](o.rewards), tp[target](tin), tp[target](o.e_root),
         )
-        wm.term.forward[target, N](TensorRefs[1, _, DT](tin), lg, ctx)
+        if analytic_term:
+            sm_term_analytic[target](ctx, N, tp[target](tin), tp[target](lg))
+        else:
+            wm.term.forward[target, N](TensorRefs[1, _, DT](tin), lg, ctx)
         sm_imag_surv[target](ctx, t, N, tp[target](lg), tp[target](o.dhat), tp[target](o.survival))
         encs.append(ein^)
         decs.append(din^)
@@ -257,6 +265,8 @@ def sm_imagine[C: SMConfigT, N: Int, target: StaticString = "cpu"](
         tp[target](ib.xi), tp[target](o.e_root).unsafe_offset(H * N * D.EROOT), tp[target](cin),
     )
     critic.forward[target, N](TensorRefs[1, _, DT](cin), o.value_h, ctx)
+    if v_max > 0.0:
+        sm_cap[target](ctx, N, tp[target](o.value_h), Scalar[DT](v_max))
     var jb = talloc[target](2 * N, ctx)
     sm_imag_j[target](ctx, N, H, Scalar[DT](gamma), tp[target](o.survival), tp[target](o.rewards), tp[target](o.value_h), tp[target](jb))
     comptime if target == "gpu":
@@ -279,6 +289,8 @@ def sm_imagine[C: SMConfigT, N: Int, target: StaticString = "cpu"](
         ctx, N, H, Scalar[DT](gamma), Scalar[DT](-1.0 / (Float64(H) * Float64(N))), tp[target](o.value_h),
         tp[target](o.survival), tp[target](o.dhat), tp[target](o.rewards), tp[target](g_r), tp[target](g_lg), tp[target](gv),
     )
+    if v_max > 0.0:
+        sm_cap_back[target](ctx, N, tp[target](o.value_h), Scalar[DT](v_max), tp[target](gv))
 
     # ── V(s_H) ──
     var gs = talloc[target](N * S, ctx)              # ∂/∂s_{t+1}
@@ -309,9 +321,12 @@ def sm_imagine[C: SMConfigT, N: Int, target: StaticString = "cpu"](
     var t = H - 1
     while t >= 0:
         # termination head at step t (re-run its forward first)
-        wm.term.forward[target, N](TensorRefs[1, _, DT](tins[t]), relg, ctx)
         sm_copy[target](ctx, glg, 0, g_lg, t * N, N)
-        wm.term.vjp[target, N](TensorRefs[1, _, DT](tins[t]), glg, TensorRefs[1, _, DT](gtin), ctx)
+        if analytic_term:
+            sm_term_analytic_back[target](ctx, N, tp[target](tins[t]), tp[target](glg), tp[target](gtin))
+        else:
+            wm.term.forward[target, N](TensorRefs[1, _, DT](tins[t]), relg, ctx)
+            wm.term.vjp[target, N](TensorRefs[1, _, DT](tins[t]), glg, TensorRefs[1, _, DT](gtin), ctx)
         # the heads at s_{t+1}, then the integrator
         sm_imag_heads_back[target, R](
             ctx, t, N, tree, table, tp[target](o.states), tp[target](o.actions), tp[target](ib.prev_action),

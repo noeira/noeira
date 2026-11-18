@@ -25,6 +25,7 @@ from noeira.deep_agents.supermimic.config import SMConfigT, SMCriticOf, SMPolicy
 from noeira.deep_agents.supermimic.imagination import SMImagBatch
 from noeira.deep_agents.supermimic.kinematics import FP
 from noeira.deep_agents.supermimic.lanes import tp
+from noeira.deep_agents.supermimic.state_spec import SM_WM_DRIFT_MILLI
 from noeira.deep_agents.supermimic.tables import SMTables, sm_tables
 from noeira.deep_agents.supermimic.world_model import SMWindowBatch, SMWMLoss
 from noeira.nn.constants import DT
@@ -85,6 +86,8 @@ struct SuperMimicTrainer[C: SMConfigT](Movable):
     var ema_n: Int                      # updates averaged so far (the first one copies `pol`)
     var ref_skip: Bool                  # actions = decoder output + the action commanding the target pose
     var skip_k: TensorImpl[DT]          # 1 / action scale per joint, on the config's target
+    var analytic_term: Bool             # imagination terminates on the real thresholds, not on the learned head
+    var v_max: Float64                  # the value ceiling in the bootstrap and the critic's targets (0 = none)
 
     def __init__(out self, var tables: SMTables[DT], ctx: Optional[DeviceContext] = None) raises:
         """Fresh networks (Kaiming; the dynamics' last layer zero, the
@@ -114,6 +117,8 @@ struct SuperMimicTrainer[C: SMConfigT](Movable):
         self.ema_n = 0
         self.ref_skip = False
         self.skip_k = TensorImpl[DT].alloc(Self.C.ROBOT.NDOF)
+        self.analytic_term = False
+        self.v_max = 0.0
 
     def __init__(out self, *, deinit move: Self):
         self.wm = move.wm^
@@ -130,6 +135,8 @@ struct SuperMimicTrainer[C: SMConfigT](Movable):
         self.ema_n = move.ema_n
         self.ref_skip = move.ref_skip
         self.skip_k = move.skip_k^
+        self.analytic_term = move.analytic_term
+        self.v_max = move.v_max
 
     # ── the fast-training options ──
     def set_ema(mut self, decay: Float64):
@@ -192,6 +199,7 @@ struct SuperMimicTrainer[C: SMConfigT](Movable):
         sc.set_int("iteration", iteration)
         sc.set_int("updates", updates)
         sc.set_int("ref_skip", 1 if self.ref_skip else 0)
+        sc.set_int("wm_drift_milli", SM_WM_DRIFT_MILLI)
         if self.ema > 0.0 and self.ema_n > 0:
             save_params_multi[Self.C.TARGET](path, self.ctx, False, self.wm, self.pol_avg, self.critic, scalars=sc)
             save_params_multi[Self.C.TARGET](path + ".live", self.ctx, False, self.pol, scalars=sc)
@@ -204,6 +212,12 @@ struct SuperMimicTrainer[C: SMConfigT](Movable):
         BEFORE the load (a resume), the average restarts from the file's
         policy and the live policy comes from `path + ".live"` when it exists."""
         var sc = load_params_multi[Self.C.TARGET](path, self.ctx, self.wm, self.pol, self.critic)
+        var drift = sc.get_int("wm_drift_milli", 1000)
+        if drift != SM_WM_DRIFT_MILLI:
+            raise Error(
+                "SuperMimicTrainer.load_state: " + path + " holds a world model trained with the drift weight " + String(drift)
+                + "/1000, this binary integrates with " + String(SM_WM_DRIFT_MILLI) + "/1000 (build with -D SM_WM_DRIFT_MILLI=" + String(drift) + ")"
+            )
         self.set_ref_skip(sc.get_int("ref_skip", 0) != 0)
         if self.ema > 0.0:
             self.ema_n = 0
@@ -269,10 +283,12 @@ struct SuperMimicTrainer[C: SMConfigT](Movable):
         comptime if Self.C.TARGET == "gpu":
             if not resident:
                 ib.to_device(self.ctx.value())
-        var ro = self.actor_blk.step[Self.C.TARGET, N](self.wm, self.pol, self.critic, self.tables, ib, obs_noise, self.ctx, self._skip())
+        var ro = self.actor_blk.step[Self.C.TARGET, N](
+            self.wm, self.pol, self.critic, self.tables, ib, obs_noise, self.ctx, self._skip(), self.analytic_term, self.v_max,
+        )
         if self.ema > 0.0:
             self._average_policy()
         var cf = self.critic_blk.step[Self.C.TARGET, N, Self.C.HORIZON](
-            self.critic, ro[0], ib, Self.C.DEF_GAMMA, perms, values_out, targets_out, self.ctx
+            self.critic, ro[0], ib, Self.C.DEF_GAMMA, perms, values_out, targets_out, self.ctx, self.v_max
         )
         return SMUpdateMetrics(ro[0].j, ro[0].return_undisc, ro[1], cf.last_loss, cf.value_mean, cf.target_mean)

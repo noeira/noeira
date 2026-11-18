@@ -17,10 +17,11 @@ optimiser and reductions agree there.
       fresh CPU trainer (and a CPU file into a fresh GPU trainer) restores
       every weight bit-identically and the loop's counters
   [7] the fast-training options (`fast.mojo`): two policy updates with the
-      averaged policy on (and, on mjlab's G1, the reference skip): the
-      average's first step is a copy on both targets, its second step and
-      the deployed policy's actions agree, and the device average is not
-      the device's live policy
+      averaged policy, the analytic termination and the value ceiling on
+      (and, on mjlab's G1, the reference skip): the policy's step agrees
+      with the CPU's, the average's first step is a copy on both targets,
+      its second step satisfies its identity, the deployed policy's actions
+      agree, and the device average is not the device's live policy
 
 Vectors compare by cosine >= 0.99999 and max err <= 1e-4 of the largest.
 
@@ -435,7 +436,7 @@ def test_checkpoint(ctx: DeviceContext, mut tl: Tally) raises:
 
 
 def test_fast(ctx: DeviceContext, mut tl: Tally) raises:
-    print("[7] the fast-training options: the averaged policy" + (String(", the reference skip") if TEST_MJLAB else String("")))
+    print("[7] the fast-training options: the averaged policy, the analytic termination, the value ceiling" + (String(", the reference skip") if TEST_MJLAB else String("")))
     var tc = _cpu_trainer()
     var tg = _gpu_twin(tc, ctx)
     tc.set_ema(0.9)
@@ -443,6 +444,11 @@ def test_fast(ctx: DeviceContext, mut tl: Tally) raises:
     comptime if TEST_MJLAB:          # BFM-Zero's G1 declares no action scale
         tc.set_ref_skip(True)
         tg.set_ref_skip(True)
+    tc.analytic_term = True
+    tg.analytic_term = True
+    tc.v_max = 1e-3                  # every lane whose V(s_H) is positive is capped
+    tg.v_max = 1e-3
+    var p0 = sm_snapshot["cpu"](tc.pol, None)
     seed(17)
     var ib = _imag_batch()
     var perms = List[Int]()
@@ -456,6 +462,11 @@ def test_fast(ctx: DeviceContext, mut tl: Tally) raises:
     var rg = List[Float64]()
     _ = tc.policy_update[NB](ib, perms, vc, rc)
     _ = tg.policy_update[NB](ib, perms, vg, rg)
+    _compare_steps("policy step with the options on", _delta(p0, sm_snapshot["cpu"](tc.pol, None)), _delta(p0, sm_snapshot["gpu"](tg.pol, ctx)), tl)
+    var top = 0.0
+    for i in range(len(vg)):
+        top = max(top, vg[i])
+    tl.check(top <= 1e-3 * (1.0 + 1e-6) and top > 0.0, "the device critic's values sit under the ceiling, some on it (largest " + String(top) + ")")
     # the averages start as two different random networks: only a copy makes them agree
     var avg1 = sm_snapshot["gpu"](tg.pol_avg, ctx)
     _compare("the average after one update (a copy of the live policy)", sm_snapshot["cpu"](tc.pol_avg, None), avg1, tl)

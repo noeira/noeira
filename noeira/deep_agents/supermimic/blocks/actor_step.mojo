@@ -66,6 +66,8 @@ struct ActorStep[C: SMConfigT](Movable):
         obs_noise: Bool,
         ctx: Optional[DeviceContext] = None,
         skip: Optional[FP[DT]] = None,
+        analytic_term: Bool = False,
+        v_max: Float64 = 0.0,
     ) raises -> Tuple[SMImagOut[Self.C.ROBOT], Float64]:
         comptime if target == "gpu":
             if not self.adopted:
@@ -73,7 +75,7 @@ struct ActorStep[C: SMConfigT](Movable):
                 self.adopted = True
         pol.zero_grad[target](ctx)
         var seed = UInt32(random_ui64(1, 0xFFFFFFFF)) if obs_noise else UInt32(0)
-        var o = sm_imagine[Self.C, N, target](wm, pol, critic, tb, ib, Self.C.DEF_GAMMA, True, seed, ctx, skip)
+        var o = sm_imagine[Self.C, N, target](wm, pol, critic, tb, ib, Self.C.DEF_GAMMA, True, seed, ctx, skip, analytic_term, v_max)
         var gn = self.opt.clip_grads[target](pol, Scalar[DT](SM_CLIP_NORM), ctx)
         var cv = ClipValue(Scalar[DT](SM_CLIP_VALUE))
         pol.for_each_param[target](cv, ctx)

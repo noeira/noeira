@@ -913,3 +913,96 @@ def sm_ref_skip[target: StaticString, R: TrackingRobot](
     else:
         for b in range(nb):
             _ref_skip_lane[R](b, goals, k, act)
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Analytic termination in imagination (the official code's 98ee3ec): the real
+# thresholds through a sigmoid, in place of the learned head's logit
+# ════════════════════════════════════════════════════════════════════════════
+comptime SM_TERM_SOFT: Float64 = 0.05
+"""The sigmoid's width, in units of the thresholds (the official code's
+`termination softness`): d̂ = 0.5 exactly on a threshold, 0.27 at 95 % of it."""
+
+
+@always_inline
+def _term_analytic_lane(b: Int, tin: FP[DT], lg: FP[DT]):
+    """logit = (max(|e_h| / thr_h, |e_tilt| / thr_tilt) − 1) / softness; the two
+    ratios' absolute values are the termination input's entries 2 and 3."""
+    lg[unsafe_offset=b] = (max(tin[unsafe_offset=b * 4 + 2], tin[unsafe_offset=b * 4 + 3]) - 1) / Scalar[DT](SM_TERM_SOFT)
+
+
+def _k_term_analytic(nb: Int64, tin: FP[DT], lg: FP[DT]):
+    var b = Int(global_idx.x)
+    if b < Int(nb):
+        _term_analytic_lane(b, tin, lg)
+
+
+def sm_term_analytic[target: StaticString](ctx: Optional[DeviceContext], nb: Int, tin: FP[DT], lg: FP[DT]) raises:
+    """The termination logit of `nb` lanes from their termination inputs
+    `tin` [nb·4] (`_imag_step_lane`), without the learned head."""
+    comptime if target == "gpu":
+        ctx.value().enqueue_function[_k_term_analytic](Int64(nb), tin, lg, grid_dim=_grid(nb), block_dim=SM_TPB)
+    else:
+        for b in range(nb):
+            _term_analytic_lane(b, tin, lg)
+
+
+@always_inline
+def _term_analytic_back_lane(b: Int, tin: FP[DT], glg: FP[DT], gtin: FP[DT]):
+    """gtin[b] = ∂/∂tin of glg[b]·logit: the larger ratio takes it all."""
+    var g = glg[unsafe_offset=b] / Scalar[DT](SM_TERM_SOFT)
+    var first = tin[unsafe_offset=b * 4 + 2] >= tin[unsafe_offset=b * 4 + 3]
+    gtin[unsafe_offset=b * 4 + 0] = 0
+    gtin[unsafe_offset=b * 4 + 1] = 0
+    gtin[unsafe_offset=b * 4 + 2] = g if first else Scalar[DT](0)
+    gtin[unsafe_offset=b * 4 + 3] = Scalar[DT](0) if first else g
+
+
+def _k_term_analytic_back(nb: Int64, tin: FP[DT], glg: FP[DT], gtin: FP[DT]):
+    var b = Int(global_idx.x)
+    if b < Int(nb):
+        _term_analytic_back_lane(b, tin, glg, gtin)
+
+
+def sm_term_analytic_back[target: StaticString](ctx: Optional[DeviceContext], nb: Int, tin: FP[DT], glg: FP[DT], gtin: FP[DT]) raises:
+    comptime if target == "gpu":
+        ctx.value().enqueue_function[_k_term_analytic_back](Int64(nb), tin, glg, gtin, grid_dim=_grid(nb), block_dim=SM_TPB)
+    else:
+        for b in range(nb):
+            _term_analytic_back_lane(b, tin, glg, gtin)
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# The value ceiling (the official code's 133c0f0): V ≤ r_max / (1 − γ)
+# ════════════════════════════════════════════════════════════════════════════
+def _k_cap(n: Int64, p: FP[DT], c: Scalar[DT]):
+    var i = Int(global_idx.x)
+    if i < Int(n):
+        p[unsafe_offset=i] = min(p[unsafe_offset=i], c)
+
+
+def sm_cap[target: StaticString](ctx: Optional[DeviceContext], n: Int, p: FP[DT], c: Scalar[DT]) raises:
+    """p[0:n] = min(p, c), in place."""
+    comptime if target == "gpu":
+        ctx.value().enqueue_function[_k_cap](Int64(n), p, c, grid_dim=_grid(n), block_dim=SM_TPB)
+    else:
+        for i in range(n):
+            p[unsafe_offset=i] = min(p[unsafe_offset=i], c)
+
+
+def _k_cap_back(n: Int64, p: FP[DT], c: Scalar[DT], g: FP[DT]):
+    var i = Int(global_idx.x)
+    if i < Int(n):
+        if p[unsafe_offset=i] >= c:
+            g[unsafe_offset=i] = 0
+
+
+def sm_cap_back[target: StaticString](ctx: Optional[DeviceContext], n: Int, p: FP[DT], c: Scalar[DT], g: FP[DT]) raises:
+    """g[i] = 0 where the CAPPED p[i] sits on the ceiling c: no gradient
+    reaches a value the cap replaced."""
+    comptime if target == "gpu":
+        ctx.value().enqueue_function[_k_cap_back](Int64(n), p, c, g, grid_dim=_grid(n), block_dim=SM_TPB)
+    else:
+        for i in range(n):
+            if p[unsafe_offset=i] >= c:
+                g[unsafe_offset=i] = 0

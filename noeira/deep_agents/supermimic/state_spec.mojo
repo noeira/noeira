@@ -26,6 +26,7 @@ w ≥ 0, series below |xyz| = 1e-6), `rot6d_from_quat` (mjlab's
 """
 
 from std.math import atan2, cos, sin, sqrt
+from std.sys import get_defined_int
 
 from noeira.deep_agents.supermimic.kinematics import FP, Q4, cross3, dot3, qapply, qapply_vjp, qconj, qmul
 from noeira.deep_agents.supermimic.robot import SMDims, TrackingRobot
@@ -33,6 +34,18 @@ from noeira.deep_agents.supermimic.heads import qapply_inv, yaw_quat, yaw_quat_v
 
 
 comptime SM_WM_DT: Float64 = 0.02
+
+comptime SM_WM_DRIFT_MILLI: Int = get_defined_int["SM_WM_DRIFT_MILLI", 1000]()
+comptime SM_WM_DRIFT: Float64 = Float64(SM_WM_DRIFT_MILLI) / 1000.0
+"""The weight c of the NEW velocity in the pose update, a BUILD constant
+(`-D SM_WM_DRIFT_MILLI=625`): poses advance by dt·((1 − c)·v + c·v'). 1 (the
+default) is the reproduction's `p' = p + dt v'`. The public recipes use
+(n + 1) / (2n) for n physics substeps per control step, 0.625 at n = 4
+(BlinkMimic's `DRIFT_W`, the official code's ce0a099): the velocity changes
+about linearly over the substeps, and the learned corrections dp, dθ, dq then
+have less to explain. A world model is only valid under the weight it was
+trained with: `SuperMimicTrainer` writes it into the checkpoint and refuses a
+file from another weight."""
 
 
 # StateSpecCfg's scales, expanded to one value per entry (n = the robot's DoF)
@@ -332,17 +345,23 @@ def sm_integrate_lane[dt: DType, R: TrackingRobot](s: FP[dt], delta: FP[dt], s_o
     var dwb = _v3(delta, 3) * Scalar[dt](0.5)
     var dph = _v3(delta, 6 + n) * Scalar[dt](0.01)
     var dth = _v3(delta, 9 + n) * Scalar[dt](0.02)
-    var v1 = _v3(s, NQ) + qapply(hq, dvh)
-    var w1 = _v3(s, NQ + 3) + dwb
-    var p1 = _v3(s, 0) + v1 * dtt + qapply(hq, dph)
-    var q1 = qnormalize(qmul(q, quat_from_rotvec(w1 * dtt + dth)))[0]
+    # poses advance by dt·((1 − c)·old velocity + c·new velocity); c = 1 gives `v1 * dtt` to the bit
+    var ca = Scalar[dt](1.0 - SM_WM_DRIFT)
+    var cb = Scalar[dt](SM_WM_DRIFT)
+    var v0 = _v3(s, NQ)
+    var w0 = _v3(s, NQ + 3)
+    var v1 = v0 + qapply(hq, dvh)
+    var w1 = w0 + dwb
+    var p1 = _v3(s, 0) + (v0 * ca + v1 * cb) * dtt + qapply(hq, dph)
+    var q1 = qnormalize(qmul(q, quat_from_rotvec((w0 * ca + w1 * cb) * dtt + dth)))[0]
     _put3(s_out, 0, p1)
     comptime for k in range(4):
         s_out[unsafe_offset=3 + k] = q1[k]
     for j in range(n):
-        var qd1 = _at(s, NQ + 6 + j) + _at(delta, 6 + j) * Scalar[dt](2.0)
+        var qd0 = _at(s, NQ + 6 + j)
+        var qd1 = qd0 + _at(delta, 6 + j) * Scalar[dt](2.0)
         s_out[unsafe_offset=NQ + 6 + j] = qd1
-        s_out[unsafe_offset=7 + j] = _at(s, 7 + j) + dtt * qd1 + _at(delta, 12 + n + j) * Scalar[dt](0.02)
+        s_out[unsafe_offset=7 + j] = _at(s, 7 + j) + dtt * (qd0 * ca + qd1 * cb) + _at(delta, 12 + n + j) * Scalar[dt](0.02)
     _put3(s_out, NQ, v1)
     _put3(s_out, NQ + 3, w1)
 
@@ -363,35 +382,38 @@ def sm_integrate_vjp_lane[dt: DType, R: TrackingRobot](
     var dwb = _v3(delta, 3) * Scalar[dt](0.5)
     var dph = _v3(delta, 6 + n) * Scalar[dt](0.01)
     var dth = _v3(delta, 9 + n) * Scalar[dt](0.02)
-    var w1 = _v3(s, NQ + 3) + dwb
-    var r = w1 * dtt + dth
+    var ca = Scalar[dt](1.0 - SM_WM_DRIFT) * dtt          # dt·(1 − c): the old velocity's share of a pose update
+    var cb = Scalar[dt](SM_WM_DRIFT) * dtt                # dt·c: the new velocity's
+    var w0 = _v3(s, NQ + 3)
+    var w1 = w0 + dwb
+    var r = w0 * ca + w1 * cb + dth
     var e = quat_from_rotvec(r)
     var qq = qmul(q, e)
     var qqn = qnormalize(qq)
     # g_delta is written in place, already × out_scale (the d = delta ⊙ out_scale chain)
-    # qj' = qj + dt qd' + dq ; qd' = qd + dqd
+    # qj' = qj + dt ((1 − c) qd + c qd') + dq ; qd' = qd + dqd
     for j in range(n):
         var gqj = _at(g_out, 7 + j)
-        var gqd1 = _at(g_out, NQ + 6 + j) + dtt * gqj
+        var gqd1 = _at(g_out, NQ + 6 + j) + cb * gqj      # ∂/∂qd'
         g_s[unsafe_offset=7 + j] += gqj
         g_delta[unsafe_offset=12 + n + j] = gqj * Scalar[dt](0.02)
-        g_s[unsafe_offset=NQ + 6 + j] += gqd1
+        g_s[unsafe_offset=NQ + 6 + j] += ca * gqj + gqd1
         g_delta[unsafe_offset=6 + j] = gqd1 * Scalar[dt](2.0)
-    # q' = normalise(q ⊗ exp(r)),  r = dt w' + dθ
+    # q' = normalise(q ⊗ exp(r)),  r = dt ((1 − c) w + c w') + dθ
     var gqq = qnormalize_vjp(qqn[0], qqn[1], _q4(g_out, 3))
     var g_q = qmul(gqq, qconj(e))
     var gr = quat_from_rotvec_vjp(r, qmul(qconj(q), gqq))
-    var gw1 = _v3(g_out, NQ + 3) + gr * dtt
+    var gw1 = _v3(g_out, NQ + 3) + gr * cb                 # ∂/∂w'
     comptime for k in range(3):
         g_delta[unsafe_offset=9 + n + k] = gr[k] * Scalar[dt](0.02)
         g_delta[unsafe_offset=3 + k] = gw1[k] * Scalar[dt](0.5)
-    _add3(g_s, NQ + 3, gw1)
-    # p' = p + dt v' + R_h dp_h ; v' = v + R_h dv_h
+    _add3(g_s, NQ + 3, gr * ca + gw1)
+    # p' = p + dt ((1 − c) v + c v') + R_h dp_h ; v' = v + R_h dv_h
     var gp1 = _v3(g_out, 0)
     _add3(g_s, 0, gp1)
     var a1 = qapply_vjp(hq, dph, gp1)
-    var gv1 = _v3(g_out, NQ) + gp1 * dtt
-    _add3(g_s, NQ, gv1)
+    var gv1 = _v3(g_out, NQ) + gp1 * cb                    # ∂/∂v'
+    _add3(g_s, NQ, gp1 * ca + gv1)
     var a2 = qapply_vjp(hq, dvh, gv1)
     comptime for k in range(3):
         g_delta[unsafe_offset=6 + n + k] = a1[1][k] * Scalar[dt](0.01)
