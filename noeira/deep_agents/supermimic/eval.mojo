@@ -102,7 +102,7 @@ def sm_benchmark_env[R: TrackingRobot, BS: TrackingBatchedSim](
 
 def sm_benchmark_run[C: SMConfigT, BS: TrackingBatchedSim](
     ctx: DeviceContext, mut trainer: SuperMimicTrainer[C], mut env: SMTrackingEnvGpu[C.ROBOT, BS],
-    mut rb: SMReplayGpuOf[C.ROBOT], n_clips: Int, verbose: Bool = True,
+    mut rb: SMReplayGpuOf[C.ROBOT], n_clips: Int, verbose: Bool = True, deployed: Bool = True,
 ) raises -> List[SMClipResult]:
     """The first `n_clips` clips of `env`'s library, the protocol above, over
     an env from `sm_benchmark_env`. Re-runnable: it restarts every lane."""
@@ -129,7 +129,7 @@ def sm_benchmark_run[C: SMConfigT, BS: TrackingBatchedSim](
     var next_report = 1000
     while remaining > 0:
         env.policy_inputs(ctx, goals)
-        var a = trainer.act[N](env.hist, goals, resident=True, deployed=True)   # the averaged policy when there is one
+        var a = trainer.act[N](env.hist, goals, resident=True, deployed=deployed)   # by default the averaged policy when there is one
         _ = env.step(ctx, a, rb)
         env.out_terms.download(ctx)
         for l in range(N):
@@ -192,6 +192,8 @@ struct SMInRunBench[C: SMConfigT, BS: TrackingBatchedSim](Movable):
     def due(self, it: Int, total: Int) -> Bool:
         return self.every > 0 and (it % self.every == 0 or it == total)
 
-    def run(mut self, ctx: DeviceContext, mut trainer: SuperMimicTrainer[Self.C]) raises -> SMBenchmarkSummary:
-        var res = sm_benchmark_run[Self.C, Self.BS](ctx, trainer, self.env, self.rb, self.env.lib.num_clips, verbose=False)
+    def run(mut self, ctx: DeviceContext, mut trainer: SuperMimicTrainer[Self.C], deployed: Bool = True) raises -> SMBenchmarkSummary:
+        """`deployed`: the policy a checkpoint would hold (the average when the
+        trainer keeps one); False: the live policy being trained."""
+        var res = sm_benchmark_run[Self.C, Self.BS](ctx, trainer, self.env, self.rb, self.env.lib.num_clips, verbose=False, deployed=deployed)
         return sm_summarize(res)

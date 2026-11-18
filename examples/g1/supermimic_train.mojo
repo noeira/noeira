@@ -63,6 +63,13 @@ Options
                library): failed clips' bins at 0, the others at G_MAX x their
                return, one visit each; skips the coverage phase of a fine-tune
 --lr X         the base learning rate (default the config's 2e-4; 4e-4 with --fast)
+--sched-iters T  the learning rate's cosine runs over T steps (default: --iters). A
+               short run that should see the lr of a long one stops early on
+               the long one's schedule (320000 = the 320k run's)
+--bench-live   with --pi-ema and --bench-every: the benchmark also scores the LIVE
+               policy (`bench_live_norm_return`), what a run without the average
+               would deploy; every benchmark logs `bench_train_s` and
+               `bench_updates`, the training seconds and updates so far
 --fast         the public recipes' loop (`docs/SUPERMIMIC_FAST_TRAINING_PLAN.md`,
                `supermimic/fast.mojo`): BlinkMimic's values for the six knobs below
                and lr 4e-4. Each knob can also be set alone:
@@ -332,7 +339,7 @@ def _train(
     var lib: SMMotionLibrary[Robot], iters: Int, log_every: Int, noise: Bool, seed_v: Int, ckpt_every: Int,
     lp: Pointer[RunLogger, MutAnyOrigin], ckpt: String, artifacts: Optional[ArtifactSink], run_dir: String,
     bench_every: Int, bench_clips: Int, bench_list: List[Int], resume: String, lr_restart: Float64, lr_restart_decay: Int,
-    count: Bool, sampler_seed: String, lr: Float64, fast: SMFastOpts,
+    count: Bool, sampler_seed: String, lr: Float64, fast: SMFastOpts, sched_iters: Int, bench_live: Bool,
 ) raises -> String:
     """Train in the build's mode; returns the run's outcome."""
     var t0 = perf_counter_ns()
@@ -341,8 +348,9 @@ def _train(
     comptime if MODE == 2:
         var dctx = DeviceContext()
         var bench_lib = Optional(_subset_of(lib, bench_list) if len(bench_list) > 0 else _subset(lib, (bench_clips if bench_clips > 0 else BENCH_LANES) if bench_every > 0 else 1))
-        var agent = sm_agent_gpu[C, RBatched[C.LANES]](dctx, lib^, RBatched[C.LANES].create(dctx), iters, noise, seed_v, lr=lr)
+        var agent = sm_agent_gpu[C, RBatched[C.LANES]](dctx, lib^, RBatched[C.LANES].create(dctx), sched_iters, noise, seed_v, lr=lr)
         agent.set_fast(fast)          # before a resume's load
+        agent.bench_live = bench_live
         if count:
             agent.env.sampler = SMResetSampler(agent.env.lib.num_bins, True)
             if sampler_seed.byte_length() > 0:
@@ -370,7 +378,7 @@ def _train(
         var ctx: Optional[DeviceContext] = None
         comptime if TARGET == "gpu":
             ctx = DeviceContext()
-        var agent = sm_agent[C](lib^, iters, noise, seed_v, lr=lr, ctx=ctx)
+        var agent = sm_agent[C](lib^, sched_iters, noise, seed_v, lr=lr, ctx=ctx)
         agent.set_fast(fast)          # before a resume's load
         if count:
             agent.env.sampler = SMResetSampler(agent.env.lib.num_bins, True)
@@ -417,6 +425,8 @@ def main() raises:
     if sampler_seed.byte_length() > 0 and sampler != "count":
         raise Error("--sampler-seed seeds the count estimator: give --sampler count")
     var bench_list = _read_ints(bench_list_path) if bench_list_path.byte_length() > 0 else List[Int]()
+    var sched_iters = Int(_opt(args, String("--sched-iters"), String("0")))
+    var bench_live = _flag(args, String("--bench-live"))
     # the fast-training options: `--fast` is BlinkMimic's preset (and lr 4e-4), each knob overridable
     var fast = SMFastOpts.blink() if _flag(args, String("--fast")) else SMFastOpts.off()
     var lr = Float64(_opt(args, String("--lr"), String("0.0004") if _flag(args, String("--fast")) else String(C.DEF_LR)))
@@ -470,6 +480,7 @@ def main() raises:
     logger.set_config("wm_batch", String(C.WM_BATCH))
     logger.set_config("pi_batch", String(C.PI_BATCH))
     logger.set_config("lr", String(lr))
+    logger.set_config("sched_iters", String(sched_iters if sched_iters > 0 else iters))
     logger.set_config("pi_ema", String(fast.pi_ema))
     logger.set_config("wm_batches", String(fast.wm_batches if fast.wm_batches > 0 else C.DEF_WM_BATCHES))
     logger.set_config("pi_lr_mult", String(fast.pi_lr_mult))
@@ -498,6 +509,7 @@ def main() raises:
     var outcome = _train(
         lib^, iters, log_every, noise, seed_v, ckpt_every, lp, ckpt, artifacts, run.dir, bench_every, bench_clips, bench_list, resume,
         lr_restart, lr_restart_decay, sampler == "count", sampler_seed, lr, fast,
+        sched_iters if sched_iters > 0 else iters, bench_live,
     )
     finish_run(run, logger, artifacts, outcome)
     _ = logger  # lifetime extender for lp

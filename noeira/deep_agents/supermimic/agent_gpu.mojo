@@ -122,6 +122,7 @@ struct SuperMimicAgentGpu[C: SMConfigT, BS: TrackingBatchedSim](Movable):
     var restart_ratio: Float64
     var restart_decay: Int
     var fast: SMFastState             # the fast-training options and their schedule (`set_fast`); off by default
+    var bench_live: Bool              # with an averaged policy, the in-run benchmark also scores the live one
     # device batches, allocated once
     var wb: SMWindowBatch[Self.C.ROBOT]
     var ib: SMImagBatch[Self.C.ROBOT]
@@ -173,6 +174,7 @@ struct SuperMimicAgentGpu[C: SMConfigT, BS: TrackingBatchedSim](Movable):
         self.lr = self.sched.lr
         self.last_avg_reward = 0.0
         self.fast = SMFastState(SMFastOpts.off())
+        self.bench_live = False
         self.wb = SMWindowBatch[R](K, B)
         self.wb.states.ensure_gpu(ctx, (K + 1) * B * D.S)
         self.wb.a_exec.ensure_gpu(ctx, K * B * R.NDOF)
@@ -221,6 +223,7 @@ struct SuperMimicAgentGpu[C: SMConfigT, BS: TrackingBatchedSim](Movable):
         self.restart_ratio = move.restart_ratio
         self.restart_decay = move.restart_decay
         self.fast = move.fast.copy()
+        self.bench_live = move.bench_live
         self.wb = move.wb^
         self.ib = move.ib^
         self.goals = move.goals^
@@ -392,11 +395,27 @@ struct SuperMimicAgentGpu[C: SMConfigT, BS: TrackingBatchedSim](Movable):
                         "  bench @", it, ":", sm.clips, "clips | norm return", sm.mean_norm_return, "| failed", sm.failed,
                         "|", Float64(perf_counter_ns() - tb) * 1e-9, "s",
                     )
+                # training seconds so far (collection + updates, the benchmark's own time excluded) and the update count,
+                # so a time to target reads straight off the benchmark rows
+                var train_s = self.t_sim + self.t_wm + self.t_pi
                 if logger:
                     var lp = logger.value()
                     lp[].log_scalar("bench_norm_return", sm.mean_norm_return, it)
                     lp[].log_scalar("bench_failed", fail, it)
+                    lp[].log_scalar("bench_failed_clips", Float64(sm.failed), it)
+                    lp[].log_scalar("bench_train_s", train_s, it)
+                    lp[].log_scalar("bench_updates", Float64(self.updates), it)
                     lp[].flush()
+                # with an averaged policy, the LIVE one on the same clips: what the plain trainer would deploy
+                if self.bench_live and self.trainer.ema > 0.0 and self.trainer.ema_n > 0:
+                    var sl = bp[].run(self.ctx, self.trainer, deployed=False)
+                    if verbose:
+                        print("  bench @", it, "(live policy): norm return", sl.mean_norm_return, "| failed", sl.failed, "| updates", self.updates, "| training", train_s, "s")
+                    if logger:
+                        var lp2 = logger.value()
+                        lp2[].log_scalar("bench_live_norm_return", sl.mean_norm_return, it)
+                        lp2[].log_scalar("bench_live_failed_clips", Float64(sl.failed), it)
+                        lp2[].flush()
         self.last_avg_reward = lg.last_avg
 
 
