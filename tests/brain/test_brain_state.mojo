@@ -26,6 +26,12 @@
    nothing else; a voice stored under it, recognised, resembling, unknown;
    a second person; a rename; another process reading the store back;
    forgetting; a damaged voice file.
+10. The answers code gives: whether the task is finished, who the speaker is.
+11. What the body can do (`computed_turn`): « Tu peux faire quoi ? » listed
+    from the skills, the motions among them and the reply view's line with
+    them; « Tu peux danser ? » / « Danse ! » run the motion, « Tu peux ouvrir
+    la porte ? » is a no, and what the decision must read (a place, a next
+    step, a direction, a thing in neither list, a statement) is left to it.
 Exits non-zero on a failure.
 """
 
@@ -36,7 +42,8 @@ from std.sys import exit
 
 from noeira.brain import (
     People, name_given, asks_identity, identity_answer, speaker_sentence,
-    asks_task_done, task_done_answer, computed_reply,
+    asks_task_done, task_done_answer, computed_reply, computed_turn, asks_capabilities, asks_can, capabilities_answer,
+    reply_stable,
     restore_memory, digest_lines, log_days, when_words, save_places, load_places, time_refs, focused_memory,
     Task, Step, give_task, cancel_task, refuse_step, tick_tasks, notice_text, task_sentences,
     EX_NONE, EX_START, EX_NOTICE, NOTICE_ALL_DONE, NOTICE_NOT_REACHED, NOTICE_REFUSED,
@@ -671,6 +678,83 @@ def main() raises:
     check(fails, computed_reply(q) == "", "no people store: an identity question is the model's")
     q.people_on = True
     check(fails, computed_reply(q) == "Je ne sais pas : tu ne m'as pas encore dit ton nom.", "with one: the identity answer")
+
+    print("11. what the body can do")
+    var c = WorldState(Body.g1_room("Noé"), String("a furnished room"))
+    c.language = String("fr")
+    c.places.append(PlaceXY(String("fridge"), 2.8, 1.7))
+    c.places.append(PlaceXY(String("door"), 0.9, 2.7))
+    c.places.append(PlaceXY(String("sofa"), -1.6, -2.0))
+    c.call_place(String("fridge"), String("fr"), String("le frigo"))
+    c.call_place(String("door"), String("fr"), String("la porte"))
+    c.call_place(String("sofa"), String("fr"), String("le canapé"))
+    var view0 = reply_stable(c)
+    check(fails, view0.find("You can: walk to a place of the room; turn; squat; raise your arms; talk and answer questions.") >= 0
+          and view0.find("you cannot: pick things up or carry them; open the door; sit down.") >= 0,
+          "g1_room's lines are BB-1's, byte for byte")
+    check(fails, asks_capabilities("Tu peux faire quoi?") and asks_capabilities("Qu'est-ce que tu sais faire ?")
+          and asks_capabilities("Noé, que sais-tu faire ?") and asks_capabilities("What can you do?"),
+          "« what can you do », four ways")
+    check(fails, not asks_capabilities("Tu peux faire un squat?") and not asks_capabilities("Qu'est-ce que tu fais ?"),
+          "a request and « what are you doing » are not it")
+    c.asked = String("Tu peux faire quoi?")
+    var ct0 = computed_turn(c)
+    check(fails, ct0.text == "Je peux aller au frigo, à la porte ou au canapé, tourner, faire un squat et lever les bras."
+          and not ct0.decides and ct0.command == "", "the list, from the skills and the places: " + ct0.text)
+    c.asked = String("Tu peux danser ?")
+    check(fails, computed_turn(c).text == "", "no dance on this body: the model answers")
+    c.body.add_motion(String("dance"))
+    c.body.add_motion(String("backflip"))
+    c.body.add_motion(String("jump"))
+    check(fails, len(c.body.can) == len(c.body.skills) and c.body.can[4] == "dance" and c.body.can[7] == "talk and answer questions",
+          "a motion goes among the movements, before talking, in both lists: " + join(c.body.can, "; "))
+    check(fails, reply_stable(c).find("raise your arms; dance; do a backflip; jump; talk and answer questions.") >= 0,
+          "and the reply view says it can dance")
+    c.asked = String("Tu peux faire quoi ?")
+    check(fails, computed_turn(c).text == "Je peux aller au frigo, à la porte ou au canapé, tourner, faire un squat, lever les bras"
+          + " et des figures comme danser ou faire un salto.", "the motions named by two examples: " + computed_turn(c).text)
+    c.asked = String("Tu peux danser ?")
+    var ct1 = computed_turn(c)
+    check(fails, ct1.text == "Oui, regarde !" and not ct1.decides and ct1.command == "dance", "« Tu peux danser ? »: it dances")
+    var cases: List[String] = ["Danse !", "Noé, danse.", "Allez, danse avec moi", "Fais un salto.", "Peux-tu faire un saut périlleux ?"]
+    var wants: List[String] = ["dance", "dance", "dance", "backflip", "backflip"]
+    for i in range(len(cases)):
+        c.asked = cases[i]
+        var ti = computed_turn(c)
+        check(fails, ti.command == wants[i] and not ti.decides, "« " + cases[i] + " » -> " + ti.command)
+    var leave: List[String] = [
+        "J'aime danser.", "Tu aimes danser ?", "Danse devant la porte.", "Saute puis va au frigo.",
+        "Tu peux tourner à gauche ?", "Tu peux chanter ?", "Va à la porte.", "Je vais sauter.",
+    ]
+    for l in leave:
+        c.asked = l
+        var tl = computed_turn(c)
+        check(fails, tl.text == "" and tl.decides and tl.command == "", "« " + l + " »: the decision's")
+    c.asked = String("Peux-tu faire un squat ?")
+    check(fails, computed_turn(c).command == "squat", "a bank row asked « peux-tu »: run too")
+    c.asked = String("Noé peux-tu lever les bras?")
+    check(fails, computed_turn(c).command == "both_hands_up", "« lever les bras » (live, 11-18: d1 sent it to a reward spec)")
+    c.asked = String("Lève le bras droit.")
+    check(fails, computed_turn(c).text == "", "one arm: the decision's (it has the row)")
+    c.asked = String("Tu peux ouvrir la porte ?")
+    var ct2 = computed_turn(c)
+    check(fails, ct2.text == "Non, je ne peux pas ouvrir la porte." and not ct2.decides and ct2.command == "",
+          "a limit, though it names a place: " + ct2.text)
+    c.asked = String("Est-ce que tu peux t'asseoir sur le canapé ?")
+    check(fails, computed_turn(c).text == "Non, je ne peux pas m'asseoir.", "« t'asseoir »: " + computed_turn(c).text)
+    c.asked = String("Ouvre la porte.")
+    check(fails, computed_turn(c).text == "", "told, not asked: the decision's (it refuses or walks)")
+    check(fails, asks_can("Tu peux danser ?") and asks_can("Peux tu danser") and asks_can("Can you dance")
+          and not asks_can("Tu peux danser.") and not asks_can("Je peux danser ?"), "the question's forms")
+    c.language = String("en")
+    c.asked = String("What can you do?")
+    check(fails, computed_turn(c).text == "I can walk to the fridge, the door or the sofa, turn, squat, raise my arms and moves such as: dance or do a backflip.",
+          "in English: " + computed_turn(c).text)
+    c.asked = String("Can you dance?")
+    check(fails, computed_turn(c).text == "Yes, watch!" and computed_turn(c).command == "dance", "can you dance")
+    c.language = String("fr")
+    c.asked = String("As-tu fini ce que je t'ai demandé ?")
+    check(fails, computed_turn(c).decides, "« As-tu fini ? » still lets the decision act")
 
     print("ALL PASS" if fails == 0 else String(fails) + " FAILED")
     if fails != 0:

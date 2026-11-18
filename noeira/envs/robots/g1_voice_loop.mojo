@@ -193,12 +193,16 @@ struct G1VoiceEvent(Copyable, Movable):
     """A `VL_COMMAND`'s further steps (bank rows). For a `VL_WORLD` with
     `cfg.dest_chain`: the place to go on to after `destination`, if any."""
     var chain_conf: List[Float64]
+    var said: String
+    """What the loop has said for this event already: a computed answer that
+    came with its command (`set_reply_override`'s `command`). The caller says
+    nothing more for it (no `g1_command_phrase`)."""
 
     @staticmethod
     def none() -> G1VoiceEvent:
         return G1VoiceEvent(
             VL_NONE, String(""), String(""), String(""), List[Float64](),
-            0.0, 0.0, 0.0, 0.0, List[String](), List[Float64](),
+            0.0, 0.0, 0.0, 0.0, List[String](), List[Float64](), String(""),
         )
 
 
@@ -292,6 +296,12 @@ struct G1VoiceConfig(Copyable, Movable):
     silence, and the microphone is never gated by it. For timing the voice on a
     headless replay (`--mic-input`): the note says when the first audio would
     have started."""
+    var reply_refused: Bool
+    """An utterance addressed to the robot and refused by the decision (« no
+    clear pick », « no such command » with no reward spec, a place this scene
+    lacks) gets a spoken reply from the reply model instead of silence; the
+    refusal's reason is still never said. Off by default (the measured
+    sessions had it off); the room demo turns it on."""
     var tts_no_play_gated: Bool
     """With `tts_no_play`: the microphone IS gated while a piece "plays" in
     silence (and `VL_ECHO_TAIL_S` after), as it is live. A replay then loses
@@ -412,6 +422,7 @@ struct G1VoiceConfig(Copyable, Movable):
         self.first_clause = 12
         self.tts_no_play = False
         self.tts_no_play_gated = False
+        self.reply_refused = False
         self.dec_spec = String("")
         self.memory_route = False
         self.dest_words = List[String]()
@@ -574,6 +585,10 @@ struct G1VoiceLoopOf[
     var override_final: Bool
     """The caller's answer will not change (`set_reply_override`'s `final`):
     `computed_first` may say it."""
+    var override_decides: Bool
+    """`set_reply_override`'s `decides`: False = the answer settles the turn."""
+    var override_cmd: String
+    """`set_reply_override`'s `command`: run with the answer ("" = none)."""
     var heard_given: Bool
     """The caller has taken this decision's utterance (`take_heard`): an
     override set after that is about it, not about the turn before."""
@@ -754,6 +769,8 @@ struct G1VoiceLoopOf[
         self.echo_speech_s = 0.0
         self.reply_override = String("")
         self.override_final = True
+        self.override_decides = True
+        self.override_cmd = String("")
         self.heard_given = False
         self.canned = String("")
         self.mic_on = True
@@ -837,6 +854,8 @@ struct G1VoiceLoopOf[
         self.echo_speech_s = move.echo_speech_s
         self.reply_override = move.reply_override^
         self.override_final = move.override_final
+        self.override_decides = move.override_decides
+        self.override_cmd = move.override_cmd^
         self.heard_given = move.heard_given
         self.canned = move.canned^
         self.mic_on = move.mic_on
@@ -1117,7 +1136,8 @@ struct G1VoiceLoopOf[
         the state changes. A reply already started keeps the one it had."""
         self.cfg.chat_sys = text^
 
-    def set_reply_override(mut self, var text: String, final: Bool = True):
+    def set_reply_override(mut self, var text: String, final: Bool = True, decides: Bool = True,
+                           var command: String = String("")):
         """A reply the caller has COMPUTED for the utterance being handled: when
         a reply is due and this is not empty, it is said as it is and the reply
         model is not asked. "" (the default) = the model replies.
@@ -1131,9 +1151,19 @@ struct G1VoiceLoopOf[
 
         `final`: the answer will not change for this utterance. False while
         the caller is still working it out (the voice check behind « Comment
-        je m'appelle ? »): `computed_first` waits for it."""
+        je m'appelle ? »): `computed_first` waits for it.
+
+        `decides` False (with `computed_first`): the answer SETTLES the turn —
+        said at once, d1's requests in flight dropped, nothing else said or
+        run for it (« Non, je ne peux pas ouvrir la porte. », the list of
+        skills). `command`: what the body runs with it, as a `VL_COMMAND`
+        whose `said` is the answer (« Tu peux danser ? » on a body with a
+        `dance` motion that no bank row names). Without `computed_first` both
+        are ignored: the answer is said when a reply is due, as before."""
         self.reply_override = text^
         self.override_final = final
+        self.override_decides = decides
+        self.override_cmd = command^
 
     def take_segment(mut self) -> List[Int16]:
         """The samples (16 kHz mono) of the utterance last sent to the
@@ -1453,11 +1483,31 @@ struct G1VoiceLoopOf[
         elif self._computed_due():
             var ctxt = spoken_text(self.reply_override)
             self.replied = True     # the decision goes on; a `talk` route says nothing more
-            self._add_note(String("[said] ") + ctxt + String("  (computed, before the decision)"))
+            var settles = not self.override_decides
+            if settles:
+                self._add_note(String("[said] ") + ctxt + String("  (computed: the turn is settled")
+                               + ((String(", runs ") + self.override_cmd) if self.override_cmd != "" else String(""))
+                               + String(", d1 not asked further)"))
+            else:
+                self._add_note(String("[said] ") + ctxt + String("  (computed, before the decision)"))
             if not self.cfg.mute:
                 self.say(ctxt)
             ev.kind = VL_TALK
             ev.text = ctxt
+            if settles:
+                # ⚠ THE REQUEST IN FLIGHT IS DROPPED, NOT WAITED FOR: its answer could only add a second,
+                # contradicting act (d1 read « Tu peux ouvrir la porte ? » as a walk to the door, §12.6)
+                try:
+                    self.jev.cancel()
+                except:
+                    pass
+                self.then_decide = False
+                self.state = VL_ST_IDLE
+                if self.override_cmd != "":
+                    ev.kind = VL_COMMAND
+                    ev.name = self.override_cmd
+                    ev.text = self.heard
+                    ev.said = ctxt
 
         # ── deciding: the destination request (`request_wording`) ──────
         elif self.state == VL_ST_DEST:
@@ -2257,6 +2307,17 @@ struct G1VoiceLoopOf[
                         got = True
                     except e:
                         self.note = String("[miss] ") + String(e)
+                if not got and self.cfg.reply_refused and self.pick.reason != "not addressed to the robot":
+                    # ⚠ ADDRESSED, AND REFUSED: A REPLY, NOT SILENCE. « Tu peux faire quoi ? » came back « no
+                    # clear pick » (addressed 0.73) in the live room and nothing was said (2026-11-18). The
+                    # reply model answers it; the REASON is still never said (below).
+                    self._reply(
+                        String("If the request is not something you can do, say so kindly; otherwise answer it."),
+                        String("[refused] ") + self.pick.reason + String("  P(none) ") + _vl_f2(self.pick.p_none)
+                        + String("  addressed ") + _vl_f2(self.pick.addressed)
+                        + self._jev_ms(ans.latency_ms, ans.input_tokens) + String(" -> reply"),
+                    )
+                    got = True
                 if not got:
                     # ⚠ NEVER SPOKEN ALOUD. "no such command" is heard,
                     # transcribed and refused again — the loop that filled a
