@@ -29,6 +29,10 @@ rollout's oracle, `test_supermimic_obj_imag`.)
     fifth carry step: under the bar, carried, 4 cm once in hand. Dropped
     after three steps: neither. A fall after four carry steps: no second
     half, not carried. Steps whose reference is under the lift count nowhere.
+    The lean (`sm_obj_lean_deg`, the fourth reading): a box held with its
+    centre in place and hanging at 40 degrees is at the bar, carried and NOT
+    level; the lean is 0 against itself and for any turn about the world's
+    vertical, 30 for a pitch of 30 and between tilts of 20 and 50.
 [7] the tracking kernels over a subset of the bodies
     (`heads.sm_tracking_kernels_lane`): with every body in the mask they are
     `sm_heads_lane`'s first six terms on a random state and reference (each kernel between 5
@@ -77,7 +81,7 @@ from noeira.deep_agents.supermimic.object_task import (
     sm_lead_in, sm_obj_carry_steps, sm_obj_carry_tally, sm_obj_reward_vjp_lane, sm_oe_feat_lane, sm_oe_feat_vjp_lane, sm_trunk_legs_mask,
     FT_FMAX, FT_HMAX, FT_KD, FT_KH, FT_KP, FT_KR, FT_KW, FT_MASS, FT_MMAX, FT_MU, FT_POINT, FT_REL, FT_SQUEEZE, FT_SQUEEZE_MAX, SM_FT_OUT, SM_FT_PARAMS,
     sm_force_alloc, sm_force_teacher_lane,
-    sm_squeeze_lane,
+    sm_squeeze_lane, sm_obj_lean_deg,
 )
 from noeira.deep_agents.supermimic.robot import G1MjlabBoxRobot, SMDims
 from noeira.deep_agents.supermimic.tables import sm_tables
@@ -505,37 +509,68 @@ def test_carry_tally(mut t: Tally) raises:
 
     var a = sm_obj_carry_tally(total)
     for f in range(FRAMES):
-        a.note(rise[f], rise[f], 0.02)
+        a.note(rise[f], rise[f], 0.02, 4.0)
     t.truth(
-        a.carry == 10 and a.held == 10 and a.at_bar() and a.carried() and a.late == 5 and a.late_up == 5 and abs(a.mean_err_late() - 0.02) < 1e-12,
-        "held all the way: at the bar, carried, 2 cm once in hand",
+        a.carry == 10 and a.held == 10 and a.at_bar() and a.carried() and a.late == 5 and a.late_up == 5 and abs(a.mean_err_late() - 0.02) < 1e-12
+        and a.level() and abs(a.mean_lean_late() - 4.0) < 1e-12,
+        "held all the way, leaning 4 deg: at the bar, carried, 2 cm once in hand, level",
+    )
+    var h = sm_obj_carry_tally(total)
+    for f in range(FRAMES):
+        h.note(rise[f], rise[f], 0.02, 40.0)
+    t.truth(
+        h.at_bar() and h.carried() and (not h.level()) and abs(h.mean_lean_late() - 40.0) < 1e-12,
+        "held all the way with its centre in place, hanging at 40 deg: at the bar, carried, NOT level",
     )
     var b = sm_obj_carry_tally(total)
     var n = 0
     for f in range(FRAMES):
         if rise[f] >= 0.05:
             n += 1
-        b.note(rise[f], rise[f], 0.2 if n <= 4 else 0.04)
+        b.note(rise[f], rise[f], 0.2 if n <= 4 else 0.04, 30.0 if n <= 4 else 10.0)
     t.truth(
         b.carry == 10 and b.held == 6 and (not b.at_bar()) and b.carried() and abs(b.mean_err_late() - 0.04) < 1e-12 and abs(b.emax - 0.2) < 1e-12
-        and abs(b.mean_err() - 0.104) < 1e-12,
-        "pushed, picked up 20 cm off, brought back: under the bar, carried, 4 cm once in hand (" + String(b.held) + " of " + String(b.carry) + " held)",
+        and abs(b.mean_err() - 0.104) < 1e-12 and b.level() and abs(b.mean_lean_late() - 10.0) < 1e-12,
+        "pushed, picked up 20 cm off and tipped 30 deg, brought back: under the bar, carried, 4 cm once in hand, level at 10 deg (" + String(b.held) + " of " + String(b.carry) + " held)",
     )
     var c = sm_obj_carry_tally(total)
     n = 0
     for f in range(FRAMES):
         if rise[f] >= 0.05:
             n += 1
-        c.note(rise[f], rise[f] if n <= 3 else 0.0, 0.02 if n <= 3 else 0.5)
-    t.truth(c.carry == 10 and c.held == 3 and (not c.at_bar()) and (not c.carried()) and c.late == 5 and c.late_up == 0, "dropped after three steps: neither")
+        c.note(rise[f], rise[f] if n <= 3 else 0.0, 0.02 if n <= 3 else 0.5, 0.0)
+    t.truth(
+        c.carry == 10 and c.held == 3 and (not c.at_bar()) and (not c.carried()) and c.late == 5 and c.late_up == 0 and (not c.level()),
+        "dropped after three steps, lying flat: neither, and not level (level is of a carried box)",
+    )
     var d = sm_obj_carry_tally(total)
     for f in range(6):                  # the run ends (a fall) after four carry steps
-        d.note(rise[f], rise[f], 0.02)
+        d.note(rise[f], rise[f], 0.02, 0.0)
     t.truth(d.carry == 4 and d.held == 4 and d.late == 0 and (not d.carried()), "a fall after four carry steps: no second half, not carried")
     var e = sm_obj_carry_tally(total)
-    e.note(0.049, 0.3, 0.9)
-    e.note(0.0, 0.0, 0.9)
+    e.note(0.049, 0.3, 0.9, 80.0)
+    e.note(0.0, 0.0, 0.9, 80.0)
     t.truth(e.carry == 0 and e.emax == 0.0 and (not e.at_bar()) and (not e.carried()), "steps whose reference is under the lift count nowhere")
+
+    # the lean: the angle between the world's up seen from the box and seen from the reference box
+    comptime RAD = 0.017453292519943295
+    var same = sm_obj_lean_deg(0.9, 0.1, -0.3, 0.2, 0.9, 0.1, -0.3, 0.2)
+    var pitch = sm_obj_lean_deg(cos(15.0 * RAD), 0.0, sin(15.0 * RAD), 0.0, 1.0, 0.0, 0.0, 0.0)
+    var yaw = sm_obj_lean_deg(cos(35.0 * RAD), 0.0, 0.0, sin(35.0 * RAD), 1.0, 0.0, 0.0, 0.0)
+    # a reference tilted 20 deg about x; the box the same, then turned 50 deg about the WORLD's vertical; and the box tilted 50 deg about x
+    var cr = cos(10.0 * RAD)
+    var sr = sin(10.0 * RAD)
+    var cz = cos(25.0 * RAD)
+    var sz = sin(25.0 * RAD)
+    var turned = sm_obj_lean_deg(cz * cr, cz * sr, sz * sr, sz * cr, cr, sr, 0.0, 0.0)
+    var more = sm_obj_lean_deg(2.0 * cos(25.0 * RAD), 2.0 * sin(25.0 * RAD), 0.0, 0.0, cr, sr, 0.0, 0.0)
+    # the same tilt about the box's OWN other axis is another way of hanging: acos(cos² 20°)
+    var other = sm_obj_lean_deg(cr, 0.0, sr, 0.0, cr, sr, 0.0, 0.0)
+    t.truth(
+        same <= 1e-6 and abs(pitch - 30.0) <= 1e-9 and yaw <= 1e-6 and turned <= 1e-6 and abs(more - 30.0) <= 1e-9 and abs(other - 27.99089071778283) <= 1e-9,
+        "the lean: 0 against itself, 30 deg for a pitch of 30, 0 for a turn about the vertical (" + String(yaw) + ") and for a tilted box turned about it ("
+        + String(turned) + "), 30 between tilts of 20 and 50 (a quaternion of norm 2), " + String(other) + " between the same tilt about two axes of the box",
+    )
 
 
 def test_tracking_kernels(mut t: Tally) raises:

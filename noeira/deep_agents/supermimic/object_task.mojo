@@ -39,7 +39,7 @@ Pointer-in / pointer-out, no allocation, no Float64 at runtime: the bodies of
 GPU kernels (`lanes.mojo`'s rules).
 """
 
-from std.math import exp, sqrt
+from std.math import acos, exp, sqrt
 
 from noeira.deep_agents.supermimic.heads import SMHeadLayout, qapply_inv, sq_quat_err, sq_quat_err_vjp
 from noeira.deep_agents.supermimic.kinematics import FP, Q4, cross3, dot3, qapply, qconj, qmul, sm_fk_lane
@@ -288,16 +288,48 @@ comptime SM_OBJ_LIFT: Float64 = 0.05
 clip's first height (m); the simulated box counts as UP by the same rule."""
 comptime SM_OBJ_HELD_SHARE: Float64 = 0.95
 """The bar: the share of a run's carry steps that must be held."""
+comptime SM_OBJ_LEVEL: Float64 = 15.0
+"""A box in hand is LEVEL when its mean lean over the carry's second half is
+at most this (degrees). A starting choice: the reward's orientation width is
+0.4 rad, 23 degrees."""
+
+
+def sm_obj_lean_deg(
+    qw: Float64, qx: Float64, qy: Float64, qz: Float64, rw: Float64, rx: Float64, ry: Float64, rz: Float64
+) -> Float64:
+    """The object's LEAN against its reference, degrees: the angle between
+    the world's up as the object (quaternion q, WXYZ) sees it and as the
+    reference object (r) sees it. A turn of either about the vertical leaves
+    it as it is: it reads how the object hangs, not where it faces."""
+    var nq = sqrt(qw * qw + qx * qx + qy * qy + qz * qz)
+    var nr = sqrt(rw * rw + rx * rx + ry * ry + rz * rz)
+    if nq < 1e-12 or nr < 1e-12:
+        return 0.0
+    var a = qw / nq
+    var b = qx / nq
+    var c = qy / nq
+    var d = qz / nq
+    var e = rw / nr
+    var f = rx / nr
+    var g = ry / nr
+    var h = rz / nr
+    # R(q)ᵀ ẑ: the rotation matrix's third row
+    var dot = (
+        (2.0 * (b * d - a * c)) * (2.0 * (f * h - e * g)) + (2.0 * (c * d + a * b)) * (2.0 * (g * h + e * f))
+        + (1.0 - 2.0 * (b * b + c * c)) * (1.0 - 2.0 * (f * f + g * g))
+    )
+    return acos(max(-1.0, min(1.0, dot))) * 57.29577951308232
 
 
 @fieldwise_init
 struct SMObjCarryTally(Copyable, Movable):
-    """One run's carry, step by step (`note`). Three readings of it, from the
-    strictest: `at_bar` (held on `SM_OBJ_HELD_SHARE` of the carry steps),
-    `carried` (the simulated box is up on more than half of the carry's
-    SECOND half: it was picked up and is still in the hands late in the
-    carry, wherever it is against the reference), and the mean distance over
-    that second half (the error once in hand). The second half is the carry
+    """One run's carry, step by step (`note`). Four readings of it:
+    `at_bar` (held on `SM_OBJ_HELD_SHARE` of the carry steps), `carried`
+    (the simulated box is up on more than half of the carry's SECOND half:
+    it was picked up and is still in the hands late in the carry, wherever
+    it is against the reference), the mean distance over that second half
+    (the error once in hand), and the mean LEAN over it (`sm_obj_lean_deg`;
+    `level`: at most `SM_OBJ_LEVEL`). The second half is the carry
     steps after the first `carry_total // 2`, `carry_total` being the clip's
     count (`sm_obj_carry_steps`), known before the run: a run that falls
     early has no second half and is not carried.
@@ -305,7 +337,9 @@ struct SMObjCarryTally(Copyable, Movable):
     Why three: a box pushed on the floor before the lift, picked up where it
     lies and brought back to its reference misses the bar for the time the
     way back takes, and is a carry (`docs/OBJECT_INTERACTION_PLAN.md` §6,
-    17 Nov)."""
+    17 Nov). Why the lean: the bar, the carry and the error read the box's
+    CENTRE; a box that hangs from the hands at 40 degrees with its centre in
+    place passes all three (the same, 18 Nov)."""
     var carry_total: Int
     var carry: Int
     var held: Int
@@ -314,10 +348,12 @@ struct SMObjCarryTally(Copyable, Movable):
     var late: Int
     var late_up: Int
     var late_esum: Float64
+    var late_lean: Float64
 
-    def note(mut self, ref_rise: Float64, box_rise: Float64, err: Float64):
+    def note(mut self, ref_rise: Float64, box_rise: Float64, err: Float64, lean: Float64):
         """One step: the reference box's and the simulated box's height above
-        the clip's first reference height, and their distance (m)."""
+        the clip's first reference height, their distance (m), and the
+        simulated box's lean against the reference's (degrees)."""
         if ref_rise < SM_OBJ_LIFT:
             return
         self.carry += 1
@@ -328,6 +364,7 @@ struct SMObjCarryTally(Copyable, Movable):
         if self.carry > self.carry_total // 2:
             self.late += 1
             self.late_esum += err
+            self.late_lean += lean
             if box_rise >= SM_OBJ_LIFT:
                 self.late_up += 1
 
@@ -343,9 +380,16 @@ struct SMObjCarryTally(Copyable, Movable):
     def mean_err_late(self) -> Float64:
         return self.late_esum / Float64(max(self.late, 1))
 
+    def mean_lean_late(self) -> Float64:
+        return self.late_lean / Float64(max(self.late, 1))
+
+    def level(self) -> Bool:
+        """Carried, and level over the carry's second half."""
+        return self.carried() and self.mean_lean_late() <= SM_OBJ_LEVEL
+
 
 def sm_obj_carry_tally(carry_total: Int) -> SMObjCarryTally:
-    return SMObjCarryTally(carry_total, 0, 0, 0.0, 0.0, 0, 0, 0.0)
+    return SMObjCarryTally(carry_total, 0, 0, 0.0, 0.0, 0, 0, 0.0, 0.0)
 
 
 def sm_obj_carry_steps(orefs: List[Scalar[DT]], first_frame: Int, frames: Int) -> Int:

@@ -20,7 +20,9 @@ The bar is not the carry. A run is CARRIED when the robot did not fall and the
 simulated box is up on more than half of the carry's second half; its error
 once in hand is the mean distance over that half
 (`object_task.SMObjCarryTally`, the one rule, shared with the CPU trace
-driver). Report the three side by side.
+driver). Those three read the box's centre; the fourth is its LEAN over the
+same half (`object_task.sm_obj_lean_deg`), and a carried run is LEVEL when
+that is at most `SM_OBJ_LEVEL` degrees. Report the four side by side.
 
 Tracking is reported twice: the tracker's normalised return (eight terms, all
 14 bodies), and the six kernels with the body kernels taken over the trunk and
@@ -71,8 +73,8 @@ from noeira.deep_agents.supermimic.object_imagination import SMObjImagBatch, sm_
 from noeira.deep_agents.supermimic.object_policy import SMObjConfigT
 from noeira.deep_agents.supermimic.object_spec import SM_OBJ, SM_OBJ_CTX
 from noeira.deep_agents.supermimic.object_task import (
-    SM_OBJ_HELD_SHARE, SM_OBJ_LIFT, SM_OBJ_TERMS, SM_OREF, SM_ORW, SMObjCarryTally, sm_obj_carry_steps, sm_obj_carry_tally,
-    sm_obj_reward_lane, sm_trunk_legs_mask,
+    SM_OBJ_HELD_SHARE, SM_OBJ_LEVEL, SM_OBJ_LIFT, SM_OBJ_TERMS, SM_OREF, SM_ORW, SMObjCarryTally, sm_obj_carry_steps, sm_obj_carry_tally,
+    sm_obj_lean_deg, sm_obj_reward_lane, sm_trunk_legs_mask,
 )
 from noeira.deep_agents.supermimic.object_trainer import SMObjTrainer
 from noeira.deep_agents.supermimic.robot import SMDims, TrackingBatchedSim
@@ -102,9 +104,13 @@ struct SMObjClipResult(Copyable, Movable):
     var mean_err_late: Float64    # m, over those steps: the error once in hand
     var kernels_all: Float64      # the six kernels over their maximum, all tracked bodies
     var kernels_trunk_legs: Float64   # … the body kernels over the trunk and the legs only
+    var mean_lean_late: Float64   # degrees, the box's lean against its reference over the carry's second half
 
     def carried(self) -> Bool:
         return (not self.fell) and self.late_steps > 0 and 2 * self.late_up_steps > self.late_steps
+
+    def level(self) -> Bool:
+        return self.carried() and self.mean_lean_late <= SM_OBJ_LEVEL
 
     def success(self) -> Bool:
         return (not self.fell) and self.carry_steps > 0 and Float64(self.held_steps) >= SM_OBJ_HELD_SHARE * Float64(self.carry_steps)
@@ -205,7 +211,15 @@ def sm_obj_benchmark[OC: SMObjConfigT, BS: TrackingBatchedSim](
             ret[l] += env.env.last_reward[l]
             steps[l] += 1
             var z0 = Float64(orefs[env.env.lib.clip_start[c] * SM_OREF + 2])
-            tally[l].note(Float64(oref_l.data[l * SM_OREF + 2]) - z0, Float64(env.o.data[l * SM_OBJ + 2]) - z0, Float64(oerr.data[2 * l]))
+            var oq = l * SM_OBJ + 3
+            var rq = l * SM_OREF + 3
+            tally[l].note(
+                Float64(oref_l.data[l * SM_OREF + 2]) - z0, Float64(env.o.data[l * SM_OBJ + 2]) - z0, Float64(oerr.data[2 * l]),
+                sm_obj_lean_deg(
+                    Float64(env.o.data[oq]), Float64(env.o.data[oq + 1]), Float64(env.o.data[oq + 2]), Float64(env.o.data[oq + 3]),
+                    Float64(oref_l.data[rq]), Float64(oref_l.data[rq + 1]), Float64(oref_l.data[rq + 2]), Float64(oref_l.data[rq + 3]),
+                ),
+            )
             var st = env.env.h_out_i[2 * l + 1]
             if (st & ST_ENDING) == 0:
                 # `env.env.s` is this lane's state after the step (an ending lane's is already its next start)
@@ -224,7 +238,7 @@ def sm_obj_benchmark[OC: SMObjConfigT, BS: TrackingBatchedSim](
             results.append(SMObjClipResult(
                 c, current[l] // n_clips, env.env.lib.clip_len[c], steps[l], ret[l] / (SM_MAX_STEP_REWARD * Float64(max(steps[l], 1))),
                 (st & ST_TERMINATED) != 0, tally[l].carry, tally[l].held, tally[l].emax, tally[l].mean_err(),
-                tally[l].late, tally[l].late_up, tally[l].mean_err_late(), k_all[l] / kn, k_tl[l] / kn,
+                tally[l].late, tally[l].late_up, tally[l].mean_err_late(), k_all[l] / kn, k_tl[l] / kn, tally[l].mean_lean_late(),
             ))
             remaining -= 1
             done_n += 1
