@@ -44,7 +44,9 @@ from noeira.deep_agents.supermimic.object_imagination import SMObjImagBatch
 from noeira.deep_agents.supermimic.object_model import SMObjLoss, SMObjWindowBatch
 from noeira.deep_agents.supermimic.object_policy import SMObjConfigT
 from noeira.deep_agents.supermimic.object_spec import SM_OBJ, SM_OBJ_CTX
-from noeira.deep_agents.supermimic.object_task import SM_OREF, SM_ORW, sm_obj_reward_params, sm_squeeze_lane, sm_squeeze_weights
+from noeira.deep_agents.supermimic.object_task import (
+    SM_OBJ_NEAR, SM_OREF, SM_ORW, sm_obj_reward_params, sm_squeeze_lane, sm_squeeze_weights,
+)
 from noeira.deep_agents.supermimic.object_trainer import SMObjTrainer, SMObjUpdate
 from noeira.deep_agents.supermimic.robot import SMDims, TrackingBatchedSim, TrackingRobot
 from noeira.deep_agents.supermimic.world_model import SMWindowBatch
@@ -60,9 +62,6 @@ comptime SM_OBJ_OM_LR: Float64 = 5e-5
 interface's replay at this rate (the prompt interface's choice for its world
 model, `prompt_agent.SM_P_WM_LR`, is the precedent)."""
 comptime SM_OBJ_TERMS_LEAD: Int = 8          # steps before a logged one on which an update also returns the object terms
-comptime SM_OBJ_NEAR: Float64 = 0.10
-"""A lane "holds" its object when it is within this of its reference (m):
-O1.5's distance."""
 
 
 def _k_oref_lanes(nl: Int64, frame: FPi, orows: FP[DT], dst: FP[DT]):
