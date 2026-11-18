@@ -10,7 +10,9 @@ and the replay on the device too (`SuperMimicAgentGpu` over the batched G1:
 NVIDIA only); `-D SM_PAPER=1` the paper's widths and 4096 lanes; `-D
 SM_LIGHT=1` half-width networks and 1024 lanes; `-D SM_BHL=1` Berkeley
 Humanoid Lite instead of the G1 (its stores: `examples/bhl/retarget_import.mojo`;
-`-D BHL_EFFORT_PCT=` / `-D BHL_SPEED_PCT=` scale its torque and speed limits):
+`-D BHL_EFFORT_PCT=` / `-D BHL_SPEED_PCT=` scale its torque and speed limits);
+`-D SM_FAST=1` with `-D SM_PAPER=1` the public recipes' sizes (a 1024³ world
+model, 2048 imagined starts), to run with `--fast`:
 
     pixi run -e apple mojo build -I . -D SM_GPU=1 examples/g1/supermimic_train.mojo -o sm_train_gpu
     pixi run -e nvidia mojo build -I . -D SM_GPU=2 -D SM_PAPER=1 examples/g1/supermimic_train.mojo -o sm_train_dev
@@ -60,6 +62,19 @@ Options
                resumed policy (`supermimic_eval`'s benchmark.csv on the same
                library): failed clips' bins at 0, the others at G_MAX x their
                return, one visit each; skips the coverage phase of a fine-tune
+--lr X         the base learning rate (default the config's 2e-4; 4e-4 with --fast)
+--fast         the public recipes' loop (`docs/SUPERMIMIC_FAST_TRAINING_PLAN.md`,
+               `supermimic/fast.mojo`): BlinkMimic's values for the six knobs below
+               and lr 4e-4. Each knob can also be set alone:
+--pi-ema D       deploy a running average of the policy, decay D per update
+                 (0.995): checkpoints and the benchmark use it; 0 = off
+--wm-batches N   world-model batches per update (5; default the config's 10)
+--pi-lr-mult M   the policy's lr = lr x M (4) until the training return reaches
+--lr-decay-ret R   R (0.75), at update --lr-decay-by U (1400) at the latest,
+--lr-decay-len L   then back to x 1 over L updates (300)
+--action-noise S collection's action noise std (default 0.1 with noise)
+--ref-skip       action = decoder output + the action that commands the target
+                 pose (--no-ref-skip turns the preset's off); kept in the checkpoint
 
 THE RUN IS AN OBJECT ON DISK: `runs/<id>/` holds `run.kv`, `metrics.csv` (the
 `SMMetrics` bundle every `--log` steps) and the checkpoint `last` (world
@@ -80,6 +95,7 @@ from noeira.data.store import TrajectoryStore
 from noeira.core.run import RunContext, register_run
 from noeira.core.run_session import RunLogger, finish_run, run_logger
 from noeira.deep_agents.supermimic import SMConfig, sm_agent, sm_agent_gpu
+from noeira.deep_agents.supermimic.fast import SMFastOpts
 from noeira.deep_agents.supermimic.eval import SMInRunBench
 from noeira.io.artifact_sink import ArtifactSink, sink_for_run
 from noeira.deep_agents.supermimic.motion_library import SMMotionLibrary, SMResetSampler
@@ -94,6 +110,9 @@ comptime MODE = get_defined_int["SM_GPU", 0]()       # 0 CPU, 1 nets on the GPU,
 comptime TARGET: StaticString = "gpu" if MODE != 0 else "cpu"
 comptime P = get_defined_int["SM_PAPER", 0]() != 0
 comptime LIGHT = get_defined_int["SM_LIGHT", 0]() != 0 and not P
+# `-D SM_FAST=1` with `-D SM_PAPER=1`: the recipes' sizes (InstantTrack's 1024³ world model, BlinkMimic's
+# imagined batch of 2048); the other knobs of the recipes are run-time flags (`--fast`)
+comptime FAST = get_defined_int["SM_FAST", 0]() != 0
 
 # The robot: mjlab's G1 (the reproduction's body) by default; `-D SM_BFM_G1=1`
 # selects BFM-Zero's G1 (checkpoints trained before 2026-11-05 are on it),
@@ -113,14 +132,14 @@ comptime SWAY1 = 10 if BHL else 29
 # Robot for the library's type)
 comptime C = SMConfig[
     TARGET, Robot,
-    2048 if P else (1024 if LIGHT else 128), 64,
+    (1024 if FAST else 2048) if P else (1024 if LIGHT else 128), 64,
     2048 if P else (1024 if LIGHT else 128), 1024 if P else (512 if LIGHT else 64),
     512 if P else (256 if LIGHT else 64), 256 if P else (128 if LIGHT else 32),
     2048 if P else (1024 if LIGHT else 128), 1024 if P else (512 if LIGHT else 64),
     512 if P else (256 if LIGHT else 64), 256 if P else (128 if LIGHT else 32),
     256 if P else (128 if LIGHT else 64), 128 if P else (64 if LIGHT else 32),
     4096 if P else (1024 if LIGHT else 8), 2048 if P else (1024 if LIGHT else 64),
-    4096 if P else (2048 if LIGHT else 16), 32,
+    (2048 if FAST else 4096) if P else (2048 if LIGHT else 16), 32,
 ]
 comptime BENCH_LANES = 512 if P else (256 if LIGHT else 8)   # the in-run benchmark's simulator (memory: see SMInRunBench)
 comptime BenchSim = RBatched[BENCH_LANES]
@@ -299,7 +318,7 @@ def _train(
     var lib: SMMotionLibrary[Robot], iters: Int, log_every: Int, noise: Bool, seed_v: Int, ckpt_every: Int,
     lp: Pointer[RunLogger, MutAnyOrigin], ckpt: String, artifacts: Optional[ArtifactSink], run_dir: String,
     bench_every: Int, bench_clips: Int, bench_list: List[Int], resume: String, lr_restart: Float64, lr_restart_decay: Int,
-    count: Bool, sampler_seed: String,
+    count: Bool, sampler_seed: String, lr: Float64, fast: SMFastOpts,
 ) raises -> String:
     """Train in the build's mode; returns the run's outcome."""
     var t0 = perf_counter_ns()
@@ -308,7 +327,8 @@ def _train(
     comptime if MODE == 2:
         var dctx = DeviceContext()
         var bench_lib = Optional(_subset_of(lib, bench_list) if len(bench_list) > 0 else _subset(lib, (bench_clips if bench_clips > 0 else BENCH_LANES) if bench_every > 0 else 1))
-        var agent = sm_agent_gpu[C, RBatched[C.LANES]](dctx, lib^, RBatched[C.LANES].create(dctx), iters, noise, seed_v)
+        var agent = sm_agent_gpu[C, RBatched[C.LANES]](dctx, lib^, RBatched[C.LANES].create(dctx), iters, noise, seed_v, lr=lr)
+        agent.set_fast(fast)          # before a resume's load
         if count:
             agent.env.sampler = SMResetSampler(agent.env.lib.num_bins, True)
             if sampler_seed.byte_length() > 0:
@@ -336,7 +356,8 @@ def _train(
         var ctx: Optional[DeviceContext] = None
         comptime if TARGET == "gpu":
             ctx = DeviceContext()
-        var agent = sm_agent[C](lib^, iters, noise, seed_v, ctx=ctx)
+        var agent = sm_agent[C](lib^, iters, noise, seed_v, lr=lr, ctx=ctx)
+        agent.set_fast(fast)          # before a resume's load
         if count:
             agent.env.sampler = SMResetSampler(agent.env.lib.num_bins, True)
             if sampler_seed.byte_length() > 0:
@@ -382,6 +403,20 @@ def main() raises:
     if sampler_seed.byte_length() > 0 and sampler != "count":
         raise Error("--sampler-seed seeds the count estimator: give --sampler count")
     var bench_list = _read_ints(bench_list_path) if bench_list_path.byte_length() > 0 else List[Int]()
+    # the fast-training options: `--fast` is BlinkMimic's preset (and lr 4e-4), each knob overridable
+    var fast = SMFastOpts.blink() if _flag(args, String("--fast")) else SMFastOpts.off()
+    var lr = Float64(_opt(args, String("--lr"), String("0.0004") if _flag(args, String("--fast")) else String(C.DEF_LR)))
+    fast.pi_ema = Float64(_opt(args, String("--pi-ema"), String(fast.pi_ema)))
+    fast.wm_batches = Int(_opt(args, String("--wm-batches"), String(fast.wm_batches)))
+    fast.pi_lr_mult = Float64(_opt(args, String("--pi-lr-mult"), String(fast.pi_lr_mult)))
+    fast.lr_decay_ret = Float64(_opt(args, String("--lr-decay-ret"), String(fast.lr_decay_ret)))
+    fast.lr_decay_len = Int(_opt(args, String("--lr-decay-len"), String(fast.lr_decay_len)))
+    fast.lr_decay_by = Int(_opt(args, String("--lr-decay-by"), String(fast.lr_decay_by)))
+    fast.action_noise = Float64(_opt(args, String("--action-noise"), String(fast.action_noise)))
+    if _flag(args, String("--ref-skip")):
+        fast.ref_skip = True
+    if _flag(args, String("--no-ref-skip")):
+        fast.ref_skip = False
     if bench_every > 0 and MODE != 2:
         raise Error("--bench-every needs the device env (-D SM_GPU=2)")
 
@@ -409,7 +444,13 @@ def main() raises:
     logger.set_config("wm_width", String(C.WM_H))
     logger.set_config("wm_batch", String(C.WM_BATCH))
     logger.set_config("pi_batch", String(C.PI_BATCH))
-    logger.set_config("lr", String(C.DEF_LR))
+    logger.set_config("lr", String(lr))
+    logger.set_config("pi_ema", String(fast.pi_ema))
+    logger.set_config("wm_batches", String(fast.wm_batches if fast.wm_batches > 0 else C.DEF_WM_BATCHES))
+    logger.set_config("pi_lr_mult", String(fast.pi_lr_mult))
+    logger.set_config("lr_decay", String(fast.lr_decay_ret) + String(" / ") + String(fast.lr_decay_len) + String(" / by ") + String(fast.lr_decay_by))
+    logger.set_config("action_noise", String(fast.action_noise) if fast.action_noise >= 0.0 else String("default"))
+    logger.set_config("ref_skip", String(fast.ref_skip))
     logger.set_config("utd", String(C.DEF_UTD))
     logger.set_config("noise", String(noise))
     logger.set_config("library_frames", String(lib.num_frames))
@@ -426,7 +467,7 @@ def main() raises:
     print("  run", run.dir)
     var outcome = _train(
         lib^, iters, log_every, noise, seed_v, ckpt_every, lp, ckpt, artifacts, run.dir, bench_every, bench_clips, bench_list, resume,
-        lr_restart, lr_restart_decay, sampler == "count", sampler_seed,
+        lr_restart, lr_restart_decay, sampler == "count", sampler_seed, lr, fast,
     )
     finish_run(run, logger, artifacts, outcome)
     _ = logger  # lifetime extender for lp

@@ -150,6 +150,10 @@ tests/deep_agents/supermimic/test_supermimic_lib.mojo /tmp/sm_lib
 # pose at full reward, resets, the encoder bias in obs and PD target, foot
 # friction, termination and clip-end rows, frame and replay bookkeeping)
 tests/deep_agents/supermimic/test_supermimic_env.mojo
+# SuperMimic's fast-training options (fast.mojo; all off by default): the lr
+# ramp, the reference skip (its gradient against a finite difference), the
+# averaged policy and its checkpoint. Known answers, no dump.
+tests/deep_agents/supermimic/test_supermimic_fast.mojo
 # The shared per-env episodic window replay (deep_agents/data), against the
 # SuperMimic reproduction's ReplayBuffer (same dump as test_supermimic_lib)
 tests/deep_agents/data/test_episodic_replay.mojo /tmp/sm_lib

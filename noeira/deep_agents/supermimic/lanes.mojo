@@ -877,3 +877,39 @@ def sm_mse[target: StaticString](ctx: Optional[DeviceContext], mb: Int, pred: FP
     else:
         for i in range(mb):
             _mse_lane(i, mb, pred, y, g, sq)
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# The reference skip (InstantTrack's `--ref_residual 1`, BlinkMimic's
+# `--pi_ref_skip`): the decoder's output is a correction to the action that
+# commands the step's target pose
+# ════════════════════════════════════════════════════════════════════════════
+@always_inline
+def _ref_skip_lane[R: TrackingRobot](b: Int, goals: FP[DT], k: FP[DT], act: FP[DT]):
+    """act[b] += (q_ref − q0) / scale. The goal window's first frame is the
+    step's target frame and starts with q_ref − q0 (`sm_goal_features_lane`);
+    `k` holds 1 / scale per joint."""
+    comptime n = R.NDOF
+    comptime G = SMDims[R].GOAL
+    for j in range(n):
+        act[unsafe_offset=b * n + j] += goals[unsafe_offset=b * G + j] * k[unsafe_offset=j]
+
+
+def _k_ref_skip[R: TrackingRobot](nb: Int64, goals: FP[DT], k: FP[DT], act: FP[DT]):
+    var b = Int(global_idx.x)
+    if b < Int(nb):
+        _ref_skip_lane[R](b, goals, k, act)
+
+
+def sm_ref_skip[target: StaticString, R: TrackingRobot](
+    ctx: Optional[DeviceContext], nb: Int, goals: FP[DT], k: FP[DT], act: FP[DT]
+) raises:
+    """`act` [nb·n] += the action that commands each lane's target pose, read
+    from its RAW goal window `goals` [nb·GOAL] (before `sm_enc_in`'s scale).
+    The skip is data: no gradient flows through it, so the policy's reverse
+    pass is unchanged."""
+    comptime if target == "gpu":
+        ctx.value().enqueue_function[_k_ref_skip[R]](Int64(nb), goals, k, act, grid_dim=_grid(nb), block_dim=SM_TPB)
+    else:
+        for b in range(nb):
+            _ref_skip_lane[R](b, goals, k, act)

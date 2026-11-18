@@ -256,6 +256,13 @@ trait TrackingRobot:
         ...
 
     @staticmethod
+    def action_scale(j: Int) -> Float64:
+        """Radians of PD target per unit of action on joint j (`target = q0 +
+        scale·a − bias`). The reference skip (`SuperMimicTrainer.set_ref_skip`)
+        needs it; 0 = not declared for this robot, and the skip refuses."""
+        return 0.0
+
+    @staticmethod
     def soft_limit_factor() -> Float64:
         ...
 
@@ -766,6 +773,10 @@ struct G1MjlabRobot(TrackingRobot):
         return g1m_default_pos(j)
 
     @staticmethod
+    def action_scale(j: Int) -> Float64:
+        return g1m_action_scale(j)
+
+    @staticmethod
     def soft_limit_factor() -> Float64:
         return 0.9
 
@@ -921,6 +932,10 @@ struct G1MjlabBoxRobot(TrackingRobot):
     @staticmethod
     def default_joint_pos(j: Int) -> Float64:
         return g1m_default_pos(j)
+
+    @staticmethod
+    def action_scale(j: Int) -> Float64:
+        return g1m_action_scale(j)
 
     @staticmethod
     def soft_limit_factor() -> Float64:
@@ -1151,6 +1166,10 @@ struct BhlRobot(TrackingRobot):
     @staticmethod
     def default_joint_pos(j: Int) -> Float64:
         return bhl_default_pos(j)
+
+    @staticmethod
+    def action_scale(j: Int) -> Float64:
+        return BHL_ACTION_SCALE
 
     @staticmethod
     def soft_limit_factor() -> Float64:

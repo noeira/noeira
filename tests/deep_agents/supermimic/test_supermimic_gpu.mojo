@@ -16,6 +16,11 @@ optimiser and reductions agree there.
   [6] the checkpoint across targets: a GPU trainer's file loaded into a
       fresh CPU trainer (and a CPU file into a fresh GPU trainer) restores
       every weight bit-identically and the loop's counters
+  [7] the fast-training options (`fast.mojo`): two policy updates with the
+      averaged policy on (and, on mjlab's G1, the reference skip): the
+      average's first step is a copy on both targets, its second step and
+      the deployed policy's actions agree, and the device average is not
+      the device's live policy
 
 Vectors compare by cosine >= 0.99999 and max err <= 1e-4 of the largest.
 
@@ -429,6 +434,68 @@ def test_checkpoint(ctx: DeviceContext, mut tl: Tally) raises:
     tl.check(bad2 == 0 and cg[0] == 7 and cg[1] == 3, "CPU file -> GPU trainer: " + String(bad2) + " mismatching weights, counters " + String(cg[0]) + " / " + String(cg[1]))
 
 
+def test_fast(ctx: DeviceContext, mut tl: Tally) raises:
+    print("[7] the fast-training options: the averaged policy" + (String(", the reference skip") if TEST_MJLAB else String("")))
+    var tc = _cpu_trainer()
+    var tg = _gpu_twin(tc, ctx)
+    tc.set_ema(0.9)
+    tg.set_ema(0.9)
+    comptime if TEST_MJLAB:          # BFM-Zero's G1 declares no action scale
+        tc.set_ref_skip(True)
+        tg.set_ref_skip(True)
+    seed(17)
+    var ib = _imag_batch()
+    var perms = List[Int]()
+    for _ in range(5):
+        var q = sm_random_perm(HZ * NB)
+        for i in range(len(q)):
+            perms.append(q[i])
+    var vc = List[Float64]()
+    var rc = List[Float64]()
+    var vg = List[Float64]()
+    var rg = List[Float64]()
+    _ = tc.policy_update[NB](ib, perms, vc, rc)
+    _ = tg.policy_update[NB](ib, perms, vg, rg)
+    # the averages start as two different random networks: only a copy makes them agree
+    var avg1 = sm_snapshot["gpu"](tg.pol_avg, ctx)
+    _compare("the average after one update (a copy of the live policy)", sm_snapshot["cpu"](tc.pol_avg, None), avg1, tl)
+    var mc = tc.policy_update[NB](ib, perms, vc, rc)
+    var mg = tg.policy_update[NB](ib, perms, vg, rg)
+    _close("objective of the second update", mc.imag_objective, mg.imag_objective, 1e-5, tl)
+    # the device's own identity avg2 = 0.9 avg1 + 0.1 live2. (Not a CPU-vs-GPU step comparison: the average moves by
+    # ~2e-5 on weights of ~0.3, a few float32 ulps, so the two targets' steps agree only to ~3e-3 of the move.)
+    var avg2 = sm_snapshot["gpu"](tg.pol_avg, ctx)
+    var live2 = sm_snapshot["gpu"](tg.pol, ctx)
+    var mix_err = 0.0
+    var moved = 0.0
+    for i in range(len(avg2)):
+        for k in range(len(avg2[i])):
+            var want = 0.9 * Float64(avg1[i][k]) + 0.1 * Float64(live2[i][k])
+            mix_err = max(mix_err, abs(Float64(avg2[i][k]) - want))
+            moved = max(moved, abs(Float64(live2[i][k]) - Float64(avg1[i][k])))
+    tl.check(
+        mix_err <= 0.02 * 0.1 * moved,
+        "the device average's second step is 0.9 x average + 0.1 x live: worst " + String(mix_err) + " against a step of " + String(0.1 * moved),
+    )
+    tl.check(_same(sm_snapshot["gpu"](tg.pol_avg, ctx), sm_snapshot["gpu"](tg.pol, ctx)) > 0, "the device average is not the device's live policy")
+    comptime L = 8
+    var hist = TensorImpl[DT].alloc(L * D.HIST * D.OBS)
+    var goals = TensorImpl[DT].alloc(L * D.GOAL)
+    for i in range(hist.n):
+        hist.data[i] = _u(-1, 1)
+    for i in range(goals.n):
+        goals.data[i] = _u(-1, 1)
+    var ac = tc.act[L](hist, goals, deployed=True)
+    var ag = tg.act[L](hist, goals, deployed=True)
+    _vec("the deployed policy's actions", _tv(ac), _tv(ag), tl)
+    var al = tg.act[L](hist, goals)
+    var differ = False
+    for i in range(ag.n):
+        if ag.data[i] != al.data[i]:
+            differ = True
+    tl.check(differ, "on the device, act(deployed) is not act")
+
+
 def main() raises:
     var ctx = DeviceContext()
     var tl = Tally()
@@ -438,6 +505,7 @@ def main() raises:
     test_wm_update(ctx, tl)
     test_act(ctx, tl)
     test_checkpoint(ctx, tl)
+    test_fast(ctx, tl)
     print("\n===", tl.ok, "/", tl.total, "passed ===")
     if tl.ok != tl.total:
         raise Error("test_supermimic_gpu: " + String(tl.total - tl.ok) + " failed")

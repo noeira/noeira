@@ -37,8 +37,9 @@ from noeira.deep_agents.supermimic.config import SMConfigT, SMCriticOf, SMPolicy
 from noeira.deep_agents.supermimic.lanes import (
     SM_TERM_IN, SMImagScratch, sm_copy, sm_critic_in, sm_dec_back, sm_dec_in, sm_enc_in, sm_imag_chain,
     sm_imag_heads_back, sm_imag_init, sm_imag_j, sm_imag_step, sm_imag_surv, sm_imag_v_back, sm_imag_wm_back,
-    sm_wm_in, talloc, tp,
+    sm_ref_skip, sm_wm_in, talloc, tp,
 )
+from noeira.deep_agents.supermimic.kinematics import FP
 from noeira.deep_agents.supermimic.robot import SMDims, TrackingRobot
 from noeira.deep_agents.supermimic.tables import SMTables
 from noeira.nn.constants import DT
@@ -179,13 +180,17 @@ def sm_imagine[C: SMConfigT, N: Int, target: StaticString = "cpu"](
     grad: Bool,
     noise_seed: UInt32 = 0,
     ctx: Optional[DeviceContext] = None,
+    skip: Optional[FP[DT]] = None,
 ) raises -> SMImagOut[C.ROBOT]:
     """The rollout; with `grad`, ADDS d(−J/H)/d params into the policy's grads
     (zero them first). The world model's and critic's grads are polluted.
     `noise_seed` ≠ 0 adds Table A.1's uniform sensor noise to each imagined
     observation as it enters the history (`rollout.py`'s `add_noise`), drawn
     by a counter hash of (seed, t, lane, entry): the same on both targets. It
-    is data, so the gradient path is unchanged."""
+    is data, so the gradient path is unchanged. With `skip` (1 / action scale
+    per joint, on `target`), every action is the decoder's output plus the
+    action that commands the step's target pose (`lanes.sm_ref_skip`): data
+    too, so the reverse scan below is the same."""
     comptime R = C.ROBOT
     comptime D = SMDims[R]
     comptime n = R.NDOF
@@ -224,6 +229,8 @@ def sm_imagine[C: SMConfigT, N: Int, target: StaticString = "cpu"](
         var din = talloc[target](N * D.DEC_IN, ctx)
         sm_dec_in[target, R](ctx, N, tp[target](z), tp[target](O).unsafe_offset(t * N * OBS), N * OBS, OBS, tp[target](din))
         pol.dec.forward[target, N](TensorRefs[1, _, DT](din), act, ctx)
+        if skip:
+            sm_ref_skip[target, R](ctx, N, tp[target](ib.goals).unsafe_offset(t * N * D.GOAL), skip.value(), tp[target](act))
         # the world model
         var x = talloc[target](N * D.WM_IN, ctx)
         sm_wm_in[target, R](ctx, N, tp[target](o.states).unsafe_offset(t * N * S), tp[target](act), tp[target](ib.xi), tp[target](x))

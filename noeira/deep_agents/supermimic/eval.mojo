@@ -129,7 +129,7 @@ def sm_benchmark_run[C: SMConfigT, BS: TrackingBatchedSim](
     var next_report = 1000
     while remaining > 0:
         env.policy_inputs(ctx, goals)
-        var a = trainer.act[N](env.hist, goals, resident=True)
+        var a = trainer.act[N](env.hist, goals, resident=True, deployed=True)   # the averaged policy when there is one
         _ = env.step(ctx, a, rb)
         env.out_terms.download(ctx)
         for l in range(N):

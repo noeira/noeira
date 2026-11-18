@@ -11,6 +11,7 @@ from std.random import random_ui64
 
 from max.gpu.host import DeviceContext
 
+from noeira.deep_agents.supermimic.kinematics import FP
 from noeira.deep_agents.supermimic.lanes import sm_clamp, tp
 from noeira.deep_agents.supermimic.config import SMConfigT, SMCriticOf, SMPolicyOf, SMWorldModelOf
 from noeira.deep_agents.supermimic.imagination import SMImagBatch, SMImagOut, sm_imagine
@@ -64,6 +65,7 @@ struct ActorStep[C: SMConfigT](Movable):
         mut ib: SMImagBatch[Self.C.ROBOT],
         obs_noise: Bool,
         ctx: Optional[DeviceContext] = None,
+        skip: Optional[FP[DT]] = None,
     ) raises -> Tuple[SMImagOut[Self.C.ROBOT], Float64]:
         comptime if target == "gpu":
             if not self.adopted:
@@ -71,7 +73,7 @@ struct ActorStep[C: SMConfigT](Movable):
                 self.adopted = True
         pol.zero_grad[target](ctx)
         var seed = UInt32(random_ui64(1, 0xFFFFFFFF)) if obs_noise else UInt32(0)
-        var o = sm_imagine[Self.C, N, target](wm, pol, critic, tb, ib, Self.C.DEF_GAMMA, True, seed, ctx)
+        var o = sm_imagine[Self.C, N, target](wm, pol, critic, tb, ib, Self.C.DEF_GAMMA, True, seed, ctx, skip)
         var gn = self.opt.clip_grads[target](pol, Scalar[DT](SM_CLIP_NORM), ctx)
         var cv = ClipValue(Scalar[DT](SM_CLIP_VALUE))
         pol.for_each_param[target](cv, ctx)

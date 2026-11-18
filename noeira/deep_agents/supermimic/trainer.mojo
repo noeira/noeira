@@ -16,11 +16,15 @@ the block and copies the actions back, so the same agent runs either way.
 A device env and replay will hand device tensors over directly.
 """
 
+from std.os.path import exists
+
 from max.gpu.host import DeviceContext
 
 from noeira.deep_agents.supermimic.blocks import ActStep, ActorStep, CriticFitStep, WorldModelUpdateStep
 from noeira.deep_agents.supermimic.config import SMConfigT, SMCriticOf, SMPolicyOf, SMWorldModelOf
 from noeira.deep_agents.supermimic.imagination import SMImagBatch
+from noeira.deep_agents.supermimic.kinematics import FP
+from noeira.deep_agents.supermimic.lanes import tp
 from noeira.deep_agents.supermimic.tables import SMTables, sm_tables
 from noeira.deep_agents.supermimic.world_model import SMWindowBatch, SMWMLoss
 from noeira.nn.constants import DT
@@ -74,6 +78,13 @@ struct SuperMimicTrainer[C: SMConfigT](Movable):
     var actor_blk: ActorStep[Self.C]
     var critic_blk: CriticFitStep[Self.C]
     var ctx: Optional[DeviceContext]
+    # The fast-training options (`docs/SUPERMIMIC_FAST_TRAINING_PLAN.md`), all
+    # off unless set: the trainer is then the reproduction's.
+    var pol_avg: SMPolicyOf[Self.C]     # the DEPLOYED policy when `ema` > 0: a running average of `pol`
+    var ema: Float64                    # its decay per policy update (0 = off: `pol` is deployed)
+    var ema_n: Int                      # updates averaged so far (the first one copies `pol`)
+    var ref_skip: Bool                  # actions = decoder output + the action commanding the target pose
+    var skip_k: TensorImpl[DT]          # 1 / action scale per joint, on the config's target
 
     def __init__(out self, var tables: SMTables[DT], ctx: Optional[DeviceContext] = None) raises:
         """Fresh networks (Kaiming; the dynamics' last layer zero, the
@@ -98,6 +109,11 @@ struct SuperMimicTrainer[C: SMConfigT](Movable):
         self.wm_blk = WorldModelUpdateStep[Self.C]()
         self.actor_blk = ActorStep[Self.C]()
         self.critic_blk = CriticFitStep[Self.C]()
+        self.pol_avg = SMPolicyOf[Self.C].make[Kaiming, T](ctx)
+        self.ema = 0.0
+        self.ema_n = 0
+        self.ref_skip = False
+        self.skip_k = TensorImpl[DT].alloc(Self.C.ROBOT.NDOF)
 
     def __init__(out self, *, deinit move: Self):
         self.wm = move.wm^
@@ -109,6 +125,50 @@ struct SuperMimicTrainer[C: SMConfigT](Movable):
         self.actor_blk = move.actor_blk^
         self.critic_blk = move.critic_blk^
         self.ctx = move.ctx^
+        self.pol_avg = move.pol_avg^
+        self.ema = move.ema
+        self.ema_n = move.ema_n
+        self.ref_skip = move.ref_skip
+        self.skip_k = move.skip_k^
+
+    # ── the fast-training options ──
+    def set_ema(mut self, decay: Float64):
+        """Deploy a running average of the policy (InstantTrack's `--pi_ema`):
+        after every policy update `pol_avg ← decay·pol_avg + (1 − decay)·pol`,
+        the first update copying `pol`. Checkpoints, the benchmark and
+        `act(deployed=True)` then use `pol_avg`; collection and the update
+        keep `pol`. 0 turns it off."""
+        self.ema = decay
+        self.ema_n = 0
+
+    def set_ref_skip(mut self, on: Bool) raises:
+        """The reference skip (BlinkMimic's `--pi_ref_skip`): every action is
+        the decoder's output plus `(q_ref − q0) / scale` of the step's target
+        frame, so an untrained policy already commands the reference pose.
+        Stored in the checkpoint; a policy trained with it is meaningless
+        without it."""
+        if on:
+            for j in range(Self.C.ROBOT.NDOF):
+                var s = Self.C.ROBOT.action_scale(j)
+                if s <= 0.0:
+                    raise Error("SuperMimicTrainer.set_ref_skip: this robot declares no action scale (`TrackingRobot.action_scale`)")
+                self.skip_k.data[j] = Scalar[DT](1.0 / s)
+            comptime if Self.C.TARGET == "gpu":
+                self.skip_k.upload_resident(self.ctx.value())
+        self.ref_skip = on
+
+    def _skip(mut self) -> Optional[FP[DT]]:
+        if self.ref_skip:
+            return Optional(tp[Self.C.TARGET](self.skip_k))
+        return None
+
+    def _average_policy(mut self) raises:
+        """One step of the deployed average, after a policy update."""
+        comptime T = Self.C.TARGET
+        var tau = Scalar[DT](1.0) if self.ema_n == 0 else Scalar[DT](1.0 - self.ema)
+        self.pol_avg.enc.polyak_from[T](self.pol.enc, tau, self.ctx)
+        self.pol_avg.dec.polyak_from[T](self.pol.dec, tau, self.ctx)
+        self.ema_n += 1
 
     @staticmethod
     def for_robot(sim: Self.C.ROBOT.SIM, ctx: Optional[DeviceContext] = None) raises -> Self:
@@ -123,32 +183,63 @@ struct SuperMimicTrainer[C: SMConfigT](Movable):
         """The three networks' weights and the loop's counters (`iteration`,
         `updates`, as `K` scalars) into one v3 binary checkpoint (atomic
         write). Optimiser moments are NOT saved (SAC's choice: a resume
-        re-warms Adam; the paper-width moments would triple the file)."""
+        re-warms Adam; the paper-width moments would triple the file).
+        With an averaged policy (`set_ema`), `path` holds the AVERAGE in the
+        policy's place (what every reader of a checkpoint deploys) and
+        `path + ".live"` the live policy, which only a resume reads. The
+        `ref_skip` scalar says whether the policy needs the reference skip."""
         var sc = CheckpointScalars()
         sc.set_int("iteration", iteration)
         sc.set_int("updates", updates)
-        save_params_multi[Self.C.TARGET](path, self.ctx, False, self.wm, self.pol, self.critic, scalars=sc)
+        sc.set_int("ref_skip", 1 if self.ref_skip else 0)
+        if self.ema > 0.0 and self.ema_n > 0:
+            save_params_multi[Self.C.TARGET](path, self.ctx, False, self.wm, self.pol_avg, self.critic, scalars=sc)
+            save_params_multi[Self.C.TARGET](path + ".live", self.ctx, False, self.pol, scalars=sc)
+        else:
+            save_params_multi[Self.C.TARGET](path, self.ctx, False, self.wm, self.pol, self.critic, scalars=sc)
 
     def load_state(mut self, path: String) raises -> Tuple[Int, Int]:
-        """Restore the three networks; returns (iteration, updates)."""
+        """Restore the three networks; returns (iteration, updates). The
+        reference skip follows the checkpoint. With an averaged policy set
+        BEFORE the load (a resume), the average restarts from the file's
+        policy and the live policy comes from `path + ".live"` when it exists."""
         var sc = load_params_multi[Self.C.TARGET](path, self.ctx, self.wm, self.pol, self.critic)
+        self.set_ref_skip(sc.get_int("ref_skip", 0) != 0)
+        if self.ema > 0.0:
+            self.ema_n = 0
+            self._average_policy()
+            if exists(path + ".live"):
+                _ = load_params_multi[Self.C.TARGET](path + ".live", self.ctx, self.pol)
         return (sc.get_int("iteration", 0), sc.get_int("updates", 0))
 
     def set_lr(mut self, lr: Float64):
         """The same lr for world model, policy and critic (`Trainer.run`)."""
-        self.wm_blk.opt.lr = Scalar[DT](lr)
-        self.actor_blk.opt.lr = Scalar[DT](lr)
-        self.critic_blk.opt.lr = Scalar[DT](lr)
+        self.set_lrs(lr, lr, lr)
 
-    def act[L: Int](mut self, mut hist: TensorImpl[DT], mut goals: TensorImpl[DT], resident: Bool = False) raises -> TensorImpl[DT]:
+    def set_lrs(mut self, lr_wm: Float64, lr_pi: Float64, lr_v: Float64):
+        """One lr per network (BlinkMimic's `--pi_lr_mult` raises the policy's)."""
+        self.wm_blk.opt.lr = Scalar[DT](lr_wm)
+        self.actor_blk.opt.lr = Scalar[DT](lr_pi)
+        self.critic_blk.opt.lr = Scalar[DT](lr_v)
+
+    def act[L: Int](
+        mut self, mut hist: TensorImpl[DT], mut goals: TensorImpl[DT], resident: Bool = False, deployed: Bool = False,
+    ) raises -> TensorImpl[DT]:
         """Host `hist` / `goals` in, host actions out (on "gpu" via the
-        device); `resident`: inputs and actions stay on the device."""
+        device); `resident`: inputs and actions stay on the device.
+        `deployed`: the averaged policy when there is one (`set_ema`), the
+        policy a checkpoint of this trainer would hold."""
         comptime T = Self.C.TARGET
         comptime if T == "gpu":
             if not resident:
                 hist.upload_resident(self.ctx.value())
                 goals.upload_resident(self.ctx.value())
-        var a = self.act_blk.step[T, L](self.pol, hist, goals, self.ctx)
+        var sk = self._skip()
+        var a: TensorImpl[DT]
+        if deployed and self.ema > 0.0 and self.ema_n > 0:
+            a = self.act_blk.step[T, L](self.pol_avg, hist, goals, self.ctx, sk)
+        else:
+            a = self.act_blk.step[T, L](self.pol, hist, goals, self.ctx, sk)
         comptime if T == "gpu":
             if not resident:
                 a.download(self.ctx.value())
@@ -178,7 +269,9 @@ struct SuperMimicTrainer[C: SMConfigT](Movable):
         comptime if Self.C.TARGET == "gpu":
             if not resident:
                 ib.to_device(self.ctx.value())
-        var ro = self.actor_blk.step[Self.C.TARGET, N](self.wm, self.pol, self.critic, self.tables, ib, obs_noise, self.ctx)
+        var ro = self.actor_blk.step[Self.C.TARGET, N](self.wm, self.pol, self.critic, self.tables, ib, obs_noise, self.ctx, self._skip())
+        if self.ema > 0.0:
+            self._average_policy()
         var cf = self.critic_blk.step[Self.C.TARGET, N, Self.C.HORIZON](
             self.critic, ro[0], ib, Self.C.DEF_GAMMA, perms, values_out, targets_out, self.ctx
         )
