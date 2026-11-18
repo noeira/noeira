@@ -35,6 +35,16 @@ WHAT EACH SECTION CAN CATCH
     update stay under the ceiling when it is on and exceed it when it is off.
 [9] the drift weight's guard: a checkpoint written under another weight is
     refused.
+[10] Muon in the trainer: turning it on after Adam has stepped is refused
+    (Adam's moments would keep moving Muon's matrices: the first version
+    of this section did exactly that and measured Adam's step size). On a
+    trainer with Muon on from its first update, Muon steps once per
+    world-model batch and once per policy update on every registered matrix
+    (it raises on a name the model does not have), and after 11 updates a
+    hidden matrix moves in one step by Muon's size, lr x 0.2 x
+    sqrt(IN x OUT) x a singular value of order 1: neither doubled nor
+    overwritten by Adam's step. Adam's size on the same matrices is printed
+    for comparison, not asserted. A first layer still moves.
 """
 
 from std.math import abs
@@ -151,6 +161,15 @@ def _worst(a: List[Float64], b: List[Float64]) -> Float64:
     return m
 
 
+def _fro(a: List[Scalar[DT]], b: List[Scalar[DT]]) -> Float64:
+    """‖a − b‖_F."""
+    var acc = 0.0
+    for i in range(len(a)):
+        var d = Float64(a[i]) - Float64(b[i])
+        acc += d * d
+    return acc ** 0.5
+
+
 def _largest(a: List[Float64]) -> Float64:
     var m = 0.0
     for i in range(len(a)):
@@ -162,7 +181,7 @@ def main() raises:
     var t = Tally()
 
     print("\n[1] the lr ramp")
-    var st = SMFastState(SMFastOpts(0.0, 0, 4.0, 0.75, 300, 1400, -1.0, False, False, 0.0))
+    var st = SMFastState(SMFastOpts(0.0, 0, 4.0, 0.75, 300, 1400, -1.0, False, False, 0.0, False, 0.0))
     t.truth(st.pi_mult(0) == 4.0 and st.pi_mult(900) == 4.0, "x 4 until the trigger")
     st.note_episode(0.9)
     t.truth(not st.tick(49) and st.decay_at < 0, "no test between two multiples of 50, whatever the return")
@@ -171,7 +190,7 @@ def main() raises:
     st.note_episode(0.8)
     t.truth(st.tick(100) and st.decay_at == 100, "a test at 0.8 starts it, at update 100")
     t.truth(_near(st.pi_mult(100), 4.0) and _near(st.pi_mult(250), 2.5) and _near(st.pi_mult(400), 1.0) and _near(st.pi_mult(5000), 1.0), "linear 4 -> 1 over 300 updates, then 1")
-    var dl = SMFastState(SMFastOpts(0.0, 0, 4.0, 0.75, 300, 1400, -1.0, False, False, 0.0))
+    var dl = SMFastState(SMFastOpts(0.0, 0, 4.0, 0.75, 300, 1400, -1.0, False, False, 0.0, False, 0.0))
     t.truth(not dl.tick(1350) and dl.tick(1400) and dl.decay_at == 1400, "without the return, the deadline starts it at update 1400")
     var off = SMFastState(SMFastOpts.off())
     t.truth(off.pi_mult(7) == 1.0 and not off.tick(50) and off.wm_batches(10) == 10, "off: x 1, no ramp, the config's world-model batches")
@@ -277,7 +296,7 @@ def main() raises:
     var a_read = reader.trainer.act[LANES](hist, goals)
     t.truth(_max_diff_t(a_read, a_dep_s, LANES * R.NDOF) == 0.0, "a plain reader deploys the AVERAGE (its act = the trainer's act(deployed))")
     var resumed = sm_agent[C](sm_stand_library[R](2, 200, 0.05, sim0.qpos(2)), 2000, False, 0)
-    resumed.set_fast(SMFastOpts(DECAY, 0, 1.0, 0.0, 300, 0, -1.0, False, False, 0.0))
+    resumed.set_fast(SMFastOpts(DECAY, 0, 1.0, 0.0, 300, 0, -1.0, False, False, 0.0, False, 0.0))
     _ = resumed.trainer.load_state(path)
     var r_live = resumed.trainer.act[LANES](hist, goals)
     var r_dep = resumed.trainer.act[LANES](hist, goals, deployed=True)
@@ -397,10 +416,56 @@ def main() raises:
         print("   ", e)
     t.truth(refused, "a checkpoint written under the weight " + String(other) + "/1000 is refused by this build (" + String(SM_WM_DRIFT_MILLI) + "/1000)")
 
+    print("\n[10] Muon in the trainer")
+    comptime WH = 32                          # the config's hidden widths: every hidden matrix is [32, 32]
+    comptime I_WM = 2                         # dynamics.1.weight in the world model's walk
+    comptime I_DEC = 12                       # decoder.1.weight in the policy's (the encoder has 5 layers)
+    var unit = 0.2 * Float64(WH)              # 0.2 sqrt(max(IN, OUT)) x sqrt(min(IN, OUT)): Muon's step per lr at singular values 1
+    var late = False
+    try:
+        agent.trainer.set_muon(True)
+    except e:
+        late = True
+        print("   ", e)
+    t.truth(late, "turning Muon on after Adam has stepped is refused")
+    var sizes = List[Float64]()               # [Adam wm, Adam policy, Muon wm, Muon policy], in Muon's unit
+    var muon_steps_ok = False
+    var first_moved = False
+    for arm in range(2):
+        # a fresh trainer (Muon on from its first update in arm 1), 11 updates so that the world model answers to
+        # actions (its last layer starts at zero: until it moves, the hidden layers have no gradient at all), then
+        # ONE step of each network
+        var fr = sm_agent[C](sm_stand_library[R](2, 200, 0.05, sim0.qpos(2)), 2000, False, 0, utd=1.0, warmup=14)
+        if arm == 1:
+            fr.trainer.set_muon(True)
+        fr.train(24, 0)
+        var steps_before = fr.trainer.actor_blk.muon.steps
+        var wm_a = sm_snapshot["cpu"](fr.trainer.wm, None)
+        var pol_a = sm_snapshot["cpu"](fr.trainer.pol, None)
+        var wb = fr.window_batch()
+        _ = fr.trainer.wm_update[8](wb)
+        var ibm = fr.start_batch()
+        var none10 = List[Int]()
+        var v10 = List[Float64]()
+        var t10 = List[Float64]()
+        _ = fr.trainer.policy_update[8](ibm, none10, v10, t10)
+        var wm_b = sm_snapshot["cpu"](fr.trainer.wm, None)
+        var pol_b = sm_snapshot["cpu"](fr.trainer.pol, None)
+        sizes.append(_fro(wm_b[I_WM], wm_a[I_WM]) / (Float64(fr.trainer.wm_blk.opt.lr) * unit))
+        sizes.append(_fro(pol_b[I_DEC], pol_a[I_DEC]) / (Float64(fr.trainer.actor_blk.opt.lr) * unit))
+        if arm == 1:
+            # 11 updates of 10 world-model batches and 1 policy step, then one of each
+            muon_steps_ok = steps_before == 11 and fr.trainer.wm_blk.muon.steps == 111 and fr.trainer.actor_blk.muon.steps == 12
+            first_moved = _fro(wm_b[0], wm_a[0]) > 0.0 and _fro(pol_b[10], pol_a[10]) > 0.0
+    t.truth(muon_steps_ok, "Muon steps once per world-model batch and once per policy update, on all 2 + 6 registered matrices")
+    print("    one step, in Muon's unit: dynamics.1.weight Muon", sizes[2], "(Adam:", sizes[0], ") | decoder.1.weight Muon", sizes[3], "(Adam:", sizes[1], ")")
+    t.truth(sizes[2] > 0.3 and sizes[2] < 1.3 and sizes[3] > 0.3 and sizes[3] < 1.3, "under Muon both hidden matrices move by lr x 0.2 x 32 x a singular value of order 1")
+    t.truth(first_moved, "with Muon on, the first layers (Adam's) still move")
+
     print("\n[6] the loop")
     var looped = sm_agent[C](sm_stand_library[R](2, 200, 0.05, sim0.qpos(2)), 2000, True, 0, utd=1.0, warmup=14)
     t.truth(looped.env.action_noise == 0.1, "with noise, collection's action noise starts at 0.1")
-    looped.set_fast(SMFastOpts(0.995, 3, 4.0, 0.0, 4, 50, 0.0, True, True, 10.0))
+    looped.set_fast(SMFastOpts(0.995, 3, 4.0, 0.0, 4, 50, 0.0, True, True, 10.0, True, 0.0))
     looped.train(65, 0)                      # 52 updates: the deadline's test is at update 50
     var u = looped.updates
     t.truth(u == 52, "52 updates (" + String(u) + ")")

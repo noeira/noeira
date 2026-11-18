@@ -16,6 +16,8 @@ off by default (`docs/SUPERMIMIC_FAST_TRAINING_PLAN.md` §4):
                   thresholds, not on the learned head         recipes' `soft_termination`
     v_max         V capped at the reward ceiling in the       the official code's 133c0f0
                   bootstrap and the critic's targets
+    muon          Muon on the hidden weight matrices of the   all three recipe lines
+                  world model and the policy, Adam elsewhere  (`--pi_opt muon --wm_opt muon`)
 
 Both agents hold one `SMFastState` and ask it for the policy's lr multiplier
 and the world-model batch count; the averaged policy and the reference skip
@@ -43,11 +45,13 @@ struct SMFastOpts(Copyable, Movable):
     var ref_skip: Bool
     var analytic_term: Bool
     var v_max: Float64            # the value ceiling; 0 = none (10 = 0.1 / (1 − 0.99) for this reward)
+    var muon: Bool
+    var muon_wd: Float64          # Muon's decoupled weight decay (BlinkMimic 0, the official code 0.1)
 
     @staticmethod
     def off() -> Self:
         """The reproduction's loop."""
-        return Self(0.0, 0, 1.0, 0.0, 300, 0, -1.0, False, False, 0.0)
+        return Self(0.0, 0, 1.0, 0.0, 300, 0, -1.0, False, False, 0.0, False, 0.0)
 
     @staticmethod
     def blink() -> Self:
@@ -56,7 +60,7 @@ struct SMFastOpts(Copyable, Movable):
         schedule's `lr`, its 1024³ world model and batch 2048 are the
         config's widths. The value ceiling is the official code's, not
         BlinkMimic's: off here."""
-        return Self(0.995, 5, 4.0, 0.75, 300, 1400, -1.0, True, True, 0.0)
+        return Self(0.995, 5, 4.0, 0.75, 300, 1400, -1.0, True, True, 0.0, True, 0.0)
 
 
 struct SMFastState(Copyable, Movable):

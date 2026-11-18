@@ -17,7 +17,7 @@ optimiser and reductions agree there.
       fresh CPU trainer (and a CPU file into a fresh GPU trainer) restores
       every weight bit-identically and the loop's counters
   [7] the fast-training options (`fast.mojo`): two policy updates with the
-      averaged policy, the analytic termination and the value ceiling on
+      averaged policy, the analytic termination, the value ceiling and Muon on
       (and, on mjlab's G1, the reference skip): the policy's step agrees
       with the CPU's, the average's first step is a copy on both targets,
       its second step satisfies its identity, the deployed policy's actions
@@ -448,6 +448,8 @@ def test_fast(ctx: DeviceContext, mut tl: Tally) raises:
     tg.analytic_term = True
     tc.v_max = 1e-3                  # every lane whose V(s_H) is positive is capped
     tg.v_max = 1e-3
+    tc.set_muon(True)                # the device's Muon: cuBLAS on NVIDIA, the host fallback elsewhere
+    tg.set_muon(True)
     var p0 = sm_snapshot["cpu"](tc.pol, None)
     seed(17)
     var ib = _imag_batch()

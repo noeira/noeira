@@ -164,6 +164,35 @@ struct SuperMimicTrainer[C: SMConfigT](Movable):
                 self.skip_k.upload_resident(self.ctx.value())
         self.ref_skip = on
 
+    def set_muon(mut self, on: Bool, wd: Float64 = 0.0) raises:
+        """Muon (`nn/optimizer/muon.mojo`) on the hidden weight matrices of
+        the dynamics, the encoder and the decoder: every Linear between the
+        first and the last of each MLP, as in BlinkMimic's `MuonAdam` and
+        the official code. Adam keeps the first and last layers, the biases,
+        the termination head and the critic. `wd`: Muon's decoupled weight
+        decay (BlinkMimic 0, torch's default and the official code 0.1).
+        Turn it on BEFORE the first update: Muon hands its matrices to Adam
+        with a zero gradient, which leaves them alone only while Adam's
+        moments for them are zero. After an Adam step they are not, and Adam
+        would keep moving those matrices beside Muon. (A resumed run starts
+        with fresh moments, so it qualifies.)"""
+        if on and not self.wm_blk.muon_on and (self.wm_blk.opt.t > 0 or self.actor_blk.opt.t > 0):
+            raise Error("SuperMimicTrainer.set_muon: Adam has already stepped; Muon must be on from the first update")
+        if on and len(self.wm_blk.muon.names) == 0:
+            comptime W = Self.C.WM_H
+            self.wm_blk.muon.add(String("dynamics.1.weight"), W, W)
+            self.wm_blk.muon.add(String("dynamics.2.weight"), W, W)
+            self.actor_blk.muon.add(String("encoder.1.weight"), Self.C.ENC1, Self.C.ENC2)
+            self.actor_blk.muon.add(String("encoder.2.weight"), Self.C.ENC2, Self.C.ENC3)
+            self.actor_blk.muon.add(String("encoder.3.weight"), Self.C.ENC3, Self.C.ENC4)
+            self.actor_blk.muon.add(String("decoder.1.weight"), Self.C.DEC1, Self.C.DEC2)
+            self.actor_blk.muon.add(String("decoder.2.weight"), Self.C.DEC2, Self.C.DEC3)
+            self.actor_blk.muon.add(String("decoder.3.weight"), Self.C.DEC3, Self.C.DEC4)
+        self.wm_blk.muon.wd = wd
+        self.actor_blk.muon.wd = wd
+        self.wm_blk.muon_on = on
+        self.actor_blk.muon_on = on
+
     def _skip(mut self) -> Optional[FP[DT]]:
         if self.ref_skip:
             return Optional(tp[Self.C.TARGET](self.skip_k))

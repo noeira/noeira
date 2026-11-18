@@ -79,6 +79,10 @@ Options
                  not on the learned head (--learned-term turns the preset's off)
 --v-max V        cap V at V in the bootstrap and the critic's targets (10 is this
                  reward's ceiling 0.1 / (1 - 0.99); default 0 = no cap; not in --fast)
+--muon           Muon on the hidden weight matrices of the world model's dynamics and
+                 of the policy's encoder and decoder, Adam on everything else
+                 (--no-muon turns the preset's off); --muon-wd W its weight decay
+                 (default 0, BlinkMimic's; the official code uses 0.1)
 A BUILD constant, not a flag: `-D SM_WM_DRIFT_MILLI=625` makes the world model
 advance poses with 0.625 of the new velocity and 0.375 of the old one (default
 1000: the new velocity only). Checkpoints carry it and refuse the other build.
@@ -430,6 +434,11 @@ def main() raises:
     if _flag(args, String("--learned-term")):
         fast.analytic_term = False
     fast.v_max = Float64(_opt(args, String("--v-max"), String(fast.v_max)))
+    if _flag(args, String("--muon")):
+        fast.muon = True
+    if _flag(args, String("--no-muon")):
+        fast.muon = False
+    fast.muon_wd = Float64(_opt(args, String("--muon-wd"), String(fast.muon_wd)))
     if bench_every > 0 and MODE != 2:
         raise Error("--bench-every needs the device env (-D SM_GPU=2)")
 
@@ -466,6 +475,7 @@ def main() raises:
     logger.set_config("ref_skip", String(fast.ref_skip))
     logger.set_config("analytic_term", String(fast.analytic_term))
     logger.set_config("v_max", String(fast.v_max))
+    logger.set_config("muon", String(fast.muon) + (String(" wd ") + String(fast.muon_wd) if fast.muon else String("")))
     logger.set_config("wm_drift_milli", String(SM_WM_DRIFT_MILLI))
     logger.set_config("utd", String(C.DEF_UTD))
     logger.set_config("noise", String(noise))

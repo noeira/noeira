@@ -13,6 +13,7 @@ from noeira.deep_agents.supermimic.world_model import SMWindowBatch, SMWMLoss, s
 from noeira.nn.constants import DT
 from noeira.nn.optimizer.adam import Adam
 from noeira.nn.optimizer.grad_clip import clip_grad_norm
+from noeira.nn.optimizer.muon import Muon
 
 
 comptime SM_WM_CLIP: Float64 = 1.0
@@ -27,16 +28,22 @@ struct WorldModelUpdateStep[C: SMConfigT](Movable):
     var opt: Adam
     var adopted: Bool
     var w_term: Float64       # the termination BCE's weight (Eq. 1: 1)
+    var muon: Muon            # the dynamics' hidden matrices when `muon_on` (`SuperMimicTrainer.set_muon`)
+    var muon_on: Bool
 
     def __init__(out self):
         self.opt = Adam(lr=Scalar[DT](Self.C.DEF_LR))
         self.adopted = False
         self.w_term = 1.0
+        self.muon = Muon(Scalar[DT](Self.C.DEF_LR))
+        self.muon_on = False
 
     def __init__(out self, *, deinit move: Self):
         self.opt = move.opt^
         self.adopted = move.adopted
         self.w_term = move.w_term
+        self.muon = move.muon^
+        self.muon_on = move.muon_on
 
     def step[target: StaticString, B: Int](
         mut self, mut wm: SMWorldModelOf[Self.C], mut w: SMWindowBatch[Self.C.ROBOT], ctx: Optional[DeviceContext] = None
@@ -55,5 +62,8 @@ struct WorldModelUpdateStep[C: SMConfigT](Movable):
             gn = -1.0
         else:
             gn = Float64(clip_grad_norm[target](wm, Scalar[DT](SM_WM_CLIP), ctx))
+        if self.muon_on:          # after the clip, before Adam: it spends its matrices' gradients
+            self.muon.lr = self.opt.lr
+            self.muon.step[target](wm, ctx)
         self.opt.step[target](wm, ctx)
         return (l^, gn)

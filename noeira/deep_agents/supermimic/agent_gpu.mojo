@@ -333,6 +333,7 @@ struct SuperMimicAgentGpu[C: SMConfigT, BS: TrackingBatchedSim](Movable):
         self.trainer.set_ref_skip(opts.ref_skip)
         self.trainer.analytic_term = opts.analytic_term
         self.trainer.v_max = opts.v_max
+        self.trainer.set_muon(opts.muon, opts.muon_wd)
         if opts.action_noise >= 0.0:
             self.env.action_noise = opts.action_noise
 
