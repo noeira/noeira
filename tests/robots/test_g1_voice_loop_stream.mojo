@@ -26,6 +26,11 @@ before it. What this pins:
 7. The FIRST piece may end at a comma (`first_clause`): a one-sentence reply
    starts before its sentence ends; only the first comma, only after 12
    bytes (« Oui, » stays whole), never inside `4,5`; 0 = sentences only.
+9. A reply capped at so many sentences (`set_reply_sentences`,
+   `spoken_cap_end`): streamed, it stops there AND the reply model is
+   stopped; whole (not streamed, or muted), it is cut by the same rule; a
+   sentence under three words (« Oui ! ») is said but not counted; a last
+   sentence is never cut; 0 = no cap.
 
 The loop is the real `G1VoiceLoopOf` with `tts_no_play` (synthesised, played in
 silence), its microphone closed; the reply model and the synthesiser are
@@ -42,7 +47,7 @@ from noeira.envs.robots.g1_command_language import G1Context
 from noeira.envs.robots.g1_voice_loop import G1VoiceConfig, G1VoiceLoopOf, VL_ST_IDLE, VL_ST_STT, VL_TALK
 from noeira.io.json import parse_json
 from noeira.io.wav import WavAudio
-from noeira.text.spoken import spoken_clause_end, spoken_sentence_end
+from noeira.text.spoken import spoken_cap_end, spoken_clause_end, spoken_sentence_end, spoken_words
 
 
 def check(mut fails: Int, ok: Bool, what: String):
@@ -125,12 +130,14 @@ struct StreamChat(Movable, ChatService):
     var answer: String
     var at: Int
     var started: Bool
+    var cancels: Int
 
     def __init__(out self):
         self.pieces = List[String]()
         self.answer = String("")
         self.at = 0
         self.started = False
+        self.cancels = 0
 
     @staticmethod
     def from_spec(spec: String) raises -> Self:
@@ -174,6 +181,7 @@ struct StreamChat(Movable, ChatService):
 
     def cancel(mut self) raises:
         self.started = False
+        self.cancels += 1
 
 
 struct RecTts(Movable, TextToSpeechService):
@@ -338,6 +346,8 @@ struct Run(Movable):
     var event: String
     var overlap: Int
     var idle: Bool
+    var llm_cancels: Int
+    var llm_polled: Int
 
     def __init__(out self):
         self.said = List[String]()
@@ -346,11 +356,13 @@ struct Run(Movable):
         self.event = String("")
         self.overlap = 0
         self.idle = False
+        self.llm_cancels = 0
+        self.llm_polled = 0
 
 
 def run(
     stream: Bool, mute: Bool, var pieces: List[String], answer: String, ref bank: G1CommandBank, say_at: Int = -1,
-    tts_polls: Int = 2, first_clause: Int = 12,
+    tts_polls: Int = 2, first_clause: Int = 12, cap: Int = 0,
 ) raises -> Run:
     """A reply streamed as `pieces`; `say_at` >= 0: the caller says something at that poll; a synthesis takes
     `tts_polls` polls."""
@@ -360,6 +372,7 @@ def run(
     loop.llm.pieces = pieces^
     loop.llm.answer = answer
     loop.heard = String("Comment tu t'appelles ?")
+    loop.set_reply_sentences(cap)
     loop._reply(String(""), String("[talk] test"))
     var ctx = G1Context()
     var r = Run()
@@ -377,6 +390,8 @@ def run(
             r.notes += n + String("\n")
     r.said = loop.tts.value().started.copy()
     r.overlap = loop.tts.value().overlap
+    r.llm_cancels = loop.llm.cancels
+    r.llm_polled = loop.llm.at
     r.idle = (loop.state == VL_ST_IDLE and not loop.tts_busy and len(loop.tts_queue) == 0
               and len(loop.tts_ready) == 0)
     return r^
@@ -496,6 +511,42 @@ def main() raises:
     check(fails, _join(said8) == "[Je vais bien.][Et toi ?][Il fait beau.][Oui.]", "each reply its own sentences: " + _join(said8))
     check(fails, n82.find("not the answer's start") < 0 and n82.find("first audio") >= 0,
           "no mismatch, and the second reply's first audio timed too")
+
+    print("9. a reply capped at so many sentences")
+    check(fails, spoken_words(String("D'accord.")) == 1 and spoken_words(String("Bien sûr !")) == 2
+          and spoken_words(String("Je ne sais pas.")) == 4 and spoken_words(String(" ... ")) == 0,
+          "words: « D'accord. » 1, « Bien sûr ! » 2, « Je ne sais pas. » 4, « ... » 0")
+    var two = String("Je suis à la table. Je peux danser.")
+    check(fails, spoken_cap_end(two, 1) == 20, "cap 1: after the first sentence (" + String(spoken_cap_end(two, 1)) + ")")
+    check(fails, spoken_cap_end(two, 2) == -1, "cap 2: the last sentence is never cut")
+    check(fails, spoken_cap_end(two, 0) == -1, "cap 0: no cap")
+    var oui = String("Oui ! Je suis à la table. Et toi ?")
+    check(fails, spoken_cap_end(oui, 1) == 26, "« Oui ! » is said but not counted (" + String(spoken_cap_end(oui, 1)) + ")")
+    check(fails, spoken_cap_end(String("Je suis à la table."), 1) == -1, "one sentence: nothing to cut")
+    var p9: List[String] = ["Je suis à la table.", " Je peux aussi", " danser. Et", " toi ?"]
+    var c9 = run(True, False, p9^, String("Je suis à la table. Je peux aussi danser. Et toi ?"), bank, -1, 2, 12, 1)
+    check(fails, _join(c9.said) == "[Je suis à la table.]", "streamed, cap 1: one sentence said: " + _join(c9.said))
+    check(fails, c9.llm_cancels == 1 and c9.llm_polled < 4,
+          "and the reply model stopped there (cancelled " + String(c9.llm_cancels) + ", pieces read " + String(c9.llm_polled) + " of 4)")
+    check(fails, c9.event == "Je suis à la table.", "the event carries what was said: " + c9.event)
+    check(fails, c9.notes.find("reply capped at 1 sentence") >= 0 and c9.idle, "the note says so, and the loop is idle")
+    var p9b: List[String] = ["Oui ! Je suis", " là, près de la", " table.", " Et toi ?"]
+    var c9b = run(True, False, p9b^, String("Oui ! Je suis là, près de la table. Et toi ?"), bank, -1, 2, 12, 1)
+    check(fails, _join(c9b.said) == "[Oui !][Je suis là, près de la table.]", "« Oui ! » does not use the cap: " + _join(c9b.said))
+    var p9c: List[String] = ["Un deux trois.", " Quatre cinq six.", " Sept huit neuf.", " Dix onze douze."]
+    var c9c = run(True, False, p9c^, String("Un deux trois. Quatre cinq six. Sept huit neuf. Dix onze douze."), bank, -1, 2, 12, 3)
+    check(fails, _join(c9c.said) == "[Un deux trois.][Quatre cinq six.][Sept huit neuf.]", "cap 3: three: " + _join(c9c.said))
+    var p9d: List[String] = ["Je suis à la table.", " Je peux", " danser."]
+    var c9d = run(True, False, p9d^, String("Je suis à la table. Je peux danser."), bank)
+    check(fails, _join(c9d.said) == "[Je suis à la table.][Je peux danser.]" and c9d.llm_cancels == 0, "cap 0: all of it: " + _join(c9d.said))
+    var p9e: List[String] = ["Je suis à la table.", " Je peux", " danser."]
+    var c9e = run(False, False, p9e^, String("Je suis à la table. Je peux danser."), bank, -1, 2, 12, 1)
+    check(fails, _join(c9e.said) == "[Je suis à la table.]" and c9e.event == "Je suis à la table.",
+          "not streamed: the whole answer cut by the same rule: " + _join(c9e.said))
+    check(fails, c9e.notes.find("not said «Je peux danser.»") >= 0, "and the note says what was not said")
+    var p9f: List[String] = ["Un deux trois.", " Quatre cinq six."]
+    var c9f = run(True, True, p9f^, String("Un deux trois. Quatre cinq six."), bank, -1, 2, 12, 1)
+    check(fails, len(c9f.said) == 0 and c9f.event == "Un deux trois.", "muted: nothing said, the event cut: " + c9f.event)
 
     print("ALL PASS" if fails == 0 else String(fails) + " FAILED")
     if fails != 0:

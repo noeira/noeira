@@ -32,6 +32,8 @@
     them; « Tu peux danser ? » / « Danse ! » run the motion, « Tu peux ouvrir
     la porte ? » is a no, and what the decision must read (a place, a next
     step, a direction, a thing in neither list, a statement) is left to it.
+12. How long the model's reply may be (`reply_sentences`): one sentence, two
+    when a joke, a story or an explanation is asked for.
 Exits non-zero on a failure.
 """
 
@@ -43,7 +45,7 @@ from std.sys import exit
 from noeira.brain import (
     People, name_given, asks_identity, identity_answer, speaker_sentence,
     asks_task_done, task_done_answer, computed_reply, computed_turn, asks_capabilities, asks_can, capabilities_answer,
-    reply_stable,
+    reply_stable, asks_for_more, reply_sentences, REPLY_SENTENCES, REPLY_SENTENCES_MORE,
     restore_memory, digest_lines, log_days, when_words, save_places, load_places, time_refs, focused_memory,
     Task, Step, give_task, cancel_task, refuse_step, tick_tasks, notice_text, task_sentences,
     EX_NONE, EX_START, EX_NOTICE, NOTICE_ALL_DONE, NOTICE_NOT_REACHED, NOTICE_REFUSED,
@@ -755,6 +757,36 @@ def main() raises:
     c.language = String("fr")
     c.asked = String("As-tu fini ce que je t'ai demandé ?")
     check(fails, computed_turn(c).decides, "« As-tu fini ? » still lets the decision act")
+
+    print("12. how long the model's reply may be")
+    var caps: List[Int] = [REPLY_SENTENCES, REPLY_SENTENCES_MORE]
+    check(fails, caps[0] == 1 and caps[1] == 2, "one sentence, two when more is asked")
+    var more: List[String] = [
+        "Raconte-moi une blague.", "Noé, tu me racontes une histoire ?", "Explique-moi comment tu marches.",
+        "Décris la pièce.", "Dis-m'en plus.", "Parle-moi de toi.", "Tell me a joke.", "Can you explain that?",
+    ]
+    var n_more = 0
+    for x in more:
+        if asks_for_more(x):
+            n_more += 1
+        else:
+            print("     not more:", x)
+    check(fails, n_more == len(more), "asked for more: " + String(n_more) + "/" + String(len(more)))
+    var enough: List[String] = [
+        "Où es-tu ?", "Il fait beau aujourd'hui.", "Comment tu t'appelles ?", "Tu sais chanter ?",
+        "Où est la télévision ?", "Bonjour Noé.", "Tu as fait une blagueuse remarque", "What is your name?",
+    ]
+    var n_one = 0
+    for x in enough:
+        if not asks_for_more(x):
+            n_one += 1
+        else:
+            print("     more:", x)
+    check(fails, n_one == len(enough), "one sentence is enough: " + String(n_one) + "/" + String(len(enough)) + " (« blagueuse » is not « blague »)")
+    c.asked = String("Raconte-moi une blague.")
+    var r_more = reply_sentences(c)
+    c.asked = String("Où es-tu ?")
+    check(fails, r_more == 2 and reply_sentences(c) == 1, "reply_sentences reads `ws.asked`")
 
     print("ALL PASS" if fails == 0 else String(fails) + " FAILED")
     if fails != 0:

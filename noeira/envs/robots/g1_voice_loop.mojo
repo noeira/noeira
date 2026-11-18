@@ -86,7 +86,7 @@ from noeira.ai.speech import (
 )
 from noeira.io.fileio import remove_file, write_file_atomic
 from noeira.io.wav import WavAudio
-from noeira.text.spoken import spoken_clause_end, spoken_sentence_end, spoken_text
+from noeira.text.spoken import spoken_cap_end, spoken_clause_end, spoken_sentence_end, spoken_text
 from noeira.envs.robots.g1_command_bank import G1CommandBank
 from noeira.envs.robots.g1_command_language import (
     g1_command_questions, g1_decide, g1_decide_chain, g1_command_state,
@@ -302,6 +302,12 @@ struct G1VoiceConfig(Copyable, Movable):
     lacks) gets a spoken reply from the reply model instead of silence; the
     refusal's reason is still never said. Off by default (the measured
     sessions had it off); the room demo turns it on."""
+    var reply_sentences: Int
+    """A reply model's answer is said up to this many sentences, and the rest
+    is not written (`noeira.text.spoken.spoken_cap_end`: a sentence under
+    three words, « Oui ! », does not count). 0 = no cap (the default: the
+    measured sessions had none). Per utterance: `set_reply_sentences`. A
+    computed answer (`set_reply_override`) is never cut."""
     var tts_no_play_gated: Bool
     """With `tts_no_play`: the microphone IS gated while a piece "plays" in
     silence (and `VL_ECHO_TAIL_S` after), as it is live. A replay then loses
@@ -423,6 +429,7 @@ struct G1VoiceConfig(Copyable, Movable):
         self.tts_no_play = False
         self.tts_no_play_gated = False
         self.reply_refused = False
+        self.reply_sentences = 0
         self.dec_spec = String("")
         self.memory_route = False
         self.dest_words = List[String]()
@@ -487,6 +494,14 @@ struct G1VoiceLoopOf[
     var stream_cut: Bool
     """The caller said something over the streamed reply (`say`): the rest of
     the reply is not said."""
+    var reply_cap: Int
+    """Sentences the next reply may say (`set_reply_sentences`; from
+    `cfg.reply_sentences`); 0 = no cap."""
+    var stream_cap: Int
+    """`reply_cap` as it was when the reply in flight started."""
+    var stream_capped: Bool
+    """The streamed reply has said its `stream_cap` sentences: nothing more is
+    said, and the reply model is stopped."""
     var audio_wait: Bool
     """The reply's first audio has not started yet: the note says when it does."""
     var reply_t0: Int
@@ -675,6 +690,9 @@ struct G1VoiceLoopOf[
         self.stream_used = 0
         self.stream_parts = 0
         self.stream_cut = False
+        self.reply_cap = self.cfg.reply_sentences
+        self.stream_cap = 0
+        self.stream_capped = False
         self.audio_wait = False
         self.reply_t0 = 0
         self.early = 0
@@ -802,6 +820,9 @@ struct G1VoiceLoopOf[
         self.stream_used = move.stream_used
         self.stream_parts = move.stream_parts
         self.stream_cut = move.stream_cut
+        self.reply_cap = move.reply_cap
+        self.stream_cap = move.stream_cap
+        self.stream_capped = move.stream_capped
         self.audio_wait = move.audio_wait
         self.reply_t0 = move.reply_t0
         self.early = move.early
@@ -1164,6 +1185,15 @@ struct G1VoiceLoopOf[
         self.override_final = final
         self.override_decides = decides
         self.override_cmd = command^
+
+    def set_reply_sentences(mut self, n: Int):
+        """How many sentences the reply model's answer to the utterance being
+        handled may say (`cfg.reply_sentences`); 0 = no cap. Set it before
+        `poll`, each frame, as `set_reply_override`; a reply reads it when it
+        starts (`noeira.brain.answers.reply_sentences`: one, two for a joke
+        or a story). The robot is deaf while it speaks: a second sentence is a
+        second chance to miss the person (ROBOT_BRAIN_PLAN.md §17.6)."""
+        self.reply_cap = n
 
     def take_segment(mut self) -> List[Int16]:
         """The samples (16 kHz mono) of the utterance last sent to the
@@ -1642,17 +1672,42 @@ struct G1VoiceLoopOf[
                 if streaming and delta.byte_length() > 0:
                     self.stream_raw += delta
                     self._say_sentences()
-                var done = self.llm.done()
+                if self.stream_capped:
+                    # ⚠ THE CAP STOPS THE MODEL, NOT ONLY THE VOICE: the rest would be written for nothing, on
+                    # the GPU d1's commands request waits for (`talk_first` asks it once the reply is out)
+                    try:
+                        self.llm.cancel()
+                    except:
+                        pass
+                    var said = spoken_text(String(self.stream_raw[byte = 0 : self.stream_used]))
+                    self._add_note(String("[said] ") + said + String("  (reply capped at ") + String(self.stream_cap)
+                                   + String(" sentence") + (String("s") if self.stream_cap > 1 else String(""))
+                                   + String(" after ") + String(Int(Float64(perf_counter_ns() - self.reply_t0) / 1e6))
+                                   + String(" ms; said in ") + String(self.stream_parts) + String(" pieces; the rest not written)"))
+                    ev.kind = VL_TALK
+                    ev.text = said
+                    self.state = VL_ST_IDLE
+                    self._after_reply()
+                var done = self.state == VL_ST_CHAT and self.llm.done()
                 if done:
                     var rtxt = String("")
                     var rtxt_raw = String("")
                     var rms_ = 0.0
                     var rcost = String("")
+                    var capnote = String("")
                     try:
                         var rep = self.llm.result()
                         # what a voice can say: no emoji, no markup (`noeira.text.spoken`)
                         rtxt = spoken_text(rep.text)
                         rtxt_raw = rep.text
+                        # the cap on a whole answer (not streamed, or streamed short of it): the same rule
+                        var cap_e = spoken_cap_end(rep.text, self.stream_cap)
+                        if cap_e >= 0:
+                            capnote = (String("; capped at ") + String(self.stream_cap) + String(" sentence")
+                                       + (String("s") if self.stream_cap > 1 else String("")) + String(", not said «")
+                                       + spoken_text(String(rep.text[byte = cap_e :])) + String("»"))
+                            rtxt_raw = String(rep.text[byte = 0 : cap_e])
+                            rtxt = spoken_text(rtxt_raw)
                         rms_ = rep.latency_ms
                         if rep.input_tokens > 0:
                             # where the reply's time went: its first token (the prompt), then its tokens
@@ -1673,7 +1728,7 @@ struct G1VoiceLoopOf[
                             else:
                                 self._speak(rtxt, True)
                         self._add_note(String("[said] ") + rtxt + String("  (reply ") + String(Int(rms_)) + String(" ms")
-                                       + rcost + pieces + String(")"))
+                                       + rcost + pieces + capnote + String(")"))
                         ev.kind = VL_TALK
                         ev.text = rtxt
                     self.state = VL_ST_IDLE
@@ -2088,8 +2143,14 @@ struct G1VoiceLoopOf[
 
     def _say_sentences(mut self):
         """Every sentence the stream has finished since the last call goes to
-        the voice (`spoken_sentence_end`, `spoken_text`)."""
+        the voice (`spoken_sentence_end`, `spoken_text`), up to the reply's cap
+        (`stream_cap`, `spoken_cap_end`): there `stream_capped` is set and
+        nothing more is said."""
+        var cap_at = spoken_cap_end(self.stream_raw, self.stream_cap)
         while True:
+            if cap_at >= 0 and self.stream_used >= cap_at:
+                self.stream_capped = True
+                return
             var e = spoken_sentence_end(self.stream_raw, self.stream_used)
             if self.stream_parts == 0 and self.cfg.first_clause > 0:
                 # the first piece may end at a comma, if that comes before a sentence's end
@@ -2098,6 +2159,8 @@ struct G1VoiceLoopOf[
                     e = c
             if e < 0:
                 return
+            if cap_at >= 0 and e > cap_at:
+                e = cap_at
             var piece = spoken_text(String(self.stream_raw[byte = self.stream_used : e]))
             self.stream_used = e
             if piece.byte_length() > 0:
@@ -2129,6 +2192,8 @@ struct G1VoiceLoopOf[
         self.stream_used = 0
         self.stream_parts = 0
         self.stream_cut = False
+        self.stream_cap = self.reply_cap
+        self.stream_capped = False
 
     def _reply(mut self, hint: String, note: String):
         """A spoken reply and nothing else: the robot's motion is unchanged.

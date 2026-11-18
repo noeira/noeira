@@ -14,8 +14,9 @@ start) and `save_places` / `load_places`. B4: `People` (who gave their name,
 whose voice this is, on disk) and the reply view's line about the person
 talking. `computed_turn`: the questions code answers exactly (who the
 speaker is, whether the task is finished, what the body can do — `Skill`,
-`Body.add_motion` — and whether it can do one thing, run when it can). A
-second body (B5) is not here yet.
+`Body.add_motion` — and whether it can do one thing, run when it can), and
+`reply_sentences`: how long the model's own reply may be. A second body (B5)
+is not here yet.
 """
 
 from .geometry import (
@@ -43,5 +44,6 @@ from .tasks import (
 from .answers import (
     asks_task_done, task_done_answer, computed_reply, computed_reply_final, computed_turn, ComputedTurn,
     asks_capabilities, capabilities_answer, asks_can, can_turn,
+    asks_for_more, reply_sentences, REPLY_SENTENCES, REPLY_SENTENCES_MORE,
 )
 from .views import ReplyView, reply_view, reply_stable, reply_live, task_sentences, speaker_sentence, memory_section, metres, language_name, REPLY_VIEW_LINES, REPLY_VIEW_SENTENCES

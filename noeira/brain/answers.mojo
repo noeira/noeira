@@ -17,6 +17,10 @@ Four questions today:
   no, a skill with a command is run (`ct.command`), and both SETTLE the turn
   (`ct.decides` False: d1 is not asked further).
 
+And how long the model's own reply may be: `reply_sentences(ws)` (one
+sentence; two for a joke or a story), for the voice loop's
+`set_reply_sentences`, which stops the reply there.
+
 ⚠ WHY NOT THE REPLY MODEL. With "Your last task: walk to the table, then walk
 to the door. It is done." in its prompt, LFM3-1.7B answered « As-tu fini ce
 que je t'ai demandé ? » with « Non, j'ai encore besoin de te dire où est la
@@ -400,6 +404,36 @@ def can_turn(ref ws: WorldState) -> ComputedTurn:
     if told:
         return ComputedTurn(String("D'accord !") if fr else String("Okay!"), True, False, s.command)
     return none^
+
+
+comptime REPLY_SENTENCES: Int = 1
+"""Sentences a reply may say (`reply_sentences`): the robot is deaf while it
+speaks, and the replays lost the sentences said over its second one (§17.6)."""
+comptime REPLY_SENTENCES_MORE: Int = 2
+"""When the person asked for more than an answer: a joke is a question and its
+punchline. Three let LFM3 add « — Mais je ne suis pas sûr de ce qui est une
+bonne blague ici… », and « Il fait beau aujourd'hui », said over it, was
+heard as « Aujourd'hui. » (round 43)."""
+
+
+def asks_for_more(text: String) -> Bool:
+    """Whether a sentence asks for more than one sentence's answer: a joke, a
+    story, an explanation, a description (French and English)."""
+    var t = _plain(text)
+    var forms: List[String] = [
+        "raconte", "racontes", "racontez", "raconter", "blague", "blagues", "histoire", "histoires",
+        "explique", "expliques", "expliquez", "expliquer", "décris", "décrire", "décrivez",
+        "dis-m'en plus", "dites-m'en plus", "parle-moi de", "parlez-moi de", "en détail",
+        "tell me a", "tell me about", "tell me more", "joke", "jokes", "story", "stories", "explain", "describe",
+    ]
+    return _any(t, forms)
+
+
+def reply_sentences(ref ws: WorldState) -> Int:
+    """How many sentences the reply to `ws.asked` may say, for the voice loop's
+    `set_reply_sentences`: `REPLY_SENTENCES`, or `REPLY_SENTENCES_MORE` when
+    the person asked for more (`asks_for_more`)."""
+    return REPLY_SENTENCES_MORE if asks_for_more(ws.asked) else REPLY_SENTENCES
 
 
 def computed_turn(ref ws: WorldState) -> ComputedTurn:
