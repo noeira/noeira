@@ -472,9 +472,14 @@ def test_fast(ctx: DeviceContext, mut tl: Tally) raises:
     for i in range(len(vg)):
         top = max(top, vg[i])
     tl.check(top <= 1e-3 * (1.0 + 1e-6) and top > 0.0, "the device critic's values sit under the ceiling, some on it (largest " + String(top) + ")")
-    # the averages start as two different random networks: only a copy makes them agree
+    # the averages both start at zero, so their agreement alone would prove nothing: each must BE its live policy
     var avg1 = sm_snapshot["gpu"](tg.pol_avg, ctx)
     _compare("the average after one update (a copy of the live policy)", sm_snapshot["cpu"](tc.pol_avg, None), avg1, tl)
+    tl.check(
+        _same(avg1, sm_snapshot["gpu"](tg.pol, ctx)) == 0 and _same(sm_snapshot["cpu"](tc.pol_avg, None), sm_snapshot["cpu"](tc.pol, None)) == 0,
+        "after the first update each average is its live policy, bit for bit",
+    )
+    tl.check(_same(avg1, p0) > 0, "and no longer what the policy was before the update (the copy happened after it)")
     var mc = tc.policy_update[NB](ib, perms, vc, rc)
     var mg = tg.policy_update[NB](ib, perms, vg, rg)
     _close("objective of the second update", mc.imag_objective, mg.imag_objective, 1e-5, tl)

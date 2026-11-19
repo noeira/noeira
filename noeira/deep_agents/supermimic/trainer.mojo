@@ -31,7 +31,7 @@ from noeira.deep_agents.supermimic.tables import SMTables, sm_tables
 from noeira.deep_agents.supermimic.world_model import SMWindowBatch, SMWMLoss
 from noeira.nn.constants import DT
 from noeira.nn.core.checkpoint import CheckpointScalars, load_params_multi, save_params_multi
-from noeira.nn.core.initializer import Kaiming
+from noeira.nn.core.initializer import Kaiming, Zero
 from noeira.nn.core.param import ParamVisitor
 from noeira.nn.core.tensor import Tensor, TensorImpl
 
@@ -115,7 +115,10 @@ struct SuperMimicTrainer[C: SMConfigT](Movable):
         self.wm_blk = WorldModelUpdateStep[Self.C]()
         self.actor_blk = ActorStep[Self.C]()
         self.critic_blk = CriticFitStep[Self.C]()
-        self.pol_avg = SMPolicyOf[Self.C].make[Kaiming, T](ctx)
+        # the average starts at ZERO, not at a random network: its first update copies the live policy over it,
+        # and a random start would draw from the process's random stream, so that building a trainer with every
+        # option off would move every seeded draw made after it (other trainers' networks, a run's reset frames)
+        self.pol_avg = SMPolicyOf[Self.C].make[Zero, T](ctx)
         self.ema = 0.0
         self.ema_n = 0
         self.ref_skip = False
