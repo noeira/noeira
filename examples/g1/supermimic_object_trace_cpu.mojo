@@ -9,10 +9,23 @@ far the interface's action is from the tracker's own.
     pixi run mojo build -I . examples/g1/supermimic_object_trace_cpu.mojo -o build/sm_obj_trace
     pixi run ./build/sm_obj_trace --ckpt TRACKER.ckpt --store CARRY_50HZ.h5 --object-dir OBJECT_CSV_DIR \\
         --only NAME[,NAME…] --out-dir DIR [--interface INTERFACE.ckpt] [--gain 0.1]
-        [--squeeze 40] [--ref-squeeze 0.05] [--ref-lower 1.0] [--trials 8 --seed 0] [--lead-in 50]
+        [--squeeze 40] [--ref-squeeze 0.05] [--ref-lower 1.0] [--trials 8 --seed 0] [--lead-in 50] [--csv OUT.csv]
+        [--teacher 1 --ft-squeeze 10 --ft-squeeze-max 60 --ft-mu 0.5 --ft-mass 1 --ft-kp 200 --ft-kd 20 --ft-kr 5 --ft-kw 0.5
+         --ft-point 0.11,-0.01,0 --ft-fmax 60 --ft-rel 1 --ft-mmax 1.5
+         --ft-kh 300 --ft-hmax 30 --ft-reach-lead 35]
+
+    --csv OUT.csv    one row a run with `supermimic_object_eval.mojo --csv`'s columns (the same account of the
+                     carry, `object_task.SMObjCarryTally`, and the same kernels): the laptop's stand-in for the
+                     device benchmark. A run's last step is in neither the carry's account nor the kernels here.
 
     --squeeze F      the scripted squeeze on the executed actions (`object_task.sm_squeeze_lane`), F newtons
     --ref-squeeze D  the reference's hands D metres toward the box while it is lifted (`sm_squeeze_reference`)
+    --teacher 1      the force teacher on the executed actions (`object_task.sm_force_teacher_lane`): the wrench that
+                     takes the box to its reference, shared between the two palms; `--ft-*` are its numbers
+                     (`--ft-point`: where the LEFT hand's force acts, in the wrist-yaw link's frame, m; `--ft-rel 1`: the
+                     box's target seen from the robot's root; `--ft-mmax`: the largest moment a hand gives, N·m;
+                     `--ft-kh`: N/m pulling each hand to the reference's place on the box, from `--ft-reach-lead`
+                     frames before the reference lifts, at most `--ft-hmax` N)
     --ref-lower S    … and DOWN by the share S of their height above the box's centre (the arms alone)
     The box's reference and the reward's reference grasp stay the ORIGINAL clip's under both edits.
     --lead-in N      N frames of standing at each clip's first pose before the clip (`object_task.sm_lead_in`; 50 = 1 s).
@@ -24,7 +37,8 @@ far the interface's action is from the tracker's own.
 
 Per clip, in `--out-dir`:
 
-    NAME.trace.tsv   one row a step (columns in the header)
+    NAME.trace.tsv   one row a step (columns in the header; `k_all` and `k_trunk_legs` are the six tracking
+                     kernels of the step over their maximum, `heads.sm_tracking_kernels_lane`)
     NAME.qpos.tsv    one row a step: the simulator's qpos (robot 36, box 7),
                      then the reference box's pose (7) and the reference
                      robot's qpos (36): what a renderer needs
@@ -49,15 +63,17 @@ from noeira.core.bytes import string_from_bytes
 from noeira.data.store import TrajectoryStore
 from noeira.deep_agents.supermimic import SMConfig, SuperMimicTrainer
 from noeira.deep_agents.supermimic.env import SMReplayOf, SMTrackingEnv
-from noeira.deep_agents.supermimic.heads import SMHeadLayout
+from noeira.deep_agents.supermimic.eval import SM_MAX_STEP_REWARD
+from noeira.deep_agents.supermimic.heads import SMHeadLayout, sm_tracking_kernels_lane
 from noeira.deep_agents.supermimic.kinematics import sm_fk_lane
 from noeira.deep_agents.supermimic.motion_library import SMMotionLibrary
 from noeira.deep_agents.supermimic.object_env_gpu import sm_object_track
 from noeira.deep_agents.supermimic.object_policy import SMObjConfig
 from noeira.deep_agents.supermimic.object_spec import SM_OBJ
 from noeira.deep_agents.supermimic.object_task import (
-    SM_OBJ_TERMS, SM_OREF, sm_obj_reward_lane, sm_obj_reward_params, sm_object_ref_rows, sm_squeeze_lane, sm_squeeze_reference,
-    sm_lead_in, sm_squeeze_weights,
+    SM_OBJ_HELD_SHARE, SM_OBJ_LIFT, SM_OBJ_TERMS, SM_OREF, sm_obj_carry_steps, sm_obj_carry_tally, sm_obj_reward_lane,
+    sm_obj_reward_params, sm_obj_lean_deg, SM_OBJ_LEVEL, sm_object_ref_rows, sm_squeeze_lane, sm_squeeze_reference, sm_lead_in, sm_squeeze_weights, sm_trunk_legs_mask,
+    sm_force_teacher_lane, SM_FT_PARAMS, FT_SQUEEZE, FT_SQUEEZE_MAX, FT_MU, FT_MASS, FT_KP, FT_KD, FT_KR, FT_KW, FT_POINT, FT_FMAX, FT_REL, FT_MMAX, FT_KH, FT_HMAX, SM_FT_OUT,
 )
 from noeira.deep_agents.supermimic.object_trainer import SMObjTrainer
 from noeira.deep_agents.supermimic.robot import G1MjlabBoxRobot, SMDims
@@ -71,7 +87,7 @@ comptime HO = get_defined_int["SM_OBJ_H", 1024]()
 comptime Robot = G1MjlabBoxRobot
 comptime D = SMDims[Robot]
 comptime ARM0 = 15              # joints 15..28 are the two arms
-comptime CARRY_RISE = 0.05      # `object_eval.SM_OBJ_LIFT`
+comptime CARRY_RISE = SM_OBJ_LIFT
 # the training driver's widths, one lane
 comptime C = SMConfig["cpu", Robot, 2048, 64, 2048, 1024, 512, 256, 2048, 1024, 512, 256, 256, 128, 1, 64, 16, 32]
 comptime OC = SMObjConfig[C, HO, 256, 256, 256, 128]
@@ -130,6 +146,33 @@ def main() raises:
     var ref_lower = Float64(_opt(args, String("--ref-lower"), String("0")))
     var trials = Int(_opt(args, String("--trials"), String("1")))
     var rng_seed = Int(_opt(args, String("--seed"), String("0")))
+    var csv_path = _opt(args, String("--csv"), String(""))
+    var teacher = Int(_opt(args, String("--teacher"), String("0"))) != 0
+    var ft = List[Scalar[DT]](length=SM_FT_PARAMS, fill=0)
+    ft[FT_SQUEEZE] = Scalar[DT](Float64(_opt(args, String("--ft-squeeze"), String("10"))))
+    ft[FT_SQUEEZE_MAX] = Scalar[DT](Float64(_opt(args, String("--ft-squeeze-max"), String("60"))))
+    ft[FT_MU] = Scalar[DT](Float64(_opt(args, String("--ft-mu"), String("0.5"))))
+    ft[FT_MASS] = Scalar[DT](Float64(_opt(args, String("--ft-mass"), String("1"))))
+    ft[FT_KP] = Scalar[DT](Float64(_opt(args, String("--ft-kp"), String("200"))))
+    ft[FT_KD] = Scalar[DT](Float64(_opt(args, String("--ft-kd"), String("20"))))
+    ft[FT_KR] = Scalar[DT](Float64(_opt(args, String("--ft-kr"), String("5"))))
+    ft[FT_KW] = Scalar[DT](Float64(_opt(args, String("--ft-kw"), String("0.5"))))
+    ft[FT_FMAX] = Scalar[DT](Float64(_opt(args, String("--ft-fmax"), String("60"))))
+    ft[FT_REL] = Scalar[DT](Float64(_opt(args, String("--ft-rel"), String("0"))))
+    ft[FT_MMAX] = Scalar[DT](Float64(_opt(args, String("--ft-mmax"), String("0"))))
+    ft[FT_KH] = Scalar[DT](Float64(_opt(args, String("--ft-kh"), String("0"))))
+    ft[FT_HMAX] = Scalar[DT](Float64(_opt(args, String("--ft-hmax"), String("30"))))
+    var reach_lead = Int(_opt(args, String("--ft-reach-lead"), String("35")))
+    var ft_point = _opt(args, String("--ft-point"), String("0.11,-0.01,0")).split(",")
+    if len(ft_point) != 3:
+        raise Error("--ft-point takes x,y,z")
+    for k in range(3):
+        ft[FT_POINT + k] = Scalar[DT](Float64(String(String(ft_point[k]).strip())))
+    if teacher:
+        var line = String("force teacher:")
+        for k in range(SM_FT_PARAMS):
+            line += " " + String(Float64(ft[k]))
+        print(line, "(squeeze, its ceiling, mu, mass, kp, kd, kr, kw, the left hand's point x y z, the largest force, relative to the root, the largest moment, the hands' pull N/m and its cap)")
     if ckpt == "" or store == "" or object_dir == "" or only == "" or out_dir == "":
         raise Error("give --ckpt TRACKER.ckpt --store STORE.h5 --object-dir DIR --only NAME[,NAME…] --out-dir DIR [--interface CKPT]")
     var want = List[String]()
@@ -192,10 +235,11 @@ def main() raises:
             moved = max(moved, abs(Float64(rows[i]) - Float64(lib_rows[i])))
         print("reference edited: hands", ref_squeeze, "m toward the box, lowered by", ref_lower, "of their height above its centre; largest joint change", moved, "rad")
     var sq_w = sm_squeeze_weights(lens, track, SM_OBJ)
+    var reach_w = sm_squeeze_weights(lens, track, SM_OBJ, reach_lead)
     var ks = List[Scalar[DT]](length=Robot.NDOF, fill=1)
     for j in range(Robot.NDOF):
         ks[j] = Scalar[DT](g1m_kp(j) * g1m_action_scale(j))
-    var sq_scratch = List[Scalar[DT]](length=D.S + 2 * D.FK_BLOCK + 6, fill=0)
+    var sq_scratch = List[Scalar[DT]](length=D.S + 2 * D.FK_BLOCK + SM_FT_OUT, fill=0)
     var rw = sm_obj_reward_params()
     var terms = List[Scalar[DT]](length=SM_OBJ_TERMS + 1, fill=0)
     var env = SMTrackingEnv[Robot](
@@ -213,10 +257,37 @@ def main() raises:
     var hb = List[Int](length=2, fill=0)
     for i in range(2):
         hb[i] = Int(tr.base.tables.head[HL.HANDS + i])
+    var mask_all = List[Scalar[DT]](length=Robot.N_TRACKED, fill=1)
+    var mask_tl = sm_trunk_legs_mask[Robot]()
+    var rf_row = List[Scalar[DT]](length=D.REF, fill=0)
+    var k6 = List[Scalar[DT]](length=6, fill=0)
+    var csv = String(
+        "clip,name,frames,steps,norm_return,fell,carry_steps,held_steps,max_err_carry_m,mean_err_carry_m,success,trial,"
+        + "carried,late_steps,late_up_steps,mean_err_late_m,kernels_all,kernels_trunk_legs,mean_lean_late_deg,level\n"
+    )
+    var n_level = 0
+    var n_bar_level = 0
+    var sum_lean = 0.0
+    var n_runs = 0
+    var n_bar = 0
+    var n_carried = 0
+    var n_fell = 0
+    var sum_carry = 0
+    var sum_held = 0
+    var sum_hand = 0.0
+    var sum_ret = 0.0
+    var sum_ka = 0.0
+    var sum_kt = 0.0
 
     for c in range(len(lens)):
         var f0 = env.lib.clip_start[c]
+        var clip_carry = sm_obj_carry_steps(orefs, f0, lens[c])
         for trial in range(max(trials, 1)):
+            var tally = sm_obj_carry_tally(clip_carry)
+            var ret = 0.0
+            var ka = 0.0
+            var kt = 0.0
+            var k_steps = 0
             var first: List[Int] = [f0]
             env.restart(first)
             env.terminations = True
@@ -231,7 +302,7 @@ def main() raises:
             var z0 = Float64(track[f0 * SM_OBJ + 2])
             var trace = String(
                 "step\tframe\tref_carry\tref_rise\tbox_err\tbox_dz\tbox_dxy\tbox_tilt\tbox_rise\thand0_box\thand1_box\tref_hand0_box\tref_hand1_box\t"
-                + "da_arm\tda_arm_max\tda_rest\troot_speed\tref_root_speed\troot_z\tbox_speed\treward\tr_pos\tr_ori\tr_hands\thand_z\tref_hand_z\n"
+                + "da_arm\tda_arm_max\tda_rest\troot_speed\tref_root_speed\troot_z\tbox_speed\treward\tr_pos\tr_ori\tr_hands\thand_z\tref_hand_z\tk_all\tk_trunk_legs\tft_f0\tft_f1\tft_m\tbox_lean\n"
             )
             var dump = String("")
             var step = 0
@@ -257,6 +328,24 @@ def main() raises:
                         o_t.data.unsafe_ptr().as_unsafe_any_origin(), sq_scratch.unsafe_ptr().as_unsafe_any_origin(),
                         a.data.unsafe_ptr().as_unsafe_any_origin(),
                     )
+                var ft_f0 = 0.0
+                var ft_f1 = 0.0
+                var ft_m = 0.0
+                if teacher:
+                    sm_force_teacher_lane[Robot](
+                        ARM0, Scalar[DT](sq_w[fr]), Scalar[DT](reach_w[fr]), ft.unsafe_ptr().as_unsafe_any_origin(), tr.base.tables.tree_ptr(), tr.base.tables.head_ptr(),
+                        ks.unsafe_ptr().as_unsafe_any_origin(), s_t.data.unsafe_ptr().as_unsafe_any_origin(),
+                        lib_rows.unsafe_ptr().unsafe_offset(fr * D.S).as_unsafe_any_origin(),
+                        o_t.data.unsafe_ptr().as_unsafe_any_origin(), oref_t.data.unsafe_ptr().as_unsafe_any_origin(),
+                        sq_scratch.unsafe_ptr().as_unsafe_any_origin(), a.data.unsafe_ptr().as_unsafe_any_origin(),
+                    )
+                    var fo = D.S + 2 * D.FK_BLOCK
+                    for k in range(3):
+                        ft_f0 += Float64(sq_scratch[fo + k]) * Float64(sq_scratch[fo + k])
+                        ft_f1 += Float64(sq_scratch[fo + 3 + k]) * Float64(sq_scratch[fo + 3 + k])
+                    ft_f0 = sqrt(ft_f0)
+                    ft_f1 = sqrt(ft_f1)
+                    ft_m = Float64(sq_scratch[fo + 6])
                 var da = 0.0
                 var da_max = 0.0
                 var da_rest = 0.0
@@ -269,6 +358,7 @@ def main() raises:
                         da_rest += d * d
                 _ = env.step(a.data, rb)
                 step += 1
+                ret += env.last_reward[0]
                 if env.lanes[0].ep_len == 0:        # the clip ended (or the robot fell); the lane is back at its first frame
                     failed = env.last_terminated[0]
                     break
@@ -319,6 +409,23 @@ def main() raises:
                 )
                 # the hands' mean height above the box's centre: simulated, and the reference's (its hand rows are in the box's frame)
                 var hz = (Float64(fk[hb[0] * 3 + 2]) + Float64(fk[hb[1] * 3 + 2])) / 2.0 - bx[2]
+                # the carry's account and the six tracking kernels, as the device benchmark's (`fr`: the frame the reward used)
+                var lean = sm_obj_lean_deg(
+                    bx[3], bx[4], bx[5], bx[6], Float64(orefs[rf + 3]), Float64(orefs[rf + 4]), Float64(orefs[rf + 5]), Float64(orefs[rf + 6])
+                )
+                tally.note(rise, bx[2] - z0, sqrt(dx * dx + dy * dy + dz * dz), lean)
+                env.lib.reference_row(fr, tr.base.tables, rf_row.unsafe_ptr().as_unsafe_any_origin())
+                var ka_s = Float64(sm_tracking_kernels_lane[DT, Robot](
+                    tr.base.tables.head_ptr(), pos, rf_row.unsafe_ptr().as_unsafe_any_origin(), mask_all.unsafe_ptr().as_unsafe_any_origin(),
+                    k6.unsafe_ptr().as_unsafe_any_origin(),
+                )) / SM_MAX_STEP_REWARD
+                var kt_s = Float64(sm_tracking_kernels_lane[DT, Robot](
+                    tr.base.tables.head_ptr(), pos, rf_row.unsafe_ptr().as_unsafe_any_origin(), mask_tl.unsafe_ptr().as_unsafe_any_origin(),
+                    k6.unsafe_ptr().as_unsafe_any_origin(),
+                )) / SM_MAX_STEP_REWARD
+                ka += ka_s
+                kt += kt_s
+                k_steps += 1
                 trace += (
                     String(step) + "\t" + String(fr - f0) + "\t" + ("1" if rise >= CARRY_RISE else "0") + "\t" + String(rise) + "\t"
                     + String(sqrt(dx * dx + dy * dy + dz * dz)) + "\t" + String(dz) + "\t" + String(sqrt(dx * dx + dy * dy)) + "\t"
@@ -326,7 +433,7 @@ def main() raises:
                     + String(rhd[0]) + "\t" + String(rhd[1]) + "\t" + String(sqrt(da)) + "\t" + String(da_max) + "\t" + String(sqrt(da_rest)) + "\t"
                     + String(vr) + "\t" + String(vref) + "\t" + String(Float64(env.lanes[0].s[2])) + "\t" + String(sqrt(bs)) + "\t"
                     + String(env.last_reward[0]) + "\t" + String(Float64(terms[0])) + "\t" + String(Float64(terms[1])) + "\t"
-                    + String(Float64(terms[2])) + "\t" + String(hz) + "\t0\n"
+                    + String(Float64(terms[2])) + "\t" + String(hz) + "\t0\t" + String(ka_s) + "\t" + String(kt_s) + "\t" + String(ft_f0) + "\t" + String(ft_f1) + "\t" + String(ft_m) + "\t" + String(lean) + "\n"
                 )
                 for k in range(D.NQ):
                     dump += String(Float64(env.lanes[0].s[k])) + "\t"
@@ -339,4 +446,51 @@ def main() raises:
             var stem = out_dir + "/" + names[c] + ((".t" + String(trial)) if trials > 1 else String(""))
             write_text_atomic(stem + ".trace.tsv", trace)
             write_text_atomic(stem + ".qpos.tsv", dump)
-            print("  ", names[c], "trial", trial, "|", step, "steps of", lens[c], "| FELL" if failed else "| stood")
+            var at_bar = (not failed) and tally.at_bar()
+            var was_carried = (not failed) and tally.carried()
+            var was_level = was_carried and tally.level()
+            var kn = Float64(max(k_steps, 1))
+            var nret = ret / (SM_MAX_STEP_REWARD * Float64(max(step, 1)))
+            csv += (
+                String(c) + "," + names[c] + "," + String(lens[c]) + "," + String(step) + "," + String(nret) + "," + ("1" if failed else "0") + ","
+                + String(tally.carry) + "," + String(tally.held) + "," + String(tally.emax) + "," + String(tally.mean_err()) + ","
+                + ("1" if at_bar else "0") + "," + String(trial) + "," + ("1" if was_carried else "0") + "," + String(tally.late) + ","
+                + String(tally.late_up) + "," + String(tally.mean_err_late()) + "," + String(ka / kn) + "," + String(kt / kn) + ","
+                + String(tally.mean_lean_late()) + "," + ("1" if was_level else "0") + "\n"
+            )
+            n_runs += 1
+            sum_carry += tally.carry
+            sum_held += tally.held
+            sum_ret += nret
+            sum_ka += ka / kn
+            sum_kt += kt / kn
+            if failed:
+                n_fell += 1
+            if at_bar:
+                n_bar += 1
+            if was_carried:
+                n_carried += 1
+                sum_hand += tally.mean_err_late()
+                sum_lean += tally.mean_lean_late()
+            if was_level:
+                n_level += 1
+                if at_bar:
+                    n_bar_level += 1
+            print(
+                "  ", names[c], "trial", trial, "|", step, "steps of", lens[c], "| FELL" if failed else "| stood", "| carry steps", tally.carry, "held",
+                tally.held, "| AT THE BAR" if at_bar else "| under the bar", "| carried," if was_carried else "| not carried,", tally.mean_err_late(),
+                "m once in hand, leaning", tally.mean_lean_late(), "deg,", "level" if was_level else "not level", "| kernels all", ka / kn,
+                "trunk and legs", kt / kn,
+            )
+    var nr = Float64(max(n_runs, 1))
+    print(
+        "\n", n_runs, "runs | at the bar", n_bar, "(within 10 cm on >=", SM_OBJ_HELD_SHARE, "of the carry steps, no fall) | carried", n_carried,
+        "(no fall, the box up on more than half of the carry's second half) | level", n_level, "(carried, lean at most", SM_OBJ_LEVEL,
+        "deg over that half) | at the bar and level", n_bar_level, "| lean once in hand", sum_lean / Float64(max(n_carried, 1)),
+        "deg | error once in hand", sum_hand / Float64(max(n_carried, 1)),
+        "m | fell", n_fell, "| carry steps held", sum_held, "/", sum_carry, "| normalised return", sum_ret / nr, "| six kernels: all bodies",
+        sum_ka / nr, ", trunk and legs", sum_kt / nr,
+    )
+    if csv_path != "":
+        write_text_atomic(csv_path, csv)
+        print("per-run results:", csv_path)

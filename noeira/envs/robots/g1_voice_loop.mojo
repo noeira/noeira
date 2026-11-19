@@ -86,7 +86,7 @@ from noeira.ai.speech import (
 )
 from noeira.io.fileio import remove_file, write_file_atomic
 from noeira.io.wav import WavAudio
-from noeira.text.spoken import spoken_clause_end, spoken_sentence_end, spoken_text
+from noeira.text.spoken import spoken_cap_end, spoken_clause_end, spoken_sentence_end, spoken_text
 from noeira.envs.robots.g1_command_bank import G1CommandBank
 from noeira.envs.robots.g1_command_language import (
     g1_command_questions, g1_decide, g1_decide_chain, g1_command_state,
@@ -193,12 +193,16 @@ struct G1VoiceEvent(Copyable, Movable):
     """A `VL_COMMAND`'s further steps (bank rows). For a `VL_WORLD` with
     `cfg.dest_chain`: the place to go on to after `destination`, if any."""
     var chain_conf: List[Float64]
+    var said: String
+    """What the loop has said for this event already: a computed answer that
+    came with its command (`set_reply_override`'s `command`). The caller says
+    nothing more for it (no `g1_command_phrase`)."""
 
     @staticmethod
     def none() -> G1VoiceEvent:
         return G1VoiceEvent(
             VL_NONE, String(""), String(""), String(""), List[Float64](),
-            0.0, 0.0, 0.0, 0.0, List[String](), List[Float64](),
+            0.0, 0.0, 0.0, 0.0, List[String](), List[Float64](), String(""),
         )
 
 
@@ -292,6 +296,18 @@ struct G1VoiceConfig(Copyable, Movable):
     silence, and the microphone is never gated by it. For timing the voice on a
     headless replay (`--mic-input`): the note says when the first audio would
     have started."""
+    var reply_refused: Bool
+    """An utterance addressed to the robot and refused by the decision (« no
+    clear pick », « no such command » with no reward spec, a place this scene
+    lacks) gets a spoken reply from the reply model instead of silence; the
+    refusal's reason is still never said. Off by default (the measured
+    sessions had it off); the room demo turns it on."""
+    var reply_sentences: Int
+    """A reply model's answer is said up to this many sentences, and the rest
+    is not written (`noeira.text.spoken.spoken_cap_end`: a sentence under
+    three words, « Oui ! », does not count). 0 = no cap (the default: the
+    measured sessions had none). Per utterance: `set_reply_sentences`. A
+    computed answer (`set_reply_override`) is never cut."""
     var tts_no_play_gated: Bool
     """With `tts_no_play`: the microphone IS gated while a piece "plays" in
     silence (and `VL_ECHO_TAIL_S` after), as it is live. A replay then loses
@@ -412,6 +428,8 @@ struct G1VoiceConfig(Copyable, Movable):
         self.first_clause = 12
         self.tts_no_play = False
         self.tts_no_play_gated = False
+        self.reply_refused = False
+        self.reply_sentences = 0
         self.dec_spec = String("")
         self.memory_route = False
         self.dest_words = List[String]()
@@ -476,6 +494,14 @@ struct G1VoiceLoopOf[
     var stream_cut: Bool
     """The caller said something over the streamed reply (`say`): the rest of
     the reply is not said."""
+    var reply_cap: Int
+    """Sentences the next reply may say (`set_reply_sentences`; from
+    `cfg.reply_sentences`); 0 = no cap."""
+    var stream_cap: Int
+    """`reply_cap` as it was when the reply in flight started."""
+    var stream_capped: Bool
+    """The streamed reply has said its `stream_cap` sentences: nothing more is
+    said, and the reply model is stopped."""
     var audio_wait: Bool
     """The reply's first audio has not started yet: the note says when it does."""
     var reply_t0: Int
@@ -574,6 +600,10 @@ struct G1VoiceLoopOf[
     var override_final: Bool
     """The caller's answer will not change (`set_reply_override`'s `final`):
     `computed_first` may say it."""
+    var override_decides: Bool
+    """`set_reply_override`'s `decides`: False = the answer settles the turn."""
+    var override_cmd: String
+    """`set_reply_override`'s `command`: run with the answer ("" = none)."""
     var heard_given: Bool
     """The caller has taken this decision's utterance (`take_heard`): an
     override set after that is about it, not about the turn before."""
@@ -660,6 +690,9 @@ struct G1VoiceLoopOf[
         self.stream_used = 0
         self.stream_parts = 0
         self.stream_cut = False
+        self.reply_cap = self.cfg.reply_sentences
+        self.stream_cap = 0
+        self.stream_capped = False
         self.audio_wait = False
         self.reply_t0 = 0
         self.early = 0
@@ -754,6 +787,8 @@ struct G1VoiceLoopOf[
         self.echo_speech_s = 0.0
         self.reply_override = String("")
         self.override_final = True
+        self.override_decides = True
+        self.override_cmd = String("")
         self.heard_given = False
         self.canned = String("")
         self.mic_on = True
@@ -785,6 +820,9 @@ struct G1VoiceLoopOf[
         self.stream_used = move.stream_used
         self.stream_parts = move.stream_parts
         self.stream_cut = move.stream_cut
+        self.reply_cap = move.reply_cap
+        self.stream_cap = move.stream_cap
+        self.stream_capped = move.stream_capped
         self.audio_wait = move.audio_wait
         self.reply_t0 = move.reply_t0
         self.early = move.early
@@ -837,6 +875,8 @@ struct G1VoiceLoopOf[
         self.echo_speech_s = move.echo_speech_s
         self.reply_override = move.reply_override^
         self.override_final = move.override_final
+        self.override_decides = move.override_decides
+        self.override_cmd = move.override_cmd^
         self.heard_given = move.heard_given
         self.canned = move.canned^
         self.mic_on = move.mic_on
@@ -1117,7 +1157,8 @@ struct G1VoiceLoopOf[
         the state changes. A reply already started keeps the one it had."""
         self.cfg.chat_sys = text^
 
-    def set_reply_override(mut self, var text: String, final: Bool = True):
+    def set_reply_override(mut self, var text: String, final: Bool = True, decides: Bool = True,
+                           var command: String = String("")):
         """A reply the caller has COMPUTED for the utterance being handled: when
         a reply is due and this is not empty, it is said as it is and the reply
         model is not asked. "" (the default) = the model replies.
@@ -1131,9 +1172,28 @@ struct G1VoiceLoopOf[
 
         `final`: the answer will not change for this utterance. False while
         the caller is still working it out (the voice check behind « Comment
-        je m'appelle ? »): `computed_first` waits for it."""
+        je m'appelle ? »): `computed_first` waits for it.
+
+        `decides` False (with `computed_first`): the answer SETTLES the turn —
+        said at once, d1's requests in flight dropped, nothing else said or
+        run for it (« Non, je ne peux pas ouvrir la porte. », the list of
+        skills). `command`: what the body runs with it, as a `VL_COMMAND`
+        whose `said` is the answer (« Tu peux danser ? » on a body with a
+        `dance` motion that no bank row names). Without `computed_first` both
+        are ignored: the answer is said when a reply is due, as before."""
         self.reply_override = text^
         self.override_final = final
+        self.override_decides = decides
+        self.override_cmd = command^
+
+    def set_reply_sentences(mut self, n: Int):
+        """How many sentences the reply model's answer to the utterance being
+        handled may say (`cfg.reply_sentences`); 0 = no cap. Set it before
+        `poll`, each frame, as `set_reply_override`; a reply reads it when it
+        starts (`noeira.brain.answers.reply_sentences`: one, two for a joke
+        or a story). The robot is deaf while it speaks: a second sentence is a
+        second chance to miss the person (ROBOT_BRAIN_PLAN.md §17.6)."""
+        self.reply_cap = n
 
     def take_segment(mut self) -> List[Int16]:
         """The samples (16 kHz mono) of the utterance last sent to the
@@ -1453,11 +1513,31 @@ struct G1VoiceLoopOf[
         elif self._computed_due():
             var ctxt = spoken_text(self.reply_override)
             self.replied = True     # the decision goes on; a `talk` route says nothing more
-            self._add_note(String("[said] ") + ctxt + String("  (computed, before the decision)"))
+            var settles = not self.override_decides
+            if settles:
+                self._add_note(String("[said] ") + ctxt + String("  (computed: the turn is settled")
+                               + ((String(", runs ") + self.override_cmd) if self.override_cmd != "" else String(""))
+                               + String(", d1 not asked further)"))
+            else:
+                self._add_note(String("[said] ") + ctxt + String("  (computed, before the decision)"))
             if not self.cfg.mute:
                 self.say(ctxt)
             ev.kind = VL_TALK
             ev.text = ctxt
+            if settles:
+                # ⚠ THE REQUEST IN FLIGHT IS DROPPED, NOT WAITED FOR: its answer could only add a second,
+                # contradicting act (d1 read « Tu peux ouvrir la porte ? » as a walk to the door, §12.6)
+                try:
+                    self.jev.cancel()
+                except:
+                    pass
+                self.then_decide = False
+                self.state = VL_ST_IDLE
+                if self.override_cmd != "":
+                    ev.kind = VL_COMMAND
+                    ev.name = self.override_cmd
+                    ev.text = self.heard
+                    ev.said = ctxt
 
         # ── deciding: the destination request (`request_wording`) ──────
         elif self.state == VL_ST_DEST:
@@ -1592,17 +1672,42 @@ struct G1VoiceLoopOf[
                 if streaming and delta.byte_length() > 0:
                     self.stream_raw += delta
                     self._say_sentences()
-                var done = self.llm.done()
+                if self.stream_capped:
+                    # ⚠ THE CAP STOPS THE MODEL, NOT ONLY THE VOICE: the rest would be written for nothing, on
+                    # the GPU d1's commands request waits for (`talk_first` asks it once the reply is out)
+                    try:
+                        self.llm.cancel()
+                    except:
+                        pass
+                    var said = spoken_text(String(self.stream_raw[byte = 0 : self.stream_used]))
+                    self._add_note(String("[said] ") + said + String("  (reply capped at ") + String(self.stream_cap)
+                                   + String(" sentence") + (String("s") if self.stream_cap > 1 else String(""))
+                                   + String(" after ") + String(Int(Float64(perf_counter_ns() - self.reply_t0) / 1e6))
+                                   + String(" ms; said in ") + String(self.stream_parts) + String(" pieces; the rest not written)"))
+                    ev.kind = VL_TALK
+                    ev.text = said
+                    self.state = VL_ST_IDLE
+                    self._after_reply()
+                var done = self.state == VL_ST_CHAT and self.llm.done()
                 if done:
                     var rtxt = String("")
                     var rtxt_raw = String("")
                     var rms_ = 0.0
                     var rcost = String("")
+                    var capnote = String("")
                     try:
                         var rep = self.llm.result()
                         # what a voice can say: no emoji, no markup (`noeira.text.spoken`)
                         rtxt = spoken_text(rep.text)
                         rtxt_raw = rep.text
+                        # the cap on a whole answer (not streamed, or streamed short of it): the same rule
+                        var cap_e = spoken_cap_end(rep.text, self.stream_cap)
+                        if cap_e >= 0:
+                            capnote = (String("; capped at ") + String(self.stream_cap) + String(" sentence")
+                                       + (String("s") if self.stream_cap > 1 else String("")) + String(", not said «")
+                                       + spoken_text(String(rep.text[byte = cap_e :])) + String("»"))
+                            rtxt_raw = String(rep.text[byte = 0 : cap_e])
+                            rtxt = spoken_text(rtxt_raw)
                         rms_ = rep.latency_ms
                         if rep.input_tokens > 0:
                             # where the reply's time went: its first token (the prompt), then its tokens
@@ -1623,7 +1728,7 @@ struct G1VoiceLoopOf[
                             else:
                                 self._speak(rtxt, True)
                         self._add_note(String("[said] ") + rtxt + String("  (reply ") + String(Int(rms_)) + String(" ms")
-                                       + rcost + pieces + String(")"))
+                                       + rcost + pieces + capnote + String(")"))
                         ev.kind = VL_TALK
                         ev.text = rtxt
                     self.state = VL_ST_IDLE
@@ -2038,8 +2143,14 @@ struct G1VoiceLoopOf[
 
     def _say_sentences(mut self):
         """Every sentence the stream has finished since the last call goes to
-        the voice (`spoken_sentence_end`, `spoken_text`)."""
+        the voice (`spoken_sentence_end`, `spoken_text`), up to the reply's cap
+        (`stream_cap`, `spoken_cap_end`): there `stream_capped` is set and
+        nothing more is said."""
+        var cap_at = spoken_cap_end(self.stream_raw, self.stream_cap)
         while True:
+            if cap_at >= 0 and self.stream_used >= cap_at:
+                self.stream_capped = True
+                return
             var e = spoken_sentence_end(self.stream_raw, self.stream_used)
             if self.stream_parts == 0 and self.cfg.first_clause > 0:
                 # the first piece may end at a comma, if that comes before a sentence's end
@@ -2048,6 +2159,8 @@ struct G1VoiceLoopOf[
                     e = c
             if e < 0:
                 return
+            if cap_at >= 0 and e > cap_at:
+                e = cap_at
             var piece = spoken_text(String(self.stream_raw[byte = self.stream_used : e]))
             self.stream_used = e
             if piece.byte_length() > 0:
@@ -2079,6 +2192,8 @@ struct G1VoiceLoopOf[
         self.stream_used = 0
         self.stream_parts = 0
         self.stream_cut = False
+        self.stream_cap = self.reply_cap
+        self.stream_capped = False
 
     def _reply(mut self, hint: String, note: String):
         """A spoken reply and nothing else: the robot's motion is unchanged.
@@ -2257,6 +2372,17 @@ struct G1VoiceLoopOf[
                         got = True
                     except e:
                         self.note = String("[miss] ") + String(e)
+                if not got and self.cfg.reply_refused and self.pick.reason != "not addressed to the robot":
+                    # ⚠ ADDRESSED, AND REFUSED: A REPLY, NOT SILENCE. « Tu peux faire quoi ? » came back « no
+                    # clear pick » (addressed 0.73) in the live room and nothing was said (2026-11-18). The
+                    # reply model answers it; the REASON is still never said (below).
+                    self._reply(
+                        String("If the request is not something you can do, say so kindly; otherwise answer it."),
+                        String("[refused] ") + self.pick.reason + String("  P(none) ") + _vl_f2(self.pick.p_none)
+                        + String("  addressed ") + _vl_f2(self.pick.addressed)
+                        + self._jev_ms(ans.latency_ms, ans.input_tokens) + String(" -> reply"),
+                    )
+                    got = True
                 if not got:
                     # ⚠ NEVER SPOKEN ALOUD. "no such command" is heard,
                     # transcribed and refused again — the loop that filled a

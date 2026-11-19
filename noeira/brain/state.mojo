@@ -57,6 +57,68 @@ comptime WS_TRAIL_N: Int = 4
 """Places in `trail`, most recent first (RB-1's reducer rule)."""
 
 
+struct Skill(Copyable, Movable):
+    """One thing the body can (or cannot) do, in the words each reader needs:
+    the reply view's English line, the French clause code says, the command the
+    body runs, and the words that name it in a question (`noeira.brain.answers`)."""
+
+    var en: String
+    """Completes "You can ..." / "You cannot ..." (the reply view)."""
+    var fr: String
+    """Completes « Je peux … » / « je ne peux pas … »: `danser`, `m'asseoir`."""
+    var command: String
+    """What the body runs when it is asked « Tu peux … ? » or told to: a bank
+    row or a named motion. "" = the decision says how (a place, a direction),
+    or there is nothing to run (a limit, talking)."""
+    var forms: List[String]
+    """Words that name it, matched as phrases on normalised text (`bb1.has_phrase`):
+    `danse`, `danser`, `dance`. Empty = never matched (asked about, the reply
+    model answers)."""
+    var to_places: Bool
+    """Walking to a place: « aller au frigo, à la porte… », the places listed."""
+    var motion: Bool
+    """A named motion (`Body.add_motion`): the list of skills names two of them, not all."""
+
+    def __init__(out self, var en: String, var fr: String, var command: String, var forms: List[String],
+                 to_places: Bool = False, motion: Bool = False):
+        self.en = en^
+        self.fr = fr^
+        self.command = command^
+        self.forms = forms^
+        self.to_places = to_places
+        self.motion = motion
+
+
+def known_motion(name: String) -> Bool:
+    """Whether `motion_skill` has words for `name`."""
+    return (name == "dance" or name == "wave" or name == "dab" or name == "stretch" or name == "jump"
+            or name == "boxing" or name == "backflip")
+
+
+def motion_skill(name: String) -> Skill:
+    """A named motion of the body (SuperMimic's room: `wave`, `dab`, `dance`,
+    `stretch`, `jump`, `boxing`, `backflip`), with its words. A name not in
+    this table is run by its own name and named by it."""
+    if name == "dance":
+        return Skill(String("dance"), String("danser"), name, ["danse", "danser", "dance"])
+    if name == "wave":
+        return Skill(String("wave hello"), String("faire coucou"), name,
+                     ["coucou", "salue", "saluer", "fais signe", "faire signe", "wave"])
+    if name == "dab":
+        return Skill(String("do a dab"), String("faire un dab"), name, ["dab"])
+    if name == "stretch":
+        return Skill(String("stretch"), String("m'étirer"), name, ["étire", "étirer", "stretch"])
+    if name == "jump":
+        return Skill(String("jump"), String("sauter"), name, ["saute", "sauter", "jump"])
+    if name == "boxing":
+        return Skill(String("shadow-box"), String("faire de la boxe"), name,
+                     ["boxe", "boxer", "boxing", "shadow box", "shadow-box"])
+    if name == "backflip":
+        return Skill(String("do a backflip"), String("faire un salto"), name,
+                     ["salto", "saut périlleux", "backflip", "back flip"])
+    return Skill(name, name, name, [name])
+
+
 struct Body(Copyable, Movable):
     """What this robot is and what it can do, in words a model reads. The
     reply view's "can / cannot" lines are generated from it, so a body that
@@ -70,25 +132,72 @@ struct Body(Copyable, Movable):
     """Each completes "You can ...": `walk to a place of the room`."""
     var cannot: List[String]
     """Things people ask for that it cannot do, each completing "You cannot ..."."""
+    var skills: List[Skill]
+    """The `can` lines that code answers for (`answers.capabilities_answer`,
+    `answers.can_answer`), each with its words. Added by `add_skill`, which
+    writes the `can` line too: one list, so the two cannot disagree."""
+    var limits: List[Skill]
+    """The same for `cannot` (`add_limit`)."""
 
     def __init__(out self, var name: String, var description: String):
         self.name = name^
         self.description = description^
         self.can = List[String]()
         self.cannot = List[String]()
+        self.skills = List[Skill]()
+        self.limits = List[Skill]()
+
+    def add_skill(mut self, var s: Skill):
+        """A thing it can do: its `can` line and its words."""
+        self.can.append(s.en)
+        self.skills.append(s^)
+
+    def add_limit(mut self, var s: Skill):
+        """A thing people ask for that it cannot do: its `cannot` line and its words."""
+        self.cannot.append(s.en)
+        self.limits.append(s^)
+
+    def add_motion(mut self, name: String):
+        """A named motion (`motion_skill`), after the movements and before
+        talking (a skill with no command and no words): « danser » reads
+        among the movements.
+
+        ⚠ IT CHANGES THE REPLY VIEW'S `can` LINE, which BB-1 measured with
+        `g1_room`'s five. Only a body that has the motions adds them."""
+        var s = motion_skill(name)
+        s.motion = True
+        var at = len(self.skills)
+        for i in range(len(self.skills)):
+            if self.skills[i].command == "" and not self.skills[i].to_places and len(self.skills[i].forms) == 0:
+                at = i
+                break
+        # ⚠ `can` and `skills` in the same order, so the view and the answers list them alike
+        var k = len(self.can) - (len(self.skills) - at)
+        self.can.insert(k, s.en)
+        self.skills.insert(at, s^)
 
     @staticmethod
     def g1_room(name: String) -> Body:
-        """The simulated G1 of the room demo: BFM-Zero's bank and the navigator."""
+        """The simulated G1 of the room demo: BFM-Zero's bank and the navigator.
+
+        ⚠ THE `can` / `cannot` LINES ARE BB-1'S: the English words are the ones
+        it was measured with (docs/ROBOT_BRAIN_PLAN.md §11.2)."""
         var b = Body(name, String("a small humanoid robot with two legs, two arms and a head"))
-        b.can.append(String("walk to a place of the room"))
-        b.can.append(String("turn"))
-        b.can.append(String("squat"))
-        b.can.append(String("raise your arms"))
-        b.can.append(String("talk and answer questions"))
-        b.cannot.append(String("pick things up or carry them"))
-        b.cannot.append(String("open the door"))
-        b.cannot.append(String("sit down"))
+        b.add_skill(Skill(String("walk to a place of the room"), String("aller"), String(""), List[String](), True))
+        b.add_skill(Skill(String("turn"), String("tourner"), String(""), ["tourner", "tourne", "turn"]))
+        b.add_skill(Skill(String("squat"), String("faire un squat"), String("squat"),
+                          ["squat", "accroupir", "accroupis", "accroupi"]))
+        b.add_skill(Skill(String("raise your arms"), String("lever les bras"), String("both_hands_up"),
+                          ["lever les bras", "lève les bras", "lever tes bras", "lève tes bras", "lever les deux bras",
+                           "lève les deux bras", "raise your arms", "raise both arms", "arms up", "hands up"]))
+        b.add_skill(Skill(String("talk and answer questions"), String("parler et répondre à tes questions"), String(""),
+                          List[String]()))
+        b.add_limit(Skill(String("pick things up or carry them"), String("prendre ou porter des objets"), String(""),
+                          ["prendre", "porter", "attraper", "ramasser", "pick up", "pick things up", "carry", "grab"]))
+        b.add_limit(Skill(String("open the door"), String("ouvrir la porte"), String(""),
+                          ["ouvrir", "ouvre", "open"]))
+        b.add_limit(Skill(String("sit down"), String("m'asseoir"), String(""),
+                          ["asseoir", "assieds", "assois", "sit", "sit down"]))
         return b^
 
 

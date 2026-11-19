@@ -12,9 +12,26 @@ the object, with what `docs/OBJECT_INTERACTION_PLAN.md`'s O1.5 asks of the box:
                  the largest and the mean distance over the carry steps, and
                  the tracker's normalised return (its eight terms)
 
-A clip SUCCEEDS when the robot did not fall, the reference carries at some
-point, and the box was held on at least `SM_OBJ_HELD_SHARE` of the carry
-steps. `strict` is the same with every carry step held.
+A clip SUCCEEDS (is "at the bar") when the robot did not fall, the reference
+carries at some point, and the box was held on at least `SM_OBJ_HELD_SHARE`
+of the carry steps. `strict` is the same with every carry step held.
+
+The bar is not the carry. A run is CARRIED when the robot did not fall and the
+simulated box is up on more than half of the carry's second half; its error
+once in hand is the mean distance over that half
+(`object_task.SMObjCarryTally`, the one rule, shared with the CPU trace
+driver). Those three read the box's centre; the fourth is its LEAN over the
+same half (`object_task.sm_obj_lean_deg`), and a carried run is LEVEL when
+that is at most `SM_OBJ_LEVEL` degrees. Report the four side by side.
+
+Tracking is reported twice: the tracker's normalised return (eight terms, all
+14 bodies), and the six kernels with the body kernels taken over the trunk and
+the legs only (`heads.sm_tracking_kernels_lane` under
+`object_task.sm_trunk_legs_mask`), each over its maximum. The arms must leave
+the reference to hold a box the reference pantomimes, so O1.5's tracking
+criterion is the second, against the blind tracker's on the same clips. The
+kernels are computed on the host from each lane's state after the step; a
+run's last step (the lane is already reset) is not in them.
 
 `trials` > 1 runs every clip that many times, each from a start perturbed by
 the training's reset noise (the robot's root and joints; the box stays at its
@@ -46,15 +63,19 @@ from max.gpu.host import DeviceContext
 from noeira.deep_agents.supermimic.agent_gpu import _k_start_inputs
 from noeira.deep_agents.supermimic.env_gpu import SMReplayGpuOf, ST_ENDING, ST_TERMINATED
 from noeira.deep_agents.supermimic.eval import SM_MAX_STEP_REWARD
+from noeira.deep_agents.supermimic.heads import sm_tracking_kernels_lane
 from noeira.deep_agents.supermimic.kinematics import FP, sm_fk_lane
 from noeira.deep_agents.supermimic.lanes import talloc, tp
 from noeira.deep_agents.supermimic.motion_library import SM_REF_SCRATCH, SMMotionLibrary
-from noeira.deep_agents.supermimic.object_agent_gpu import SM_OBJ_NEAR, SMObjSqueeze, _k_obj_err, _k_oref_lanes, _k_oref_starts
+from noeira.deep_agents.supermimic.object_agent_gpu import SMObjSqueeze, _k_obj_err, _k_oref_lanes, _k_oref_starts
 from noeira.deep_agents.supermimic.object_env_gpu import SMObjReplayGpu, SMObjTrackingEnvGpu
 from noeira.deep_agents.supermimic.object_imagination import SMObjImagBatch, sm_imagine_obj
 from noeira.deep_agents.supermimic.object_policy import SMObjConfigT
 from noeira.deep_agents.supermimic.object_spec import SM_OBJ, SM_OBJ_CTX
-from noeira.deep_agents.supermimic.object_task import SM_OBJ_TERMS, SM_OREF, SM_ORW, sm_obj_reward_lane
+from noeira.deep_agents.supermimic.object_task import (
+    SM_OBJ_HELD_SHARE, SM_OBJ_LEVEL, SM_OBJ_LIFT, SM_OBJ_TERMS, SM_OREF, SM_ORW, SMObjCarryTally, sm_obj_carry_steps, sm_obj_carry_tally,
+    sm_obj_lean_deg, sm_obj_reward_lane, sm_trunk_legs_mask,
+)
 from noeira.deep_agents.supermimic.object_trainer import SMObjTrainer
 from noeira.deep_agents.supermimic.robot import SMDims, TrackingBatchedSim
 from noeira.nn.constants import DT
@@ -62,8 +83,6 @@ from noeira.nn.core.ptr import mptr
 
 
 comptime _TPB: Int = 64
-comptime SM_OBJ_LIFT: Float64 = 0.05
-comptime SM_OBJ_HELD_SHARE: Float64 = 0.95
 comptime SM_OBJ_HONEST_FIRST: Int = 10      # the first window's start step
 comptime SM_OBJ_HONEST_GAP: Int = 8         # steps between a window's end and the next one's start
 
@@ -80,6 +99,18 @@ struct SMObjClipResult(Copyable, Movable):
     var held_steps: Int
     var max_err_carry: Float64    # m, over the carry steps (0 without any)
     var mean_err_carry: Float64
+    var late_steps: Int           # carry steps of the carry's second half that the run reached
+    var late_up_steps: Int        # … with the simulated box up
+    var mean_err_late: Float64    # m, over those steps: the error once in hand
+    var kernels_all: Float64      # the six kernels over their maximum, all tracked bodies
+    var kernels_trunk_legs: Float64   # … the body kernels over the trunk and the legs only
+    var mean_lean_late: Float64   # degrees, the box's lean against its reference over the carry's second half
+
+    def carried(self) -> Bool:
+        return (not self.fell) and self.late_steps > 0 and 2 * self.late_up_steps > self.late_steps
+
+    def level(self) -> Bool:
+        return self.carried() and self.mean_lean_late <= SM_OBJ_LEVEL
 
     def success(self) -> Bool:
         return (not self.fell) and self.carry_steps > 0 and Float64(self.held_steps) >= SM_OBJ_HELD_SHARE * Float64(self.carry_steps)
@@ -135,10 +166,21 @@ def sm_obj_benchmark[OC: SMObjConfigT, BS: TrackingBatchedSim](
         env.env.next_frame[l] = env.env.lib.clip_start[min(nxt[l], n_runs - 1) % n_clips]
     var ret = List[Float64](length=N, fill=0.0)
     var steps = List[Int](length=N, fill=0)
-    var carry = List[Int](length=N, fill=0)
-    var held = List[Int](length=N, fill=0)
-    var emax = List[Float64](length=N, fill=0.0)
-    var esum = List[Float64](length=N, fill=0.0)
+    var clip_carry = List[Int](length=n_clips, fill=0)      # each clip's carry frames, known before its runs
+    for c in range(n_clips):
+        clip_carry[c] = sm_obj_carry_steps(orefs, env.env.lib.clip_start[c], env.env.lib.clip_len[c])
+    var tally = List[SMObjCarryTally]()
+    for l in range(N):
+        tally.append(sm_obj_carry_tally(clip_carry[current[l] % n_clips]))
+    # the six kernels on the host: all tracked bodies, and the trunk and the legs
+    var mask_all = List[Scalar[DT]](length=R.N_TRACKED, fill=1)
+    var mask_tl = sm_trunk_legs_mask[R]()
+    var fk = List[Scalar[DT]](length=SMDims[R].FK_BLOCK, fill=0)
+    var rf = List[Scalar[DT]](length=SMDims[R].REF, fill=0)
+    var k6 = List[Scalar[DT]](length=6, fill=0)
+    var k_all = List[Float64](length=N, fill=0.0)
+    var k_tl = List[Float64](length=N, fill=0.0)
+    var k_steps = List[Int](length=N, fill=0)
     var results = List[SMObjClipResult]()
     var goals = talloc["gpu"](N * SMDims[R].GOAL, Optional(ctx))
     var oref_l = talloc["gpu"](N * SM_OREF, Optional(ctx))
@@ -160,6 +202,8 @@ def sm_obj_benchmark[OC: SMObjConfigT, BS: TrackingBatchedSim](
         ctx.enqueue_function[_k_obj_err](Int64(N), tp["gpu"](env.o), tp["gpu"](oref_l), tp["gpu"](oerr), grid_dim=ceildiv(N, _TPB), block_dim=_TPB)
         oerr.download(ctx)
         oref_l.download(ctx)
+        env.o.download(ctx)
+        env.env.s.download(ctx)
         for l in range(N):
             if not active[l]:
                 continue
@@ -167,19 +211,34 @@ def sm_obj_benchmark[OC: SMObjConfigT, BS: TrackingBatchedSim](
             ret[l] += env.env.last_reward[l]
             steps[l] += 1
             var z0 = Float64(orefs[env.env.lib.clip_start[c] * SM_OREF + 2])
-            if Float64(oref_l.data[l * SM_OREF + 2]) >= z0 + SM_OBJ_LIFT:
-                var d = Float64(oerr.data[2 * l])
-                carry[l] += 1
-                esum[l] += d
-                emax[l] = max(emax[l], d)
-                if d <= SM_OBJ_NEAR:
-                    held[l] += 1
+            var oq = l * SM_OBJ + 3
+            var rq = l * SM_OREF + 3
+            tally[l].note(
+                Float64(oref_l.data[l * SM_OREF + 2]) - z0, Float64(env.o.data[l * SM_OBJ + 2]) - z0, Float64(oerr.data[2 * l]),
+                sm_obj_lean_deg(
+                    Float64(env.o.data[oq]), Float64(env.o.data[oq + 1]), Float64(env.o.data[oq + 2]), Float64(env.o.data[oq + 3]),
+                    Float64(oref_l.data[rq]), Float64(oref_l.data[rq + 1]), Float64(oref_l.data[rq + 2]), Float64(oref_l.data[rq + 3]),
+                ),
+            )
             var st = env.env.h_out_i[2 * l + 1]
             if (st & ST_ENDING) == 0:
+                # `env.env.s` is this lane's state after the step (an ending lane's is already its next start)
+                env.env.lib.reference_row(Int(env.env.h_out_i[2 * l]), trainer.base.tables, _hp(rf))
+                var sp = _hp(env.env.s.data, l * SMDims[R].S)
+                var pos = _hp(fk)
+                sm_fk_lane[DT, SMDims[R].NB](
+                    trainer.base.tables.tree_ptr(), sp, sp.unsafe_offset(SMDims[R].NQ), pos, pos.unsafe_offset(SMDims[R].NB * 3),
+                    pos.unsafe_offset(SMDims[R].NB * 7), pos.unsafe_offset(SMDims[R].NB * 10),
+                )
+                k_all[l] += Float64(sm_tracking_kernels_lane[DT, R](trainer.base.tables.head_ptr(), pos, _hp(rf), _hp(mask_all), _hp(k6)))
+                k_tl[l] += Float64(sm_tracking_kernels_lane[DT, R](trainer.base.tables.head_ptr(), pos, _hp(rf), _hp(mask_tl), _hp(k6)))
+                k_steps[l] += 1
                 continue
+            var kn = SM_MAX_STEP_REWARD * Float64(max(k_steps[l], 1))
             results.append(SMObjClipResult(
                 c, current[l] // n_clips, env.env.lib.clip_len[c], steps[l], ret[l] / (SM_MAX_STEP_REWARD * Float64(max(steps[l], 1))),
-                (st & ST_TERMINATED) != 0, carry[l], held[l], emax[l], esum[l] / Float64(max(carry[l], 1)),
+                (st & ST_TERMINATED) != 0, tally[l].carry, tally[l].held, tally[l].emax, tally[l].mean_err(),
+                tally[l].late, tally[l].late_up, tally[l].mean_err_late(), k_all[l] / kn, k_tl[l] / kn, tally[l].mean_lean_late(),
             ))
             remaining -= 1
             done_n += 1
@@ -192,10 +251,10 @@ def sm_obj_benchmark[OC: SMObjConfigT, BS: TrackingBatchedSim](
             env.env.next_frame[l] = env.env.lib.clip_start[min(nxt[l], n_runs - 1) % n_clips]
             ret[l] = 0.0
             steps[l] = 0
-            carry[l] = 0
-            held[l] = 0
-            emax[l] = 0.0
-            esum[l] = 0.0
+            tally[l] = sm_obj_carry_tally(clip_carry[min(current[l], n_runs - 1) % n_clips])
+            k_all[l] = 0.0
+            k_tl[l] = 0.0
+            k_steps[l] = 0
     return results^
 
 

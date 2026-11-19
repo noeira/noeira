@@ -5,6 +5,15 @@ randomisation, every clip to its end or to a fall, and for the box the counts
 `docs/OBJECT_INTERACTION_PLAN.md`'s O1.5 asks for (carry steps, steps within
 10 cm of the reference, the largest distance while the reference carries).
 
+Four readings of the box, side by side: runs AT THE BAR (within 10 cm on 95 %
+of the carry steps, no fall), runs CARRIED (no fall, the box up on more than
+half of the carry's second half), the error once in hand (the mean distance
+over that half, carried runs), and the box's LEAN over that half (a carried
+run is LEVEL at 15 degrees or less; the first three read the box's centre
+and pass a box that hangs from the hands). Two of the tracking: the tracker's
+normalised return, and the six kernels over the trunk and the legs (O1.5's
+criterion, against the same number of a run without `--interface`).
+
     pixi run -e nvidia mojo build -I . -D SM_PAPER=1 examples/g1/supermimic_object_eval.mojo -o /tmp/sm_obj_eval
     /tmp/sm_obj_eval --ckpt TRACKER.ckpt --store CARRY_50HZ.h5 --object-dir OBJECT_CSV_DIR --clips CLIPS.tsv \\
         [--interface INTERFACE.ckpt] [--split eval] [--gain 0.1] [--csv OUT.csv]
@@ -39,10 +48,11 @@ from noeira.data.store import TrajectoryStore
 from noeira.deep_agents.supermimic import SMConfig, SuperMimicTrainer
 from noeira.deep_agents.supermimic.motion_library import SMMotionLibrary
 from noeira.deep_agents.supermimic.object_env_gpu import sm_object_track
-from noeira.deep_agents.supermimic.object_eval import SM_OBJ_HELD_SHARE, SMObjHonesty, sm_obj_benchmark, sm_obj_honesty
+from noeira.deep_agents.supermimic.object_eval import SMObjHonesty, sm_obj_benchmark, sm_obj_honesty
 from noeira.deep_agents.supermimic.object_policy import SMObjConfig
 from noeira.deep_agents.supermimic.object_task import (
-    SM_OSTD_HANDS, SM_OSTD_ORI, SM_OSTD_POS, SM_OW_HANDS, SM_OW_ORI, SM_OW_POS, sm_lead_in, sm_object_ref_rows, sm_obj_reward_params,
+    SM_OBJ_HELD_SHARE, SM_OBJ_LEVEL, SM_OSTD_HANDS, SM_OSTD_ORI, SM_OSTD_POS, SM_OW_HANDS, SM_OW_ORI, SM_OW_POS, sm_lead_in, sm_object_ref_rows,
+    sm_obj_reward_params,
 )
 from noeira.deep_agents.supermimic.object_trainer import SMObjTrainer
 from noeira.deep_agents.supermimic.robot import G1MjlabBoxBatchedSim, G1MjlabBoxRobot, SMDims
@@ -246,6 +256,7 @@ def main() raises:
     var t_pass = List[Int](length=max(trials, 1), fill=0)
     var t_half = List[Int](length=max(trials, 1), fill=0)
     var t_fell = List[Int](length=max(trials, 1), fill=0)
+    var t_carried = List[Int](length=max(trials, 1), fill=0)
     var c_pass = List[Int](length=len(lens), fill=0)
 
     var fell = 0
@@ -255,7 +266,17 @@ def main() raises:
     var ret = 0.0
     var carry = 0
     var held = 0
-    var csv = String("clip,name,frames,steps,norm_return,fell,carry_steps,held_steps,max_err_carry_m,mean_err_carry_m,success,trial\n")
+    var carried = 0
+    var hand_err = 0.0          # Σ over carried runs of the mean distance in the carry's second half
+    var hand_lean = 0.0         # … of the mean lean
+    var level = 0
+    var bar_level = 0
+    var k_all = 0.0
+    var k_tl = 0.0
+    var csv = String(
+        "clip,name,frames,steps,norm_return,fell,carry_steps,held_steps,max_err_carry_m,mean_err_carry_m,success,trial,"
+        + "carried,late_steps,late_up_steps,mean_err_late_m,kernels_all,kernels_trunk_legs,mean_lean_late_deg,level\n"
+    )
     for i in range(len(res)):
         var r = res[i].copy()
         if r.fell:
@@ -267,6 +288,17 @@ def main() raises:
         if r.carry_steps == 0:
             no_carry += 1
         ret += r.norm_return / Float64(len(res))
+        k_all += r.kernels_all / Float64(len(res))
+        k_tl += r.kernels_trunk_legs / Float64(len(res))
+        if r.carried():
+            carried += 1
+            hand_err += r.mean_err_late
+            hand_lean += r.mean_lean_late
+            t_carried[r.trial] += 1
+        if r.level():
+            level += 1
+            if r.success():
+                bar_level += 1
         carry += r.carry_steps
         held += r.held_steps
         t_carry[r.trial] += r.carry_steps
@@ -281,17 +313,30 @@ def main() raises:
         csv += (
             String(r.clip) + "," + names[r.clip] + "," + String(r.frames) + "," + String(r.steps) + "," + String(r.norm_return) + ","
             + ("1" if r.fell else "0") + "," + String(r.carry_steps) + "," + String(r.held_steps) + "," + String(r.max_err_carry) + ","
-            + String(r.mean_err_carry) + "," + ("1" if r.success() else "0") + "," + String(r.trial) + "\n"
+            + String(r.mean_err_carry) + "," + ("1" if r.success() else "0") + "," + String(r.trial) + ","
+            + ("1" if r.carried() else "0") + "," + String(r.late_steps) + "," + String(r.late_up_steps) + "," + String(r.mean_err_late) + ","
+            + String(r.kernels_all) + "," + String(r.kernels_trunk_legs) + "," + String(r.mean_lean_late) + "," + ("1" if r.level() else "0") + "\n"
         )
         print(
             "  ", names[r.clip], "| steps", r.steps, "/", r.frames, "| return", r.norm_return, "| FELL" if r.fell else "| stood",
             "| carry steps", r.carry_steps, "held", r.held_steps, "| box off by", r.mean_err_carry, "m mean,", r.max_err_carry, "m at most",
-            "| SUCCESS" if r.success() else "| no",
+            "| SUCCESS" if r.success() else "| no", "| carried," if r.carried() else "| not carried,", r.mean_err_late, "m once in hand, leaning",
+            r.mean_lean_late, "deg,", "level" if r.level() else "not level",
+            "| kernels all", r.kernels_all, "trunk and legs", r.kernels_trunk_legs,
         )
     print(
         "\n", len(res), "runs |" if trials > 1 else "clips |", "success", ok, "(box within 10 cm on >=", SM_OBJ_HELD_SHARE, "of the carry steps, no fall) | strict", strict,
         "| fell", fell, "| clips whose reference never carries", no_carry,
         "| carry steps held", held, "/", carry, "| mean normalised return (the tracker's terms)", ret,
+    )
+    print(
+        " CARRIED", carried, "of", len(res), "(no fall, the box up on more than half of the carry's second half) | error once in hand",
+        hand_err / Float64(max(carried, 1)), "m (mean over the carried runs) | six kernels over their maximum: all bodies", k_all,
+        ", trunk and legs", k_tl, "(O1.5's tracking criterion: >= 0.95 of the blind tracker's on the same clips)",
+    )
+    print(
+        " LEVEL", level, "of", len(res), "(carried, the box's lean at most", SM_OBJ_LEVEL, "deg over that half) | at the bar and level", bar_level,
+        "| lean once in hand", hand_lean / Float64(max(carried, 1)), "deg (mean over the carried runs)",
     )
     if trials > 1:
         var sm = 0.0
@@ -301,7 +346,9 @@ def main() raises:
         var plo = len(lens)
         var phi = 0
         var hm = 0.0
+        var cm = 0.0
         for k in range(trials):
+            cm += Float64(t_carried[k]) / Float64(trials)
             var sh = Float64(t_held[k]) / Float64(max(t_carry[k], 1))
             sm += sh / Float64(trials)
             lo = min(lo, sh)
@@ -321,6 +368,7 @@ def main() raises:
             " TRIALS", trials, "| share of carry steps held per trial: mean", sm, "lowest", lo, "highest", hi,
             "| clips passing per trial: mean", pm, "lowest", plo, "highest", phi, "| clips held on at least half the carry, mean", hm,
             "| clips passing in every trial", always, ", in at least half the trials", mostly, "of", len(lens),
+            "| clips carried per trial: mean", cm,
         )
     if csv_path != "":
         with open(csv_path, "w") as f:

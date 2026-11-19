@@ -344,6 +344,70 @@ def sm_heads_lane[dt: DType, R: TrackingRobot](
     return total
 
 
+def sm_tracking_kernels_lane[dt: DType, R: TrackingRobot](
+    table: FP[dt], fk: FP[dt], rf: FP[dt], mask: FP[dt], dst: FP[dt],
+) -> Scalar[dt] where dt.is_floating_point():
+    """A MEASURE, not a reward: `sm_heads_lane`'s six kernel terms
+    (`T_ROOT_POS` … `T_BODY_ANG`, weighted and × dt) with the four body
+    kernels' mean taken over the tracked bodies whose `mask` entry is not 0
+    (`mask`: N_TRACKED values) instead of over all of them. `fk` is the
+    state's FK block (`sm_fk_lane`'s pos, quat, lin, ang), `rf` the reference
+    row. Writes the six to `dst` and returns their sum.
+
+    With every body in the mask these are `sm_heads_lane`'s first six terms
+    (gated, `test_supermimic_obj_task` [7]). The anchor and the two root terms
+    do not depend on the mask. What it is for: a policy that must move some
+    bodies off the reference (the arms, to hold an object the reference
+    pantomimes) is scored on the others."""
+    comptime D = SMDims[R]
+    comptime L = SMHeadLayout[R]
+    var pos = fk
+    var quat = fk.unsafe_offset(D.NB * 3)
+    var lin = fk.unsafe_offset(D.NB * 7)
+    var ang = fk.unsafe_offset(D.NB * 10)
+    var aslot = Int(_at(table, L.ANCHOR))
+    var ai = Int(_at(table, L.TRACKED + aslot))
+    var ra_p = _v3(pos, ai * 3)
+    var ra_q = _q4(quat, ai * 4)
+    var mb = aslot * D.REF_BODY
+    var ma_p = _v3(rf, mb)
+    var ma_q = _q4(rf, mb + 3)
+    var dpos = Q4[dt](ra_p[0], ra_p[1], ma_p[2], 0)
+    var dori = yaw_quat(qmul(ra_q, _qinv(ma_q)))
+    var e_bp = Scalar[dt](0)
+    var e_bo = Scalar[dt](0)
+    var e_bl = Scalar[dt](0)
+    var e_ba = Scalar[dt](0)
+    var cnt = Scalar[dt](0)
+    for k in range(D.N_TRACKED):
+        if _at(mask, k) == Scalar[dt](0):
+            continue
+        cnt += Scalar[dt](1)
+        var b = Int(_at(table, L.TRACKED + k))
+        var rb = k * D.REF_BODY
+        var rel_p = dpos + qapply(dori, _v3(rf, rb) - ma_p)
+        var rel_q = qmul(dori, _q4(rf, rb + 3))
+        var dp = rel_p - _v3(pos, b * 3)
+        e_bp += dot3(dp, dp)
+        e_bo += sq_quat_err(qmul(rel_q, qconj(_q4(quat, b * 4))))
+        var dl = _v3(rf, rb + 7) - _v3(lin, b * 3)
+        e_bl += dot3(dl, dl)
+        var da = _v3(rf, rb + 10) - _v3(ang, b * 3)
+        e_ba += dot3(da, da)
+    var inv_n = Scalar[dt](1) / max(cnt, Scalar[dt](1))
+    var drp = ma_p - ra_p
+    dst[unsafe_offset=T_ROOT_POS] = _exp_term[dt, SM_W_ROOT_POS, SM_STD_ROOT_POS](dot3(drp, drp))
+    dst[unsafe_offset=T_ROOT_ORI] = _exp_term[dt, SM_W_ROOT_ORI, SM_STD_ROOT_ORI](sq_quat_err(qmul(ma_q, qconj(ra_q))))
+    dst[unsafe_offset=T_BODY_POS] = _exp_term[dt, SM_W_BODY_POS, SM_STD_BODY_POS](e_bp * inv_n)
+    dst[unsafe_offset=T_BODY_ORI] = _exp_term[dt, SM_W_BODY_ORI, SM_STD_BODY_ORI](e_bo * inv_n)
+    dst[unsafe_offset=T_BODY_LIN] = _exp_term[dt, SM_W_BODY_LIN, SM_STD_BODY_LIN](e_bl * inv_n)
+    dst[unsafe_offset=T_BODY_ANG] = _exp_term[dt, SM_W_BODY_ANG, SM_STD_BODY_ANG](e_ba * inv_n)
+    var total = dst[unsafe_offset=0]
+    for k in range(1, 6):
+        total += dst[unsafe_offset=k]
+    return total
+
+
 # ── VJP ─────────────────────────────────────────────────────────────────────
 def sm_heads_vjp_lane[dt: DType, R: TrackingRobot](
     tree: FP[dt], table: FP[dt], s: FP[dt], a: FP[dt], a_prev: FP[dt], rf: FP[dt],

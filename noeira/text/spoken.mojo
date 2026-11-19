@@ -14,7 +14,16 @@ U+2B00-2BFF), the variation selector U+FE0F and the joiner U+200D that glue
 them, `*` and backticks. Runs of spaces left behind collapse to one, a space
 left before `.,!?;:` at the end goes, and the ends are trimmed. Letters,
 accents, digits and punctuation are untouched.
+
+`spoken_sentence_end` / `spoken_clause_end`: where a reply being written can
+be cut into pieces to say. `spoken_cap_end`: where a reply capped at so many
+sentences ends (the voice loop's `set_reply_sentences`); `spoken_words`
+counts the words it goes by.
 """
+
+comptime SPOKEN_CAP_MIN_WORDS: Int = 3
+"""A sentence under this many words does not count toward a cap: « Oui ! »,
+« D'accord. », « Bien sûr ! » lead the sentence that answers, they are not it."""
 
 
 def spoken_text(reply: String) -> String:
@@ -124,6 +133,53 @@ def spoken_sentence_end(text: String, start: Int) -> Int:
             seen_word = True
         i += mlen if mark else 1
     return -1
+
+
+def spoken_words(text: String) -> Int:
+    """The words of `text`: runs between blanks that hold a letter or a digit
+    (any byte of a multi-byte character counts as a letter). « D'accord. » is
+    one, « Bien sûr ! » two, « 4,5 m. » two."""
+    var b = text.as_bytes()
+    var n = 0
+    var in_run = False
+    var has = False
+    for i in range(len(b) + 1):
+        var c = Int(b[i]) if i < len(b) else 32
+        if c == 32 or c == 9 or c == 10:
+            if in_run and has:
+                n += 1
+            in_run = False
+            has = False
+        else:
+            in_run = True
+            if c >= 0x80 or (c >= 48 and c <= 57) or (c >= 65 and c <= 90) or (c >= 97 and c <= 122):
+                has = True
+    return n
+
+
+def spoken_cap_end(text: String, sentences: Int, min_words: Int = SPOKEN_CAP_MIN_WORDS) -> Int:
+    """Where `text` ends once it has said `sentences` sentences (a byte index,
+    as `spoken_sentence_end` gives it), or -1 when it has not said that many
+    FINISHED ones (yet: a reply still being written; or at all: its last
+    sentence, with nothing after it, is never cut). A sentence of fewer than
+    `min_words` words is said but not counted (`SPOKEN_CAP_MIN_WORDS`), so
+    « Oui ! Je suis à la table. » is one sentence. `sentences` <= 0: no cap (-1).
+
+    ⚠ THE ONE RULE FOR BOTH PATHS: the voice loop stops a streamed reply here
+    and cuts a whole one here, so the two cannot say different things."""
+    if sentences <= 0:
+        return -1
+    var at = 0
+    var counted = 0
+    while True:
+        var e = spoken_sentence_end(text, at)
+        if e < 0:
+            return -1
+        if spoken_words(String(text[byte = at : e])) >= min_words:
+            counted += 1
+            if counted >= sentences:
+                return e
+        at = e
 
 
 def spoken_clause_end(text: String, start: Int, min_bytes: Int) -> Int:

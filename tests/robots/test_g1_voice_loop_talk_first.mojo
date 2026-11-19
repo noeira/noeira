@@ -38,6 +38,17 @@ said while d1 still decides, and the decision still acts.
     silence counts as speaking only when gated: the microphone is then muted
     as it is live.
 
+A computed answer that SETTLES the turn (`set_reply_override`'s `decides`
+False, `noeira.brain.answers.can_turn`, live room 2026-11-18):
+
+14. « Tu peux ouvrir la porte ? »: the answer at once, d1's request in flight
+    dropped (cancelled, its answer never read), nothing else said or run, the
+    loop idle.
+15. « Tu peux danser ? » with the command `dance`: ONE event, the command,
+    carrying the answer it was said with; d1 dropped the same way.
+16. (`reply_refused`) an addressed sentence d1 refuses (« no clear pick »)
+    gets a reply from the model; off, it stays silent as before.
+
 The loop is the real `G1VoiceLoopOf`, its microphone closed, a stand-in
 recogniser handing it the sentence, a stand-in decision answering from a
 script, and a stand-in reply model.
@@ -124,9 +135,11 @@ struct ScriptDecision(Movable, DecisionService):
     var polls: Int
     var broken: Bool
     """Its model "failed to load" (`load_failed`)."""
+    var cancelled: Int
 
     def __init__(out self):
         self.broken = False
+        self.cancelled = 0
         self.script = List[String]()
         self.asked = String("")
         self.states = List[String]()
@@ -169,7 +182,7 @@ struct ScriptDecision(Movable, DecisionService):
         return JevAnswers(parse_json(_bytes(j)), 500.0)
 
     def cancel(mut self) raises:
-        pass
+        self.cancelled += 1
 
 
 struct ScriptChat(Movable, ChatService):
@@ -349,6 +362,12 @@ struct CRun(Movable):
     var notes: List[String]
     var asked: String
     var replies: Int
+    var cmd_said: String
+    """A command event's `said`."""
+    var cancelled: Int
+    var idle: Bool
+    var left: Int
+    """d1's answers never read."""
 
     def __init__(out self):
         self.order = String("")
@@ -356,10 +375,16 @@ struct CRun(Movable):
         self.notes = List[String]()
         self.asked = String("")
         self.replies = 0
+        self.cmd_said = String("")
+        self.cancelled = 0
+        self.idle = False
+        self.left = 0
 
 
 def run_computed(
     second: String, ref bank: G1CommandBank, final_at: Int, stale: Bool = False, take_from: Int = 0,
+    decides: Bool = True, command: String = String(""), answer: String = String("Oui, j'ai fini ce que tu m'as demandé."),
+    heard: String = String("As-tu fini ce que je t'ai demandé ?"),
 ) raises -> CRun:
     """« As-tu fini ? » with `computed_first`, driven as the demo drives the loop: before each poll the caller
     sets its computed answer from the words it has TAKEN (`take_heard` after each poll). `final_at`: the first
@@ -368,7 +393,7 @@ def run_computed(
     `take_from`: the caller takes the words from that poll on (a caller a poll late)."""
     var loop = make_loop(0.7, bank)
     loop.cfg.computed_first = True
-    loop.stt.text = String("As-tu fini ce que je t'ai demandé ?")
+    loop.stt.text = heard
     loop.jev.script.append(first_answer(0.5))
     loop.jev.script.append(command_answer(second))
     loop.state = VL_ST_STT
@@ -383,7 +408,7 @@ def run_computed(
             if i < final_at:
                 loop.set_reply_override(String("Un instant."), False)
             else:
-                loop.set_reply_override(String("Oui, j'ai fini ce que tu m'as demandé."), True)
+                loop.set_reply_override(answer, True, decides, command)
         var ev = loop.poll(ctx, bank)
         if len(loop.jev.script) < answers_left:
             answers_left = len(loop.jev.script)
@@ -393,6 +418,7 @@ def run_computed(
             r.said.append(ev.text)
         elif ev.kind == VL_COMMAND:
             r.order += String("C") + ev.name
+            r.cmd_said = ev.said
         if i >= take_from and loop.take_heard() != "":
             taken = True
         var n = loop.take_note()
@@ -402,7 +428,17 @@ def run_computed(
                 r.notes.append(n)
     r.asked = loop.jev.asked
     r.replies = loop.llm.asked
+    r.cancelled = loop.jev.cancelled
+    r.idle = loop.state == VL_ST_IDLE
+    r.left = len(loop.jev.script)
     return r^
+
+
+def refused_answer() -> String:
+    """The commands request: addressed, nothing clear (`squat` 0.30, under `min_top` 0.35)."""
+    return (String('{"model":"script","usage":{"input_tokens":1228},"answers":{')
+            + String('"command":{"choice":"squat","probabilities":{"squat":0.30,"crouch":0.28,"none":0.10}},')
+            + String('"needs_world":{"noul":0.05},"addressed":{"noul":0.80},"extent":{"score":1.0}}}'))
 
 
 def main() raises:
@@ -524,6 +560,49 @@ def main() raises:
     check(fails, not sg.speaking(), "and not once it has ended")
     sg.tts_queue.append(String("Une phrase."))
     check(fails, sg.speaking(), "a piece still to synthesise counts, as live")
+
+    print("14. a computed answer that settles the turn: « Tu peux ouvrir la porte ? »")
+    var nd = run_computed(String("talk"), bank, 0, decides=False, answer=String("Non, je ne peux pas ouvrir la porte."),
+                          heard=String("Tu peux ouvrir la porte ?"))
+    check(fails, nd.order == "T" and len(nd.said) == 1 and nd.said[0] == "Non, je ne peux pas ouvrir la porte.",
+          "the answer, and nothing else: " + nd.order)
+    check(fails, nd.asked == "D" and nd.cancelled == 1 and nd.left == 2 and nd.replies == 0 and nd.idle,
+          "the first request dropped unread, the second never asked, the model never, the loop idle: "
+          + nd.asked + " cancelled " + String(nd.cancelled) + " left " + String(nd.left))
+    check(fails, len(nd.notes) > 0 and nd.notes[0].find("the turn is settled") >= 0, "the log says so")
+
+    print("15. the same with its command: « Tu peux danser ? »")
+    var dn = run_computed(String("talk"), bank, 0, decides=False, command=String("dance"), answer=String("Oui, regarde !"),
+                          heard=String("Tu peux danser ?"))
+    check(fails, dn.order == "Cdance" and dn.cmd_said == "Oui, regarde !" and len(dn.said) == 0,
+          "one event, the command, with the answer it was said with: " + dn.order + " / " + dn.cmd_said)
+    check(fails, dn.asked == "D" and dn.cancelled == 1 and dn.idle, "d1 dropped the same way: " + dn.asked)
+    check(fails, len(dn.notes) > 0 and dn.notes[0].find("runs dance") >= 0, "the log names the command")
+    var kd = run_computed(String("stand"), bank, 0)
+    check(fails, kd.order == "TttCstand" and kd.cancelled == 0, "`decides` left True: case 9's order, nothing dropped")
+
+    print("16. an addressed sentence d1 refuses: a reply (`reply_refused`)")
+    for on in range(2):
+        var rf = make_loop(0.7, bank)
+        rf.cfg.reply_refused = on == 1
+        rf.stt.text = String("Tu peux faire quoi ?")
+        rf.jev.script.append(first_answer(0.5))
+        rf.jev.script.append(refused_answer())
+        rf.state = VL_ST_STT
+        var rctx = G1Context()
+        var talked = 0
+        var refused_note = False
+        for _ in range(40):
+            var rev = rf.poll(rctx, bank)
+            if rev.kind == VL_TALK:
+                talked += 1
+            var rn = rf.take_note()
+            if rn.find("[refused] no clear pick") >= 0:
+                refused_note = True
+        if on == 1:
+            check(fails, refused_note and talked == 1 and rf.llm.asked == 1, "on: refused, then the model's reply, once")
+        else:
+            check(fails, refused_note and talked == 0 and rf.llm.asked == 0, "off: refused and silent, as before")
 
     print("ALL PASS" if fails == 0 else String(fails) + " FAILED")
     if fails != 0:

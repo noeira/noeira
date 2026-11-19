@@ -2,15 +2,24 @@
 # | Answers the robot computes — said as they are, the reply model not asked
 # +--------------------------------------------------------------------------+ #
 """A question whose answer the state holds EXACTLY is answered by code
-(docs/ROBOT_BRAIN_PLAN.md §16):
+(docs/ROBOT_BRAIN_PLAN.md §16, §17):
 
     ws.asked = heard                       # the utterance being answered
-    voice.set_reply_override(computed_reply(ws), computed_reply_final(ws))     # "" = the model replies
+    var ct = computed_turn(ws)             # ct.text "" = the model replies
+    voice.set_reply_override(ct.text, ct.final, ct.decides, ct.command)
 
-Two questions today:
+Four questions today:
 
 - who the speaker is (`noeira.brain.people.identity_answer`, B4);
-- whether the robot has finished what it was asked (`task_done_answer`).
+- whether the robot has finished what it was asked (`task_done_answer`);
+- what it can do (`capabilities_answer`, from `Body.skills`);
+- whether it can do one thing, or an order to do it (`can_turn`): a limit is a
+  no, a skill with a command is run (`ct.command`), and both SETTLE the turn
+  (`ct.decides` False: d1 is not asked further).
+
+And how long the model's own reply may be: `reply_sentences(ws)` (one
+sentence; two for a joke or a story), for the voice loop's
+`set_reply_sentences`, which stops the reply there.
 
 ⚠ WHY NOT THE REPLY MODEL. With "Your last task: walk to the table, then walk
 to the door. It is done." in its prompt, LFM3-1.7B answered « As-tu fini ce
@@ -27,7 +36,7 @@ before — rather than a confident sentence about the wrong request.
 from .bb1 import normalise, has_phrase
 from .events import EV_BEGAN, EV_TASK_DONE, EV_TASK_FAILED, EV_TASK_CANCELLED
 from .people import asks_identity, identity_answer
-from .state import WorldState, TASK_DONE, TASK_FAILED
+from .state import WorldState, Skill, TASK_DONE, TASK_FAILED
 
 
 def _plain(text: String) -> List[UInt8]:
@@ -143,9 +152,298 @@ def computed_reply_final(ref ws: WorldState) -> Bool:
 
 def computed_reply(ref ws: WorldState) -> String:
     """What to say to `ws.asked` when code holds the answer; "" = the reply
-    model answers. For `G1VoiceLoopOf.set_reply_override`, once a frame."""
+    model answers. For `G1VoiceLoopOf.set_reply_override`, once a frame.
+    `computed_turn` gives the same text with what the decision may still do."""
+    return computed_turn(ws).text
+
+
+# ── what the body can do (« Tu peux faire quoi ? », « Tu peux danser ? ») ──
+
+
+def _letter(c: UInt8) -> Bool:
+    return (c >= 97 and c <= 122) or (c >= 48 and c <= 57) or c >= 128
+
+
+def _starts(ref t: List[UInt8], at: Int, pat: List[UInt8]) -> Bool:
+    """`pat` at `at` in `t`, ending at a word's end."""
+    var m = len(pat)
+    if m == 0 or at + m > len(t):
+        return False
+    for k in range(m):
+        if t[at + k] != pat[k]:
+            return False
+    return not (_letter(pat[m - 1]) and at + m < len(t) and _letter(t[at + m]))
+
+
+def _head(ref t: List[UInt8], robot: String) -> Int:
+    """Where the sentence's own words begin: after a call (« Noé, », « hé »)
+    and a filler (« allez », « maintenant »), and the punctuation between."""
+    var fillers: List[String] = [
+        "hé", "hey", "eh", "allez", "alors", "bon", "ok", "okay", "d'accord", "maintenant", "now", "please",
+        "vas y", "s'il te plaît", "s'il te plait", "stp",
+    ]
+    var name = _plain(robot)
+    var i = 0
+    var moved = True
+    while moved:
+        while i < len(t) and (t[i] == 32 or t[i] == 44 or t[i] == 46 or t[i] == 33 or t[i] == 58):
+            i += 1
+        moved = False
+        if len(name) > 0 and _starts(t, i, name.copy()):
+            i += len(name)
+            moved = True
+            continue
+        for f in fillers:
+            var p = _plain(f)
+            if _starts(t, i, p.copy()):
+                i += len(p)
+                moved = True
+                break
+    return i
+
+
+def asks_capabilities(text: String) -> Bool:
+    """Whether a sentence asks the robot what it can do (French and English)."""
+    var t = _plain(text)
+    var forms: List[String] = [
+        "tu peux faire quoi", "tu sais faire quoi", "tu sais faire quelles choses", "qu'est-ce que tu sais faire",
+        "qu'est-ce que tu peux faire", "qu'est ce que tu sais faire", "qu'est ce que tu peux faire",
+        "que sais-tu faire", "que peux-tu faire", "que savez-vous faire", "que pouvez-vous faire",
+        "vous pouvez faire quoi", "vous savez faire quoi", "c'est quoi tes capacités", "quelles sont tes capacités",
+        "what can you do", "what are you able to do", "what do you know how to do", "what can you do for me",
+    ]
+    return _any(t, forms)
+
+
+def asks_can(text: String) -> Bool:
+    """Whether a sentence asks the robot whether it can do something: an
+    inverted form is a question by itself (« peux-tu », "can you"); a plain one
+    (« tu peux ») counts with a question mark or « est-ce que », as in
+    `asks_task_done`."""
+    var t = _plain(text)
+    var inverted: List[String] = [
+        "peux-tu", "pourrais-tu", "sais-tu", "pouvez-vous", "pourriez-vous", "savez-vous",
+        "can you", "could you", "are you able to",
+    ]
+    if _any(t, inverted):
+        return True
+    var plain: List[String] = ["tu peux", "tu pourrais", "tu sais", "vous pouvez", "vous pourriez", "vous savez", "tu es capable"]
+    if not _any(t, plain):
+        return False
+    var marks: List[String] = ["?", "est-ce que", "est-ce qu'"]
+    return _any(t, marks)
+
+
+def _named(ref t: List[UInt8], skills: List[Skill]) -> Tuple[Int, Int]:
+    """The skill a sentence names, by its longest matching form (« saut
+    périlleux » is the backflip, not « saut »): (index, form length), (-1, 0)."""
+    var best = -1
+    var best_n = 0
+    for i in range(len(skills)):
+        for f in skills[i].forms:
+            var p = _plain(f)
+            if len(p) > best_n and has_phrase(t, p):
+                best = i
+                best_n = len(p)
+    return (best, best_n)
+
+
+def _then_or_place(ref ws: WorldState, ref t: List[UInt8]) -> Bool:
+    """The sentence goes on to a place or a next step (« fais un squat puis va
+    à la porte »): the decision reads it, not a rule."""
+    var seq: List[String] = ["puis", "ensuite", "après", "et après", "then", "after that", "afterwards"]
+    if _any(t, seq):
+        return True
+    for w in ws.place_words:
+        var p = _plain(w.word)
+        if has_phrase(t, p):
+            return True
+    for pl in ws.places:
+        var p = _plain(pl.name)
+        if has_phrase(t, p):
+            return True
+    return False
+
+
+def _a_fr(word: String) -> String:
+    """« à » before a French place word: au frigo, à la porte, à l'étagère, aux toilettes."""
+    if word.startswith("le "):
+        return "au " + String(word[byte=3:])
+    if word.startswith("les "):
+        return "aux " + String(word[byte=4:])
+    return "à " + word
+
+
+def _list_fr(items: List[String], last: String) -> String:
+    var s = String("")
+    for i in range(len(items)):
+        if i > 0:
+            s += String(" ") + last + String(" ") if i == len(items) - 1 else String(", ")
+        s += items[i]
+    return s
+
+
+def capabilities_answer(ref ws: WorldState) -> String:
+    """« Je peux aller au frigo, à la porte…, tourner, faire un squat, lever les
+    bras, et des figures comme danser ou faire un salto. » from the body's
+    skills, in the conversation's language (French, else English).
+
+    ⚠ A TEMPLATE, LIKE `task_done_answer`. Asked « Tu peux faire quoi ? » in the
+    live room (2026-11-18), d1 refused it as « no clear pick » and nothing was
+    said; asked « Tu peux danser ? » of a body that dances, the reply model
+    answered « je suis un robot sans capacité de mouvement ».
+
+    ⚠ SHORT, BECAUSE THE ROBOT IS DEAF WHILE IT SPEAKS. Every skill listed was
+    14 s of speech on the SuperMimic body, and the replay lost the next two
+    sentences under it (the echo gate, round 42). The motions are named by two
+    examples; talking, which the person is doing, is not listed."""
+    var fr = ws.language == "fr"
+    var items = List[String]()
+    var motions = List[Int]()
+    for i in range(len(ws.body.skills)):
+        ref s = ws.body.skills[i]
+        if s.motion:
+            motions.append(i)
+        elif s.to_places and len(ws.places) > 0:
+            var ps = List[String]()
+            for p in ws.places:
+                ps.append(_a_fr(ws.word_for(p.name, String("fr"))) if fr else ws.word_for(p.name, ws.language))
+            items.append((String("aller ") if fr else String("walk to ")) + _list_fr(ps, String("ou") if fr else String("or")))
+        elif s.command == "" and not s.to_places and len(s.forms) == 0:
+            continue    # talking
+        elif fr:
+            items.append(s.fr)
+        else:
+            items.append(s.en.replace(" your ", " my "))
+    if len(motions) > 0:
+        # the two named: the first of these the body has, then its own order
+        var prefer: List[String] = ["dance", "backflip", "boxing", "jump", "wave", "dab", "stretch"]
+        var picked = List[Int]()
+        for want in prefer:
+            for i in motions:
+                if ws.body.skills[i].command == want and len(picked) < 2:
+                    picked.append(i)
+        for i in motions:
+            var seen = False
+            for k in picked:
+                if k == i:
+                    seen = True
+            if not seen and len(picked) < 2:
+                picked.append(i)
+        var shown = List[String]()
+        for i in picked:
+            shown.append(ws.body.skills[i].fr if fr else ws.body.skills[i].en)
+        if fr:
+            items.append(String("des figures comme ") + _list_fr(shown, String("ou")))
+        else:
+            items.append(String("moves such as: ") + _list_fr(shown, String("or")))
+    if len(items) == 0:
+        return String("")
+    if fr:
+        return "Je peux " + _list_fr(items, String("et")) + "."
+    return "I can " + _list_fr(items, String("and")) + "."
+
+
+struct ComputedTurn(Copyable, Movable):
+    """What code says to an utterance, and what the decision may still do
+    (`G1VoiceLoopOf.set_reply_override`)."""
+
+    var text: String
+    """The answer; "" = none (the reply model answers, the decision decides)."""
+    var final: Bool
+    """`computed_reply_final`."""
+    var decides: Bool
+    """False: the answer settles the turn and d1's requests are dropped (a
+    limit, the list of skills, a skill run by `command`)."""
+    var command: String
+    """What the body runs with the answer ("" = nothing)."""
+
+    def __init__(out self, var text: String, final: Bool = True, decides: Bool = True, var command: String = String("")):
+        self.text = text^
+        self.final = final
+        self.decides = decides
+        self.command = command^
+
+
+def can_turn(ref ws: WorldState) -> ComputedTurn:
+    """« Tu peux danser ? » / « Danse ! » / « Tu peux ouvrir la porte ? »: what
+    the body's skills say (`Body.skills`, `Body.limits`).
+
+    - asked whether it can, or told to, do a skill that has a `command`: done,
+      « Oui, regarde ! » / « D'accord ! », d1 not asked further;
+    - asked whether it can do a limit: « Non, je ne peux pas ouvrir la porte. »;
+    - anything else (a skill the decision runs — a place, a direction —, a
+      thing not in either list, a sentence that goes on to a place or a next
+      step): no answer, the decision and the reply model as before."""
+    var none = ComputedTurn(String(""))
+    var fr = ws.language == "fr"
+    var t = _plain(ws.asked)
+    var asking = asks_can(ws.asked)
+    var sk = _named(t, ws.body.skills)
+    var lm = _named(t, ws.body.limits)
+    if asking and lm[0] >= 0 and lm[1] > sk[1]:
+        var l = ws.body.limits[lm[0]].copy()
+        if fr:
+            return ComputedTurn("Non, je ne peux pas " + l.fr + ".", True, False)
+        return ComputedTurn("No, I cannot " + l.en + ".", True, False)
+    if sk[0] < 0 or ws.body.skills[sk[0]].command == "" or _then_or_place(ws, t):
+        return none^
+    var s = ws.body.skills[sk[0]].copy()
+    if asking:
+        return ComputedTurn(String("Oui, regarde !") if fr else String("Yes, watch!"), True, False, s.command)
+    # told to: the sentence's own first word names it (« Danse ! »), or « fais … » does (« Fais un dab. »)
+    var h = _head(t, ws.body.name)
+    var told = False
+    for f in s.forms:
+        if _starts(t, h, _plain(f)):
+            told = True
+    var dos: List[String] = ["fais", "fait", "refais", "do", "go"]
+    for d in dos:
+        if _starts(t, h, _plain(d)):
+            told = True
+    if told:
+        return ComputedTurn(String("D'accord !") if fr else String("Okay!"), True, False, s.command)
+    return none^
+
+
+comptime REPLY_SENTENCES: Int = 1
+"""Sentences a reply may say (`reply_sentences`): the robot is deaf while it
+speaks, and the replays lost the sentences said over its second one (§17.6)."""
+comptime REPLY_SENTENCES_MORE: Int = 2
+"""When the person asked for more than an answer: a joke is a question and its
+punchline. Three let LFM3 add « — Mais je ne suis pas sûr de ce qui est une
+bonne blague ici… », and « Il fait beau aujourd'hui », said over it, was
+heard as « Aujourd'hui. » (round 43)."""
+
+
+def asks_for_more(text: String) -> Bool:
+    """Whether a sentence asks for more than one sentence's answer: a joke, a
+    story, an explanation, a description (French and English)."""
+    var t = _plain(text)
+    var forms: List[String] = [
+        "raconte", "racontes", "racontez", "raconter", "blague", "blagues", "histoire", "histoires",
+        "explique", "expliques", "expliquez", "expliquer", "décris", "décrire", "décrivez",
+        "dis-m'en plus", "dites-m'en plus", "parle-moi de", "parlez-moi de", "en détail",
+        "tell me a", "tell me about", "tell me more", "joke", "jokes", "story", "stories", "explain", "describe",
+    ]
+    return _any(t, forms)
+
+
+def reply_sentences(ref ws: WorldState) -> Int:
+    """How many sentences the reply to `ws.asked` may say, for the voice loop's
+    `set_reply_sentences`: `REPLY_SENTENCES`, or `REPLY_SENTENCES_MORE` when
+    the person asked for more (`asks_for_more`)."""
+    return REPLY_SENTENCES_MORE if asks_for_more(ws.asked) else REPLY_SENTENCES
+
+
+def computed_turn(ref ws: WorldState) -> ComputedTurn:
+    """What code answers to `ws.asked`, and what the decision may still do;
+    `text` "" = nothing computed. In order: who the speaker is, whether the task
+    is finished, what the robot can do, whether it can do one thing."""
     if ws.people_on and asks_identity(ws.asked):
-        return identity_answer(ws)
+        return ComputedTurn(identity_answer(ws), computed_reply_final(ws))
     if asks_task_done(ws.asked):
-        return task_done_answer(ws)
-    return String("")
+        return ComputedTurn(task_done_answer(ws))
+    if asks_capabilities(ws.asked):
+        return ComputedTurn(capabilities_answer(ws), True, False)
+    return can_turn(ws)
