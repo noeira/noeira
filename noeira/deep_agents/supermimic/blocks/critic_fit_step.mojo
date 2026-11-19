@@ -20,7 +20,7 @@ from std.random import random_ui64
 from noeira.deep_agents.supermimic.config import SMConfigT, SMCriticOf
 from noeira.deep_agents.supermimic.imagination import SMImagBatch, SMImagOut
 from noeira.deep_agents.supermimic.kinematics import FP
-from noeira.deep_agents.supermimic.lanes import sm_critic_in, sm_gae, sm_mb_gather, sm_mse, talloc, tp
+from noeira.deep_agents.supermimic.lanes import sm_cap, sm_critic_in, sm_gae, sm_mb_gather, sm_mse, talloc, tp
 from noeira.deep_agents.supermimic.policy import SMValueNet
 from noeira.deep_agents.supermimic.robot import SMDims, TrackingRobot
 from noeira.nn.constants import DT
@@ -68,8 +68,11 @@ def sm_value_fit[target: StaticString, CIN: Int, C1: Int, C2: Int, N: Int, H: In
     mut values_out: List[Float64],
     mut targets_out: List[Float64],
     ctx: Optional[DeviceContext] = None,
+    v_max: Float64 = 0.0,
 ) raises -> SMCriticFit:
-    """The fit on prebuilt inputs `X` [(H+1)·N·CIN]: V on every imagined state,
+    """`v_max` > 0 caps V before the targets (the reward ceiling r_max / (1 − γ);
+    the targets then stay under it too, since r ≤ r_max).
+    The fit on prebuilt inputs `X` [(H+1)·N·CIN]: V on every imagined state,
     the TD(λ) targets of `rewards` [H·N] and `dhat` [(H+1)·N], 5 epochs × 4
     minibatches. `values_out` / `targets_out` receive the (H+1)·N values and
     H·N targets."""
@@ -78,6 +81,8 @@ def sm_value_fit[target: StaticString, CIN: Int, C1: Int, C2: Int, N: Int, H: In
     comptime assert ROWS % SM_CRITIC_MB == 0, "H·N must split into the critic's 4 minibatches"
     var values = talloc[target]((H + 1) * N, ctx)
     critic.forward[target, (H + 1) * N](TensorRefs[1, _, DT](X), values, ctx)
+    if v_max > 0.0:
+        sm_cap[target](ctx, (H + 1) * N, tp[target](values), Scalar[DT](v_max))
     var targets = talloc[target](ROWS, ctx)
     sm_gae[target](ctx, N, H, Scalar[DT](gamma), Scalar[DT](SM_GAE_LAMBDA), tp[target](values), rewards, dhat, tp[target](targets))
     # the fit, rows t < H
@@ -161,9 +166,10 @@ struct CriticFitStep[C: SMConfigT](Movable):
         mut values_out: List[Float64],
         mut targets_out: List[Float64],
         ctx: Optional[DeviceContext] = None,
+        v_max: Float64 = 0.0,
     ) raises -> SMCriticFit:
         """`values_out` / `targets_out` receive V on the (H+1)·N states and the
-        H·N targets."""
+        H·N targets; `v_max` as in `sm_value_fit`."""
         comptime if target == "gpu":
             if not self.adopted:
                 self.opt.adopt[target](critic, ctx)
@@ -174,5 +180,5 @@ struct CriticFitStep[C: SMConfigT](Movable):
         var X = talloc[target]((H + 1) * N * CIN, ctx)
         sm_critic_in[target, R](ctx, (H + 1) * N, N, tp[target](o.states), tp[target](ib.goals), tp[target](ib.xi), tp[target](o.e_root), tp[target](X))
         return sm_value_fit[target, CIN, Self.C.CRIT1, Self.C.CRIT2, N, H](
-            critic, self.opt, X, tp[target](o.rewards), tp[target](o.dhat), gamma, perms, values_out, targets_out, ctx
+            critic, self.opt, X, tp[target](o.rewards), tp[target](o.dhat), gamma, perms, values_out, targets_out, ctx, v_max
         )

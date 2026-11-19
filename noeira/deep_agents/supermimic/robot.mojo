@@ -48,7 +48,7 @@ from noeira.envs.robots.unitree_g1_mjlab_box import UnitreeG1MjlabBox
 from noeira.envs.robots.unitree_g1_mjlab_box_xml import G1M_BOX_QPOS, G1M_BOX_QVEL, UnitreeG1MjlabBoxModel
 from noeira.envs.robots.unitree_g1_mjlab_config import UnitreeG1MjlabConfig
 from noeira.envs.robots.unitree_g1_mjlab_xml import UnitreeG1MjlabModel
-from noeira.envs.robots.unitree_g1_mjlab_pd import G1M_N_DOF, g1m_action_scale, g1m_default_pos
+from noeira.envs.robots.unitree_g1_mjlab_pd import G1M_N_DOF, g1m_action_scale, g1m_default_pos, g1m_dof_name
 from noeira.envs.robots.berkeley_humanoid_lite import BerkeleyHumanoidLite, BerkeleyHumanoidLiteBatchedDR
 from noeira.envs.robots.berkeley_humanoid_lite_pd import (
     BHL_ACTION_SCALE, BHL_N_DOF, BHL_SOFT_LIMIT_FACTOR, bhl_default_pos,
@@ -254,6 +254,21 @@ trait TrackingRobot:
     @staticmethod
     def default_joint_pos(j: Int) -> Float64:
         ...
+
+    @staticmethod
+    def action_scale(j: Int) -> Float64:
+        """Radians of PD target per unit of action on joint j (`target = q0 +
+        scale·a − bias`). The reference skip (`SuperMimicTrainer.set_ref_skip`)
+        needs it; 0 = not declared for this robot, and the skip refuses."""
+        return 0.0
+
+    @staticmethod
+    def joint_name(j: Int) -> String:
+        """Actuated joint j's name. The left-right mirror of the world-model
+        batches (`SuperMimicTrainer.set_mirror`) pairs `left_` with `right_`
+        joints and flips `_roll_` and `_yaw_` ones by it; "" = not declared
+        for this robot, and the mirror refuses."""
+        return String("")
 
     @staticmethod
     def soft_limit_factor() -> Float64:
@@ -766,6 +781,14 @@ struct G1MjlabRobot(TrackingRobot):
         return g1m_default_pos(j)
 
     @staticmethod
+    def action_scale(j: Int) -> Float64:
+        return g1m_action_scale(j)
+
+    @staticmethod
+    def joint_name(j: Int) -> String:
+        return String(g1m_dof_name(j))
+
+    @staticmethod
     def soft_limit_factor() -> Float64:
         return 0.9
 
@@ -921,6 +944,14 @@ struct G1MjlabBoxRobot(TrackingRobot):
     @staticmethod
     def default_joint_pos(j: Int) -> Float64:
         return g1m_default_pos(j)
+
+    @staticmethod
+    def action_scale(j: Int) -> Float64:
+        return g1m_action_scale(j)
+
+    @staticmethod
+    def joint_name(j: Int) -> String:
+        return String(g1m_dof_name(j))
 
     @staticmethod
     def soft_limit_factor() -> Float64:
@@ -1151,6 +1182,10 @@ struct BhlRobot(TrackingRobot):
     @staticmethod
     def default_joint_pos(j: Int) -> Float64:
         return bhl_default_pos(j)
+
+    @staticmethod
+    def action_scale(j: Int) -> Float64:
+        return BHL_ACTION_SCALE
 
     @staticmethod
     def soft_limit_factor() -> Float64:

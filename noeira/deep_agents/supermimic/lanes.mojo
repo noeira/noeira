@@ -877,3 +877,218 @@ def sm_mse[target: StaticString](ctx: Optional[DeviceContext], mb: Int, pred: FP
     else:
         for i in range(mb):
             _mse_lane(i, mb, pred, y, g, sq)
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# The reference skip (InstantTrack's `--ref_residual 1`, BlinkMimic's
+# `--pi_ref_skip`): the decoder's output is a correction to the action that
+# commands the step's target pose
+# ════════════════════════════════════════════════════════════════════════════
+@always_inline
+def _ref_skip_lane[R: TrackingRobot](b: Int, goals: FP[DT], k: FP[DT], act: FP[DT]):
+    """act[b] += (q_ref − q0) / scale. The goal window's first frame is the
+    step's target frame and starts with q_ref − q0 (`sm_goal_features_lane`);
+    `k` holds 1 / scale per joint."""
+    comptime n = R.NDOF
+    comptime G = SMDims[R].GOAL
+    for j in range(n):
+        act[unsafe_offset=b * n + j] += goals[unsafe_offset=b * G + j] * k[unsafe_offset=j]
+
+
+def _k_ref_skip[R: TrackingRobot](nb: Int64, goals: FP[DT], k: FP[DT], act: FP[DT]):
+    var b = Int(global_idx.x)
+    if b < Int(nb):
+        _ref_skip_lane[R](b, goals, k, act)
+
+
+def sm_ref_skip[target: StaticString, R: TrackingRobot](
+    ctx: Optional[DeviceContext], nb: Int, goals: FP[DT], k: FP[DT], act: FP[DT]
+) raises:
+    """`act` [nb·n] += the action that commands each lane's target pose, read
+    from its RAW goal window `goals` [nb·GOAL] (before `sm_enc_in`'s scale).
+    The skip is data: no gradient flows through it, so the policy's reverse
+    pass is unchanged."""
+    comptime if target == "gpu":
+        ctx.value().enqueue_function[_k_ref_skip[R]](Int64(nb), goals, k, act, grid_dim=_grid(nb), block_dim=SM_TPB)
+    else:
+        for b in range(nb):
+            _ref_skip_lane[R](b, goals, k, act)
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Analytic termination in imagination (the official code's 98ee3ec): the real
+# thresholds through a sigmoid, in place of the learned head's logit
+# ════════════════════════════════════════════════════════════════════════════
+comptime SM_TERM_SOFT: Float64 = 0.05
+"""The sigmoid's width, in units of the thresholds (the official code's
+`termination softness`): d̂ = 0.5 exactly on a threshold, 0.27 at 95 % of it."""
+
+
+@always_inline
+def _term_analytic_lane(b: Int, tin: FP[DT], lg: FP[DT]):
+    """logit = (max(|e_h| / thr_h, |e_tilt| / thr_tilt) − 1) / softness; the two
+    ratios' absolute values are the termination input's entries 2 and 3."""
+    lg[unsafe_offset=b] = (max(tin[unsafe_offset=b * 4 + 2], tin[unsafe_offset=b * 4 + 3]) - 1) / Scalar[DT](SM_TERM_SOFT)
+
+
+def _k_term_analytic(nb: Int64, tin: FP[DT], lg: FP[DT]):
+    var b = Int(global_idx.x)
+    if b < Int(nb):
+        _term_analytic_lane(b, tin, lg)
+
+
+def sm_term_analytic[target: StaticString](ctx: Optional[DeviceContext], nb: Int, tin: FP[DT], lg: FP[DT]) raises:
+    """The termination logit of `nb` lanes from their termination inputs
+    `tin` [nb·4] (`_imag_step_lane`), without the learned head."""
+    comptime if target == "gpu":
+        ctx.value().enqueue_function[_k_term_analytic](Int64(nb), tin, lg, grid_dim=_grid(nb), block_dim=SM_TPB)
+    else:
+        for b in range(nb):
+            _term_analytic_lane(b, tin, lg)
+
+
+@always_inline
+def _term_analytic_back_lane(b: Int, tin: FP[DT], glg: FP[DT], gtin: FP[DT]):
+    """gtin[b] = ∂/∂tin of glg[b]·logit: the larger ratio takes it all."""
+    var g = glg[unsafe_offset=b] / Scalar[DT](SM_TERM_SOFT)
+    var first = tin[unsafe_offset=b * 4 + 2] >= tin[unsafe_offset=b * 4 + 3]
+    gtin[unsafe_offset=b * 4 + 0] = 0
+    gtin[unsafe_offset=b * 4 + 1] = 0
+    gtin[unsafe_offset=b * 4 + 2] = g if first else Scalar[DT](0)
+    gtin[unsafe_offset=b * 4 + 3] = Scalar[DT](0) if first else g
+
+
+def _k_term_analytic_back(nb: Int64, tin: FP[DT], glg: FP[DT], gtin: FP[DT]):
+    var b = Int(global_idx.x)
+    if b < Int(nb):
+        _term_analytic_back_lane(b, tin, glg, gtin)
+
+
+def sm_term_analytic_back[target: StaticString](ctx: Optional[DeviceContext], nb: Int, tin: FP[DT], glg: FP[DT], gtin: FP[DT]) raises:
+    comptime if target == "gpu":
+        ctx.value().enqueue_function[_k_term_analytic_back](Int64(nb), tin, glg, gtin, grid_dim=_grid(nb), block_dim=SM_TPB)
+    else:
+        for b in range(nb):
+            _term_analytic_back_lane(b, tin, glg, gtin)
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# The value ceiling (the official code's 133c0f0): V ≤ r_max / (1 − γ)
+# ════════════════════════════════════════════════════════════════════════════
+def _k_cap(n: Int64, p: FP[DT], c: Scalar[DT]):
+    var i = Int(global_idx.x)
+    if i < Int(n):
+        p[unsafe_offset=i] = min(p[unsafe_offset=i], c)
+
+
+def sm_cap[target: StaticString](ctx: Optional[DeviceContext], n: Int, p: FP[DT], c: Scalar[DT]) raises:
+    """p[0:n] = min(p, c), in place."""
+    comptime if target == "gpu":
+        ctx.value().enqueue_function[_k_cap](Int64(n), p, c, grid_dim=_grid(n), block_dim=SM_TPB)
+    else:
+        for i in range(n):
+            p[unsafe_offset=i] = min(p[unsafe_offset=i], c)
+
+
+def _k_cap_back(n: Int64, p: FP[DT], c: Scalar[DT], g: FP[DT]):
+    var i = Int(global_idx.x)
+    if i < Int(n):
+        if p[unsafe_offset=i] >= c:
+            g[unsafe_offset=i] = 0
+
+
+def sm_cap_back[target: StaticString](ctx: Optional[DeviceContext], n: Int, p: FP[DT], c: Scalar[DT], g: FP[DT]) raises:
+    """g[i] = 0 where the CAPPED p[i] sits on the ceiling c: no gradient
+    reaches a value the cap replaced."""
+    comptime if target == "gpu":
+        ctx.value().enqueue_function[_k_cap_back](Int64(n), p, c, g, grid_dim=_grid(n), block_dim=SM_TPB)
+    else:
+        for i in range(n):
+            if p[unsafe_offset=i] >= c:
+                g[unsafe_offset=i] = 0
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# The left-right mirror of world-model windows (BlinkMimic's `--wm_mirror`):
+# the reflection y → −y of a transition is a transition of the same robot
+# ════════════════════════════════════════════════════════════════════════════
+@always_inline
+def _mirror_joints[R: TrackingRobot](x: FP[DT], tab: FP[DT]):
+    """x[j] ← sign_j · x[partner(j)], in place. `tab` = [partner n, sign n];
+    partners form pairs (or a joint is its own), with one sign per pair."""
+    comptime n = R.NDOF
+    for j in range(n):
+        var pj = Int(tab[unsafe_offset=j])
+        var sg = tab[unsafe_offset=n + j]
+        if pj > j:
+            var a = x[unsafe_offset=j]
+            x[unsafe_offset=j] = sg * x[unsafe_offset=pj]
+            x[unsafe_offset=pj] = sg * a
+        elif pj == j:
+            x[unsafe_offset=j] = sg * x[unsafe_offset=j]
+
+
+@always_inline
+def _mirror_root(r: FP[DT]):
+    """A root pose [p 3, q WXYZ 4] reflected in the world's xz plane:
+    p_y ← −p_y; a rotation of θ about n becomes one of θ about (−n_x, n_y, −n_z)."""
+    r[unsafe_offset=1] = -r[unsafe_offset=1]
+    r[unsafe_offset=4] = -r[unsafe_offset=4]
+    r[unsafe_offset=6] = -r[unsafe_offset=6]
+
+
+@always_inline
+def _mirror_state[R: TrackingRobot](s: FP[DT], tab: FP[DT]):
+    """A state [p 3, q 4, qj n, v 3 (world), w 3 (body), qd n], reflected:
+    the linear velocity as a vector, the angular one as a pseudo-vector (the
+    same rule in the body frame, which is reflected with the body)."""
+    comptime NQ = R.NQ
+    _mirror_root(s)
+    _mirror_joints[R](s.unsafe_offset(7), tab)
+    s[unsafe_offset=NQ + 1] = -s[unsafe_offset=NQ + 1]
+    s[unsafe_offset=NQ + 3] = -s[unsafe_offset=NQ + 3]
+    s[unsafe_offset=NQ + 5] = -s[unsafe_offset=NQ + 5]
+    _mirror_joints[R](s.unsafe_offset(NQ + 6), tab)
+
+
+@always_inline
+def _mirror_window_lane[R: TrackingRobot](
+    l: Int, k: Int, nb: Int, states: FP[DT], a_exec: FP[DT], xi: FP[DT], ref_root: FP[DT], tab: FP[DT],
+):
+    """Lane l of a k-step window batch of nb lanes, reflected in place."""
+    comptime D = SMDims[R]
+    comptime n = R.NDOF
+    for t in range(k + 1):
+        _mirror_state[R](states.unsafe_offset((t * nb + l) * D.S), tab)
+    for t in range(k):
+        _mirror_joints[R](a_exec.unsafe_offset((t * nb + l) * n), tab)
+        _mirror_root(ref_root.unsafe_offset((t * nb + l) * 7))
+    # the sim context [friction 1, encoder bias n, CoM offset 3]: the biases as joints, the CoM's y
+    _mirror_joints[R](xi.unsafe_offset(l * D.X + 1), tab)
+    xi[unsafe_offset=l * D.X + 1 + n + 1] = -xi[unsafe_offset=l * D.X + 1 + n + 1]
+
+
+def _k_mirror_windows[R: TrackingRobot](
+    nm: Int64, k: Int64, nb: Int64, states: FP[DT], a_exec: FP[DT], xi: FP[DT], ref_root: FP[DT], tab: FP[DT],
+):
+    var l = Int(global_idx.x)
+    if l < Int(nm):
+        _mirror_window_lane[R](l, Int(k), Int(nb), states, a_exec, xi, ref_root, tab)
+
+
+def sm_mirror_windows[target: StaticString, R: TrackingRobot](
+    ctx: Optional[DeviceContext], nm: Int, k: Int, nb: Int,
+    states: FP[DT], a_exec: FP[DT], xi: FP[DT], ref_root: FP[DT], tab: FP[DT],
+) raises:
+    """The first `nm` lanes of a k-step window batch of `nb` lanes replaced
+    by their left-right mirror image, in place: states [(k+1)·nb·S], executed
+    actions [k·nb·n], sim context [nb·X], reference roots [k·nb·7]. `tab` is
+    the robot's joint mirror table [partner n, sign n]
+    (`SuperMimicTrainer.set_mirror`). The termination labels need no change."""
+    comptime if target == "gpu":
+        ctx.value().enqueue_function[_k_mirror_windows[R]](
+            Int64(nm), Int64(k), Int64(nb), states, a_exec, xi, ref_root, tab, grid_dim=_grid(nm), block_dim=SM_TPB,
+        )
+    else:
+        for l in range(nm):
+            _mirror_window_lane[R](l, k, nb, states, a_exec, xi, ref_root, tab)

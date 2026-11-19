@@ -35,6 +35,7 @@ EMA in float32 (its `bin_return` is a float32 tensor), ~1e-7 apart.
 
 from std.builtin.sort import sort
 from std.math import ceil, exp, log
+from std.random import random_float64
 
 from max.gpu.host import DeviceBuffer, DeviceContext
 
@@ -471,6 +472,22 @@ struct SMResetSampler(Movable):
         var f = lib.bin_start[b] + Int(u * Float64(lib.bin_end[b] - lib.bin_start[b]))
         f = min(f, lib.last_frame_of(f) - 2)
         return max(f, lib.clip_start[lib.frame_clip[f]])
+
+    def reset_frame[R: TrackingRobot](
+        mut self, lib: SMMotionLibrary[R], cdf: List[Float64], acc: Float64, queued: Int
+    ) -> Int:
+        """A lane's reset frame, the ONE rule both envs apply. `queued` ≥ 0 (an
+        evaluation's clip queue, the envs' `next_frame`) is that frame and
+        draws NOTHING from the host's random stream: an evaluation running
+        beside a training run (the in-run benchmark) leaves the run's stream
+        where it found it, so how often it runs cannot change the run.
+        Otherwise a bin from `cdf` (the cumulated `probabilities()`, total
+        `acc`), counted, and a frame inside it: two draws."""
+        if queued >= 0:
+            return queued
+        var b = Self.bin_from_cdf(cdf, random_float64(0.0, acc))
+        self.note_draw(b)
+        return Self.frame_from[R](lib, b, random_float64(0.0, 1.0))
 
     def finalize(mut self, episodes: List[SMEpisodeLog]):
         """Fold a batch of finished episodes (all those reset at one step) into

@@ -16,6 +16,14 @@ optimiser and reductions agree there.
   [6] the checkpoint across targets: a GPU trainer's file loaded into a
       fresh CPU trainer (and a CPU file into a fresh GPU trainer) restores
       every weight bit-identically and the loop's counters
+  [7] the fast-training options (`fast.mojo`): two policy updates with the
+      averaged policy, the analytic termination, the value ceiling and Muon on
+      (and, on mjlab's G1, the reference skip): the policy's step agrees
+      with the CPU's, the average's first step is a copy on both targets,
+      its second step satisfies its identity, the deployed policy's actions
+      agree, and the device average is not the device's live policy; on
+      mjlab's G1 the device's left-right mirror of a window batch is the
+      host's, to the bit
 
 Vectors compare by cosine >= 0.99999 and max err <= 1e-4 of the largest.
 
@@ -30,6 +38,7 @@ from max.gpu.host import DeviceContext
 from noeira.deep_agents.supermimic.blocks import sm_random_perm
 from noeira.deep_agents.supermimic.config import SMConfig
 from noeira.deep_agents.supermimic.imagination import SMImagBatch, sm_imagine
+from noeira.deep_agents.supermimic.lanes import sm_mirror_windows, tp
 from noeira.deep_agents.supermimic.params import sm_restore, sm_snapshot
 from std.sys import get_defined_int
 
@@ -429,6 +438,128 @@ def test_checkpoint(ctx: DeviceContext, mut tl: Tally) raises:
     tl.check(bad2 == 0 and cg[0] == 7 and cg[1] == 3, "CPU file -> GPU trainer: " + String(bad2) + " mismatching weights, counters " + String(cg[0]) + " / " + String(cg[1]))
 
 
+def test_fast(ctx: DeviceContext, mut tl: Tally) raises:
+    print("[7] the fast-training options: the averaged policy, the analytic termination, the value ceiling" + (String(", the reference skip") if TEST_MJLAB else String("")))
+    var tc = _cpu_trainer()
+    var tg = _gpu_twin(tc, ctx)
+    tc.set_ema(0.9)
+    tg.set_ema(0.9)
+    comptime if TEST_MJLAB:          # BFM-Zero's G1 declares no action scale
+        tc.set_ref_skip(True)
+        tg.set_ref_skip(True)
+    tc.analytic_term = True
+    tg.analytic_term = True
+    tc.v_max = 1e-3                  # every lane whose V(s_H) is positive is capped
+    tg.v_max = 1e-3
+    tc.set_muon(True)                # the device's Muon: cuBLAS on NVIDIA, the host fallback elsewhere
+    tg.set_muon(True)
+    var p0 = sm_snapshot["cpu"](tc.pol, None)
+    seed(17)
+    var ib = _imag_batch()
+    var perms = List[Int]()
+    for _ in range(5):
+        var q = sm_random_perm(HZ * NB)
+        for i in range(len(q)):
+            perms.append(q[i])
+    var vc = List[Float64]()
+    var rc = List[Float64]()
+    var vg = List[Float64]()
+    var rg = List[Float64]()
+    _ = tc.policy_update[NB](ib, perms, vc, rc)
+    _ = tg.policy_update[NB](ib, perms, vg, rg)
+    _compare_steps("policy step with the options on", _delta(p0, sm_snapshot["cpu"](tc.pol, None)), _delta(p0, sm_snapshot["gpu"](tg.pol, ctx)), tl)
+    var top = 0.0
+    for i in range(len(vg)):
+        top = max(top, vg[i])
+    tl.check(top <= 1e-3 * (1.0 + 1e-6) and top > 0.0, "the device critic's values sit under the ceiling, some on it (largest " + String(top) + ")")
+    # the averages both start at zero, so their agreement alone would prove nothing: each must BE its live policy
+    var avg1 = sm_snapshot["gpu"](tg.pol_avg, ctx)
+    _compare("the average after one update (a copy of the live policy)", sm_snapshot["cpu"](tc.pol_avg, None), avg1, tl)
+    tl.check(
+        _same(avg1, sm_snapshot["gpu"](tg.pol, ctx)) == 0 and _same(sm_snapshot["cpu"](tc.pol_avg, None), sm_snapshot["cpu"](tc.pol, None)) == 0,
+        "after the first update each average is its live policy, bit for bit",
+    )
+    tl.check(_same(avg1, p0) > 0, "and no longer what the policy was before the update (the copy happened after it)")
+    var mc = tc.policy_update[NB](ib, perms, vc, rc)
+    var mg = tg.policy_update[NB](ib, perms, vg, rg)
+    _close("objective of the second update", mc.imag_objective, mg.imag_objective, 1e-5, tl)
+    # the device's own identity avg2 = 0.9 avg1 + 0.1 live2. (Not a CPU-vs-GPU step comparison: the average moves by
+    # ~2e-5 on weights of ~0.3, a few float32 ulps, so the two targets' steps agree only to ~3e-3 of the move.)
+    var avg2 = sm_snapshot["gpu"](tg.pol_avg, ctx)
+    var live2 = sm_snapshot["gpu"](tg.pol, ctx)
+    var mix_err = 0.0
+    var moved = 0.0
+    for i in range(len(avg2)):
+        for k in range(len(avg2[i])):
+            var want = 0.9 * Float64(avg1[i][k]) + 0.1 * Float64(live2[i][k])
+            mix_err = max(mix_err, abs(Float64(avg2[i][k]) - want))
+            moved = max(moved, abs(Float64(live2[i][k]) - Float64(avg1[i][k])))
+    tl.check(
+        mix_err <= 0.02 * 0.1 * moved,
+        "the device average's second step is 0.9 x average + 0.1 x live: worst " + String(mix_err) + " against a step of " + String(0.1 * moved),
+    )
+    tl.check(_same(sm_snapshot["gpu"](tg.pol_avg, ctx), sm_snapshot["gpu"](tg.pol, ctx)) > 0, "the device average is not the device's live policy")
+    comptime L = 8
+    var hist = TensorImpl[DT].alloc(L * D.HIST * D.OBS)
+    var goals = TensorImpl[DT].alloc(L * D.GOAL)
+    for i in range(hist.n):
+        hist.data[i] = _u(-1, 1)
+    for i in range(goals.n):
+        goals.data[i] = _u(-1, 1)
+    var ac = tc.act[L](hist, goals, deployed=True)
+    var ag = tg.act[L](hist, goals, deployed=True)
+    _vec("the deployed policy's actions", _tv(ac), _tv(ag), tl)
+    var al = tg.act[L](hist, goals)
+    var differ = False
+    for i in range(ag.n):
+        if ag.data[i] != al.data[i]:
+            differ = True
+    tl.check(differ, "on the device, act(deployed) is not act")
+    comptime if TEST_MJLAB:          # the mirror needs the robot's joint names
+        # the left-right mirror of a window batch: the device kernel against the host loop, to the bit
+        tg.set_mirror(0.5)
+        comptime MK = 3
+        comptime MB = 6
+        var w = SMWindowBatch[R](MK, MB)
+        var h = SMWindowBatch[R](MK, MB)
+        for i in range(w.states.n):
+            w.states.data[i] = _u(-1, 1)
+            h.states.data[i] = w.states.data[i]
+        for i in range(w.a_exec.n):
+            w.a_exec.data[i] = _u(-1, 1)
+            h.a_exec.data[i] = w.a_exec.data[i]
+        for i in range(w.xi.n):
+            w.xi.data[i] = _u(-1, 1)
+            h.xi.data[i] = w.xi.data[i]
+        for i in range(w.ref_root.n):
+            w.ref_root.data[i] = _u(-1, 1)
+            h.ref_root.data[i] = w.ref_root.data[i]
+        w.to_device(ctx)
+        sm_mirror_windows["gpu", R](
+            Optional(ctx), 4, MK, MB, tp["gpu"](w.states), tp["gpu"](w.a_exec), tp["gpu"](w.xi), tp["gpu"](w.ref_root), tp["gpu"](tg.mirror_tab),
+        )
+        sm_mirror_windows["cpu", R](
+            None, 4, MK, MB, tp["cpu"](h.states), tp["cpu"](h.a_exec), tp["cpu"](h.xi), tp["cpu"](h.ref_root), tp["cpu"](tg.mirror_tab),
+        )
+        w.states.download(ctx)
+        w.a_exec.download(ctx)
+        w.xi.download(ctx)
+        w.ref_root.download(ctx)
+        var bad = 0
+        var moved = 0
+        for i in range(w.states.n):
+            bad += 0 if w.states.data[i] == h.states.data[i] else 1
+        for i in range(w.a_exec.n):
+            bad += 0 if w.a_exec.data[i] == h.a_exec.data[i] else 1
+        for i in range(w.xi.n):
+            bad += 0 if w.xi.data[i] == h.xi.data[i] else 1
+        for i in range(w.ref_root.n):
+            bad += 0 if w.ref_root.data[i] == h.ref_root.data[i] else 1
+        for i in range(MB * D.S):
+            moved += 1 if h.states.data[i] < 0.0 else 0      # a mirrored batch is not degenerate: it keeps both signs
+        tl.check(bad == 0 and moved > 0, "the device mirrors 4 of 6 windows as the host does: " + String(bad) + " mismatching entries")
+
+
 def main() raises:
     var ctx = DeviceContext()
     var tl = Tally()
@@ -438,6 +569,7 @@ def main() raises:
     test_wm_update(ctx, tl)
     test_act(ctx, tl)
     test_checkpoint(ctx, tl)
+    test_fast(ctx, tl)
     print("\n===", tl.ok, "/", tl.total, "passed ===")
     if tl.ok != tl.total:
         raise Error("test_supermimic_gpu: " + String(tl.total - tl.ok) + " failed")

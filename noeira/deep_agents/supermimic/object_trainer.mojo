@@ -115,7 +115,10 @@ struct SMObjTrainer[OC: SMObjConfigT](Movable):
         """`hist` [L · 10 · OBS], `goals` [L · GOAL], the robot's states `s`
         [L · S], the object's `o` [L · 13] and its reference rows `oref`
         [L · 19] → actions [L · n]. `resident`: inputs and actions stay on the
-        device."""
+        device. Refuses a tracker trained with the reference skip
+        (`SuperMimicTrainer.require_no_ref_skip`): neither this nor the
+        object's imagined rollout adds it."""
+        self.base.require_no_ref_skip(String("SMObjTrainer"))
         comptime T = Self.OC.BASE.TARGET
         comptime R = Self.OC.BASE.ROBOT
         comptime D = SMDims[R]
@@ -171,6 +174,7 @@ struct SMObjTrainer[OC: SMObjConfigT](Movable):
     ) raises -> SMObjUpdate:
         """The object encoder's step on one rollout, then the critic's fit on
         it. `terms`: also return the object's three reward terms (a download)."""
+        self.base.require_no_ref_skip(String("SMObjTrainer"))
         comptime T = Self.OC.BASE.TARGET
         comptime H = Self.OC.BASE.HORIZON
         if ib.base.h != H:

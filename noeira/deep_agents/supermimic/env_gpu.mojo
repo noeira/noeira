@@ -385,10 +385,13 @@ struct SMTrackingEnvGpu[R: TrackingRobot, BS: TrackingBatchedSim](Movable):
         out self, ctx: DeviceContext, var lib: SMMotionLibrary[Self.R], var sim: Self.BS,
         dr: Bool = True, obs_noise: Bool = True, reset_noise: Bool = True,
         action_noise: Float64 = SM_ACTION_NOISE, friction_period: Int = SM_EPISODE_STEPS, rng_seed: Int = 0,
-        max_episode_steps: Int = SM_EPISODE_STEPS,
+        max_episode_steps: Int = SM_EPISODE_STEPS, queued: Bool = False,
     ) raises:
         """`tables` must be built from a CPU lane of the same robot (the model
-        records); `sim` is the batched simulator, already created."""
+        records); `sim` is the batched simulator, already created. `queued`:
+        an evaluation's env, whose lanes start on frame 0 until `restart`
+        gives them their clips, so that building it draws nothing from the
+        host's random stream (`SMResetSampler.reset_frame`)."""
         comptime D = SMDims[Self.R]
         comptime n = Self.R.NDOF
         comptime NL = Self.BS.N
@@ -433,7 +436,7 @@ struct SMTrackingEnvGpu[R: TrackingRobot, BS: TrackingBatchedSim](Movable):
         self.reset_f = ctx.enqueue_create_buffer[DType.int32](NL)
         self.h_out_i = List[Int32](length=NL * 2, fill=0)
         self.max_episode_steps = max_episode_steps
-        self.next_frame = List[Int](length=NL, fill=-1)
+        self.next_frame = List[Int](length=NL, fill=0 if queued else -1)
         self.out_terms = talloc["gpu"](NL * SM_N_TERMS, ctx)
         self.prompt_from = NL
         self.prompt_r = talloc["gpu"](NL, ctx)
@@ -567,12 +570,7 @@ struct SMTrackingEnvGpu[R: TrackingRobot, BS: TrackingBatchedSim](Movable):
             acc += p[b]
             cdf[b] = acc
         for l in lanes:
-            var x = random_float64(0.0, acc)
-            var b = SMResetSampler.bin_from_cdf(cdf, x)
-            self.sampler.note_draw(b)
-            var f = SMResetSampler.frame_from[Self.R](self.lib, b, random_float64(0.0, 1.0))
-            if self.next_frame[l] >= 0:      # the evaluation's clip queue
-                f = self.next_frame[l]
+            var f = self.sampler.reset_frame[Self.R](self.lib, cdf, acc, self.next_frame[l])   # a queued frame draws nothing
             hf[l] = Int32(f)
             hm[l] = 1
             self.logs[l] = SMEpisodeLog()

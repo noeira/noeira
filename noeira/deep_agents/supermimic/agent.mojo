@@ -29,6 +29,7 @@ from noeira.io.artifact_sink import ArtifactSink
 from noeira.deep_agents.data import EpisodicReplay
 from noeira.deep_agents.supermimic.config import SMConfigT
 from noeira.deep_agents.supermimic.env import SMReplayOf, SMTrackingEnv
+from noeira.deep_agents.supermimic.fast import SMFastOpts, SMFastState
 from noeira.deep_agents.supermimic.heads import sm_observation_lane
 from noeira.deep_agents.supermimic.imagination import SMImagBatch
 from noeira.deep_agents.supermimic.metrics import SMIterInfo, SMTrainLog, sm_tick
@@ -99,6 +100,7 @@ struct SuperMimicAgent[C: SMConfigT](Movable):
     var restart_at: Int               # a warm restart of the lr from this iteration (-1: none)
     var restart_ratio: Float64
     var restart_decay: Int
+    var fast: SMFastState             # the fast-training options and their schedule (`set_fast`); off by default
 
     def __init__(
         out self, var lib: SMMotionLibrary[Self.C.ROBOT], var sched: SMSchedule, ctx: Optional[DeviceContext] = None
@@ -129,6 +131,7 @@ struct SuperMimicAgent[C: SMConfigT](Movable):
         self.t_pi = 0.0
         self.lr = self.sched.lr
         self.last_avg_reward = 0.0
+        self.fast = SMFastState(SMFastOpts.off())
 
     def __init__(out self, *, deinit move: Self):
         self.env = move.env^
@@ -151,6 +154,7 @@ struct SuperMimicAgent[C: SMConfigT](Movable):
         self.restart_at = move.restart_at
         self.restart_ratio = move.restart_ratio
         self.restart_decay = move.restart_decay
+        self.fast = move.fast.copy()
 
     # ── data plumbing: replay → the trainer's batches ──
     def window_batch(mut self) raises -> SMWindowBatch[Self.C.ROBOT]:
@@ -226,6 +230,7 @@ struct SuperMimicAgent[C: SMConfigT](Movable):
             self.ep_n[i] += 1
             if self.env.lanes[i].ep_len == 0:      # reset this step
                 self.finished.append(self.ep_sum[i] / (0.1 * Float64(self.ep_n[i])))
+                self.fast.note_episode(self.ep_sum[i] / (0.1 * Float64(self.ep_n[i])))
                 self.finished_len.append(self.ep_n[i])
                 self.ep_sum[i] = 0.0
                 self.ep_n[i] = 0
@@ -237,12 +242,13 @@ struct SuperMimicAgent[C: SMConfigT](Movable):
             while self.utd_acc >= 1.0:
                 self.utd_acc -= 1.0
                 self.lr = self._lr()
-                self.trainer.set_lr(self.lr)
+                self.trainer.set_lrs(self.lr, self.lr * self.fast.pi_mult(self.updates), self.lr)
                 var t1 = perf_counter_ns()
                 var acc = SMWMLoss(0, 0, 0, 0, 0)
-                for _ in range(Self.C.DEF_WM_BATCHES):
+                var nwm = self.fast.wm_batches(Self.C.DEF_WM_BATCHES)
+                for _ in range(nwm):
                     var wb = self.window_batch()
-                    acc.add_scaled(self.trainer.wm_update[Self.C.WM_BATCH](wb), 1.0 / Float64(Self.C.DEF_WM_BATCHES))
+                    acc.add_scaled(self.trainer.wm_update[Self.C.WM_BATCH](wb), 1.0 / Float64(nwm))
                 var t2 = perf_counter_ns()
                 var ib = self.start_batch()
                 var vals = List[Float64]()
@@ -254,7 +260,23 @@ struct SuperMimicAgent[C: SMConfigT](Movable):
                 self.t_pi += Float64(perf_counter_ns() - t2) * 1e-9
                 self.updates += 1
                 info.updated = True
+                if self.fast.tick(self.updates):
+                    print("  policy lr ramp starts at update", self.updates, "| training return", self.fast.last_return, "| x", self.fast.opts.pi_lr_mult, "-> x 1 over", self.fast.opts.lr_decay_len, "updates")
         return info^
+
+    def set_fast(mut self, opts: SMFastOpts) raises:
+        """The fast-training options (`fast.mojo`). Call it before the first
+        iteration, and before `trainer.load_state` on a resume (the averaged
+        policy must be on for the load to restore the live one)."""
+        self.fast = SMFastState(opts)
+        self.trainer.set_ema(opts.pi_ema)
+        self.trainer.set_ref_skip(opts.ref_skip)
+        self.trainer.analytic_term = opts.analytic_term
+        self.trainer.v_max = opts.v_max
+        self.trainer.set_muon(opts.muon, opts.muon_wd)
+        self.trainer.set_mirror(opts.wm_mirror)
+        if opts.action_noise >= 0.0:
+            self.env.action_noise = opts.action_noise
 
     def resume(mut self, iteration: Int, updates: Int, lr_restart_ratio: Float64 = 0.0, lr_restart_decay: Int = 0):
         """Go on from a checkpoint's counters (`SuperMimicTrainer.load_state`):

@@ -22,6 +22,7 @@ Layout (SAC's pattern):
     config.mojo         SMConfigT: target, robot, widths, shapes; presets
     agent.mojo          SuperMimicAgent: env + replay + trainer + schedule
     agent_gpu.mojo      SuperMimicAgentGpu: the same loop, device env + replay
+    fast.mojo           the fast-training options of the loop (off by default)
     trainer.mojo        SuperMimicTrainer: networks, tables, the blocks, checkpoint
     metrics.mojo        SMMetrics (dashboard names), the log window, sm_tick
     blocks/             ActStep, WorldModelUpdateStep, ActorStep, CriticFitStep
@@ -59,6 +60,7 @@ from .config import SMConfigT, SMConfig, SMPaperG1, SMSmokeG1, SMWorldModelOf, S
 from .robot import TrackingRobot, TrackingSim, TrackingBatchedSim, SMDims, G1Robot, G1Sim, G1BatchedSim, G1MjlabRobot, G1MjlabSim, G1MjlabBatchedSim
 from .agent import SuperMimicAgent, SMSchedule, sm_agent, sm_schedule
 from .agent_gpu import SuperMimicAgentGpu, sm_agent_gpu
+from .fast import SMFastOpts, SMFastState
 from .metrics import SMMetrics
 from .trainer import SuperMimicTrainer, SMUpdateMetrics
 from .prompt_policy import SMPromptConfigT, SMPromptConfig

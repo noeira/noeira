@@ -105,7 +105,10 @@ struct SMPromptTrainer[P: SMPromptConfigT](Movable):
     ) raises -> TensorImpl[DT]:
         """`hist` [L · 10 · OBS], `goals` [L · GOAL] (read below `split`), `cmds`
         [L · CMD] (read from `split` on) → actions [L · n]. `resident`: inputs
-        and actions stay on the device."""
+        and actions stay on the device. Refuses a tracker trained with the
+        reference skip (`SuperMimicTrainer.require_no_ref_skip`): a prompt
+        lane has no reference frame to take the skip from."""
+        self.base.require_no_ref_skip(String("SMPromptTrainer"))
         comptime T = Self.P.BASE.TARGET
         comptime R = Self.P.BASE.ROBOT
         comptime D = SMDims[R]
@@ -149,6 +152,7 @@ struct SMPromptTrainer[P: SMPromptConfigT](Movable):
         resident: Bool = False,
     ) raises -> SMPromptUpdate:
         """The encoder's step on one rollout, then the critic's fit on it."""
+        self.base.require_no_ref_skip(String("SMPromptTrainer"))
         comptime T = Self.P.BASE.TARGET
         comptime H = Self.P.BASE.HORIZON
         if ib.h != H:
