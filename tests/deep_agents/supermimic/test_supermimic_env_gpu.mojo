@@ -28,13 +28,18 @@ action (a pose the PD holds), so answers are known.
 [6] prompt lanes: a tracking error ends a tracker lane and not a prompt lane, a
     fall does end one, its task reward comes back, and it never reaches the
     reset sampler.
+[7] the benchmark's env (`eval.sm_benchmark_env`) and the host's random
+    stream, which a training run beside it shares: building it, a restart on
+    queued frames and a reset of every lane at its clip's end leave the
+    stream's next draw unchanged; an env that draws its reset frames moves
+    it (the check can fail).
 
 Run (box): pixi run -e nvidia mojo run -I . tests/deep_agents/supermimic/test_supermimic_env_gpu.mojo
 (`mojo build -D SM_MJLAB=1` or `-D SM_BHL=1` for the other two robots.)
 """
 
 from std.math import ceildiv, isnan
-from std.random import random_float64, seed
+from std.random import random_float64, random_ui64, seed
 from std.sys import default_accelerator, get_defined_int
 
 from max.gpu import global_idx
@@ -43,6 +48,7 @@ from max.gpu.host import DeviceContext
 from noeira.core.cont_action import ContAction
 from noeira.deep_agents.supermimic.env import SMReplayOf, SMTrackingEnv
 from noeira.deep_agents.supermimic.env_gpu import ST_CLIP_END, ST_ENDING, ST_TERMINATED, SMReplayGpuOf, SMTrackingEnvGpu
+from noeira.deep_agents.supermimic.eval import sm_benchmark_env
 from noeira.deep_agents.supermimic.lanes import tp
 from noeira.deep_agents.supermimic.motion_library import SMMotionLibrary
 from noeira.deep_agents.supermimic.prompt import SMSpec, sm_spec_velocity
@@ -404,6 +410,31 @@ def test_prompt_lanes(ctx: DeviceContext, stand: List[Scalar[DT]], mut tl: Tally
     tl.check(g2 == g3, "prompt lanes never reach the reset sampler")
 
 
+def test_queued_stream(ctx: DeviceContext, stand: List[Scalar[DT]], mut tl: Tally) raises:
+    print("[7] the benchmark's env and the host's random stream")
+    seed(31)
+    var want = random_ui64(0, 0xFFFFFFFF)
+    seed(31)
+    var env = sm_benchmark_env[R, BS](ctx, _library(stand, [60, 60, 60], 0.0), BS.create(ctx))
+    var frames = List[Int](length=NL, fill=0)
+    for l in range(NL):
+        frames[l] = 60 * (l % 3)
+    env.restart(ctx, frames)
+    var rb = SMReplayGpuOf[R](ctx, NL, 128)
+    var a = _actions(ctx, _zeros())
+    var ends = 0
+    for _ in range(62):
+        var si = env.step(ctx, a, rb)
+        ends += si.n_terminated + si.n_truncated
+    var got = random_ui64(0, 0xFFFFFFFF)
+    tl.check(ends >= NL, "every lane ended and was reset from the queue: " + String(ends) + " resets")
+    tl.check(got == want, "building it, a restart and those resets left the stream's next draw unchanged")
+    seed(31)
+    var drawing = EnvG(ctx, _library(stand, [60, 60, 60], 0.0), BS.create(ctx), dr=False, obs_noise=False, reset_noise=False, action_noise=0.0)
+    var moved = random_ui64(0, 0xFFFFFFFF)
+    tl.check(moved != want and drawing.num_lanes() == NL, "an env that draws its reset frames moves it")
+
+
 def main() raises:
     comptime if not default_accelerator().is_nvidia_gpu():
         # the batched G1 is NVIDIA only; never instantiated here
@@ -419,6 +450,7 @@ def main() raises:
         test_clip_end(ctx, stand, tl)
         test_bookkeeping(ctx, stand, tl)
         test_prompt_lanes(ctx, stand, tl)
+        test_queued_stream(ctx, stand, tl)
         print("\n===", tl.ok, "/", tl.total, "passed ===")
         if tl.ok != tl.total:
             raise Error("test_supermimic_env_gpu: " + String(tl.total - tl.ok) + " failed")

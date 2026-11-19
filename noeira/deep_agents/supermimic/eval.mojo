@@ -94,9 +94,12 @@ def sm_benchmark_gpu[C: SMConfigT, BS: TrackingBatchedSim](
 def sm_benchmark_env[R: TrackingRobot, BS: TrackingBatchedSim](
     ctx: DeviceContext, var lib: SMMotionLibrary[R], var sim: BS,
 ) raises -> SMTrackingEnvGpu[R, BS]:
-    """The protocol's env: no noise, no domain randomisation, no cap."""
+    """The protocol's env: no noise, no domain randomisation, no cap, and
+    every reset from the clip queue: neither building it nor running the
+    protocol on it draws from the host's random stream, which a training run
+    beside it (`SMInRunBench`) shares."""
     return SMTrackingEnvGpu[R, BS](
-        ctx, lib^, sim^, dr=False, obs_noise=False, reset_noise=False, action_noise=0.0, max_episode_steps=0,
+        ctx, lib^, sim^, dr=False, obs_noise=False, reset_noise=False, action_noise=0.0, max_episode_steps=0, queued=True,
     )
 
 

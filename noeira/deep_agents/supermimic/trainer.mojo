@@ -171,6 +171,18 @@ struct SuperMimicTrainer[C: SMConfigT](Movable):
                 self.skip_k.upload_resident(self.ctx.value())
         self.ref_skip = on
 
+    def require_no_ref_skip(self, who: String) raises:
+        """For a reader that runs this tracker's decoder itself, outside `act`
+        and the tracker's own imagined rollout (the prompt interface, the
+        object encoder): it does not add the reference skip, so a tracker
+        trained with it would be run without it and nothing would say so.
+        Raises instead."""
+        if self.ref_skip:
+            raise Error(
+                who + ": this tracker was trained with the reference skip (`--ref-skip`), which " + who
+                + " does not add to its actions; give it a tracker trained without the skip"
+            )
+
     def set_mirror(mut self, share: Float64) raises:
         """Replace this share of every world-model batch by its left-right
         mirror image (BlinkMimic's `--wm_mirror 0.5`): the robot is

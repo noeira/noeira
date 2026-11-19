@@ -344,12 +344,7 @@ struct SMTrackingEnv[R: TrackingRobot](Movable):
                 self._set_friction(i, _u(0.3, 1.2))
                 for j in range(Self.R.NDOF):
                     self.lanes[i].xi[1 + j] = Scalar[DT](_u(-0.01, 0.01))
-            var x = random_float64(0.0, acc)
-            var b = SMResetSampler.bin_from_cdf(cdf, x)
-            self.sampler.note_draw(b)
-            var f = SMResetSampler.frame_from[Self.R](self.lib, b, random_float64(0.0, 1.0))
-            if self.next_frame[i] >= 0:      # the evaluation's clip queue
-                f = self.next_frame[i]
+            var f = self.sampler.reset_frame[Self.R](self.lib, cdf, acc, self.next_frame[i])   # a queued frame draws nothing
             self._write_reference(i, f)
             ref ln = self.lanes[i]
             ln.frame = f

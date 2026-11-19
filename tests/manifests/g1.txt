@@ -170,6 +170,12 @@ tests/nn/test_muon.mojo /tmp/muon_oracle
 # from the names, twice = identity, and the CPU simulator as the reference (a
 # mirrored step is the mirror of the step, in the air and on the floor)
 tests/deep_agents/supermimic/test_supermimic_mirror.mojo
+# What must not happen silently beside the fast options: the prompt and object
+# trainers REFUSE a tracker trained with the reference skip (they run its
+# decoder without it), and a reset from an evaluation's clip queue draws
+# nothing from the host's random stream (the in-run benchmark shares it with
+# the training run). Known answers, no dump.
+tests/deep_agents/supermimic/test_supermimic_skip_guard.mojo
 # The shared per-env episodic window replay (deep_agents/data), against the
 # SuperMimic reproduction's ReplayBuffer (same dump as test_supermimic_lib)
 tests/deep_agents/data/test_episodic_replay.mojo /tmp/sm_lib
