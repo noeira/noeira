@@ -24,13 +24,17 @@ some of them, and the robot's memory of its own day would have the gaps.
 steps the physics. A log file that cannot be written is reported in
 `log_error` and the event still enters the state.
 
-What is NOT here yet (plan §7): objects seen and their last-seen time (B5),
-people (B4), the task stack (B2), reading a day back at start (B3).
+Movable objects (the crate) are `objects`, one `ObjectXY` record each, written
+by `saw_object`, `told_object`, `object_missing`, `picked_up` and `put_down`
+(`noeira.brain.objects` says how). The reply view does not read them yet.
 """
 
 from .events import (
     BrainEvent, EventLog, EV_SESSION, EV_HEARD, EV_SAID, EV_BEGAN, EV_GOING, EV_ARRIVED,
-    EV_MISSED,
+    EV_MISSED, EV_SAW, EV_TOLD_WHERE, EV_LOST, EV_PICKED, EV_PUT,
+)
+from .objects import (
+    ObjectXY, object_event_text, OBJ_FLOOR, OBJ_HELD, OBJ_PUT, HOW_SEEN, HOW_TOLD, OBJ_GAP_S,
 )
 
 comptime STEP_PENDING: Int = 0
@@ -214,11 +218,15 @@ struct Step(Copyable, Movable):
     """One command of the body inside a task (`noeira.brain.tasks`)."""
 
     var command: String
-    """As the body takes it: `goto:table`, `squat`."""
+    """As the body takes it: `goto:table`, `squat`, `pick:crate`, `put:crate:table`."""
     var label: String
     """In words, for the models: `walk to the table`."""
     var place: String
-    """The place the step ends at; "" for a step that ends after `hold_s`."""
+    """The place the step ends at; "" for a step that ends after `hold_s`.
+    For a `put:` step, the place the object is to be put at."""
+    var obj: String
+    """The object a `pick:` or `put:` step is about; "" for the others. Such a
+    step ends on the object's record (`noeira.brain.tasks`), not on `at`."""
     var timeout_s: Float64
     var hold_s: Float64
     var status: Int
@@ -228,6 +236,7 @@ struct Step(Copyable, Movable):
         self.command = command^
         self.label = label^
         self.place = place^
+        self.obj = String("")
         self.timeout_s = STEP_TIMEOUT_S
         self.hold_s = STEP_HOLD_S
         self.status = STEP_PENDING
@@ -242,6 +251,23 @@ struct Step(Copyable, Movable):
     def gesture(name: String) -> Step:
         """A posture or a gesture of the body's own list: done after `hold_s`."""
         return Step(name.copy(), name.replace("_", " "), String(""))
+
+    @staticmethod
+    def pick(obj: String) -> Step:
+        """Pick an object up (`pick:crate`): done when it is held, failed
+        after `timeout_s`, or at once when the state does not know where it is."""
+        var s = Step("pick:" + obj, "pick up the " + obj, String(""))
+        s.obj = obj.copy()
+        return s^
+
+    @staticmethod
+    def put(obj: String, place: String) -> Step:
+        """Put an object at a place (`put:crate:table`): done when it was put
+        down there, failed after `timeout_s`. The body decides whether that
+        includes walking there and picking it up first."""
+        var s = Step("put:" + obj + ":" + place, "put the " + obj + " at the " + place, place.copy())
+        s.obj = obj.copy()
+        return s^
 
 
 struct Task(Copyable, Movable):
@@ -299,7 +325,12 @@ struct WorldState(Movable):
     """The places' names in the languages people speak to the robot
     (`call_place`). The places are named in English in the state; the reply
     view gives the conversation's words beside them. Measured (BB-1): without
-    them LFM3-1.7B called the table "le tableau" in 2 of 16 French answers."""
+    them LFM3-1.7B called the table "le tableau" in 2 of 16 French answers.
+    An object's words are kept here too, under its name (`crate` = `la caisse`)."""
+
+    var objects: List[ObjectXY]
+    """The movable objects the robot knows (`add_object`), one record each,
+    where each is believed to be now (`noeira.brain.objects`)."""
 
     var pose_known: Bool
     var x: Float64
@@ -369,6 +400,7 @@ struct WorldState(Movable):
         self.language = String("")
         self.places = List[PlaceXY]()
         self.place_words = List[PlaceWord]()
+        self.objects = List[ObjectXY]()
         self.pose_known = False
         self.x = 0.0
         self.y = 0.0
@@ -477,6 +509,131 @@ struct WorldState(Movable):
             self.at = a
             if a != "":
                 self.record(EV_ARRIVED, a, String("motion"), now)
+
+    # ── movable objects (`noeira.brain.objects`) ──────────────────────
+
+    def object_index(self, name: String) -> Int:
+        """The object called `name` in `objects`; -1 when it was not added."""
+        for i in range(len(self.objects)):
+            if self.objects[i].name == name:
+                return i
+        return -1
+
+    def place_index(self, name: String) -> Int:
+        """The place called `name` in `places`; -1 when there is none."""
+        for i in range(len(self.places)):
+            if self.places[i].name == name:
+                return i
+        return -1
+
+    def add_object(mut self, var o: ObjectXY):
+        """An object the robot is to know, with its size. One of the same name
+        is replaced (pose and all)."""
+        var i = self.object_index(o.name)
+        if i >= 0:
+            self.objects[i] = o^
+        else:
+            self.objects.append(o^)
+
+    def _log_object(mut self, i: Int, kind: String, source: String, t: Float64, now: Int):
+        self.objects[i].mark_logged(t)
+        var text = object_event_text(self.objects[i])
+        self.record(kind, text, source, now)
+
+    def saw_object(mut self, name: String, x: Float64, y: Float64, yaw_deg: Float64, score: Float64,
+                   source: String, t: Float64, now: Int) -> Bool:
+        """A sighting: the object's pose REPLACES the record's (`how` = seen).
+        Call it as often as the object is seen; a `saw` event is written only
+        when the sighting is news (the module note). False = no object of that
+        name was added: the size a fit was made with is the state's, so an
+        undeclared object is not taken."""
+        var i = self.object_index(name)
+        if i < 0:
+            return False
+        var news = (
+            self.objects[i].how != HOW_SEEN
+            or self.objects[i].missing
+            or self.objects[i].t_seen < 0.0
+            or t - self.objects[i].t_seen > OBJ_GAP_S
+        )
+        self.objects[i].set_pose(x, y, yaw_deg)
+        self.objects[i].how = String(HOW_SEEN)
+        self.objects[i].source = source.copy()
+        self.objects[i].score = score
+        self.objects[i].missing = False
+        self.objects[i].t_seen = t
+        self.objects[i].now_seen = now
+        self.objects[i].times_seen += 1
+        if self.objects[i].where == OBJ_HELD:
+            return True   # its pose follows the hands; written when it is put down
+        var moved = self.objects[i].moved_since_logged()
+        if moved and self.objects[i].where == OBJ_PUT:
+            # it is no longer where the robot put it: someone moved it
+            self.objects[i].where = OBJ_FLOOR
+            self.objects[i].put_at = String("")
+        if news or moved or self.objects[i].t_logged < 0.0:
+            self._log_object(i, EV_SAW, source, t, now)
+        return True
+
+    def told_object(mut self, name: String, x: Float64, y: Float64, yaw_deg: Float64,
+                    source: String, t: Float64, now: Int) -> Bool:
+        """Where the object is, given rather than seen (`how` = told): a trials
+        table, a scene file, a person. On the floor, at no place. False = not added."""
+        var i = self.object_index(name)
+        if i < 0:
+            return False
+        self.objects[i].set_pose(x, y, yaw_deg)
+        self.objects[i].how = String(HOW_TOLD)
+        self.objects[i].source = source.copy()
+        self.objects[i].score = 0.0
+        self.objects[i].missing = False
+        self.objects[i].where = OBJ_FLOOR
+        self.objects[i].put_at = String("")
+        self.objects[i].t_seen = t
+        self.objects[i].now_seen = now
+        self._log_object(i, EV_TOLD_WHERE, source, t, now)
+        return True
+
+    def object_missing(mut self, name: String, t: Float64, now: Int) -> Bool:
+        """The robot looked where the record puts the object and did not find
+        it: `missing`, and a `lost` event with the pose it was believed at. A
+        later sighting clears it. Only the first report is written. False =
+        not added or no pose to have looked at."""
+        var i = self.object_index(name)
+        if i < 0 or not self.objects[i].has_pose:
+            return False
+        if self.objects[i].missing:
+            return True
+        self.objects[i].missing = True
+        self._log_object(i, EV_LOST, String("brain"), t, now)
+        return True
+
+    def picked_up(mut self, name: String, t: Float64, now: Int) -> Bool:
+        """The hands have the object (`OBJ_HELD`). False = not added."""
+        var i = self.object_index(name)
+        if i < 0:
+            return False
+        self.objects[i].where = OBJ_HELD
+        self.objects[i].put_at = String("")
+        self.objects[i].missing = False
+        self._log_object(i, EV_PICKED, String("body"), t, now)
+        return True
+
+    def put_down(mut self, name: String, place: String, x: Float64, y: Float64, yaw_deg: Float64,
+                 t: Float64, now: Int) -> Bool:
+        """The object was let go at (x, y, heading): put at `place`
+        (`OBJ_PUT`), or on the floor at no place when `place` is "". The pose
+        is the body's estimate; the next sightings refine it. False = not added."""
+        var i = self.object_index(name)
+        if i < 0:
+            return False
+        self.objects[i].set_pose(x, y, yaw_deg)
+        self.objects[i].where = OBJ_PUT if place != "" else OBJ_FLOOR
+        self.objects[i].put_at = place.copy()
+        self.objects[i].missing = False
+        self.objects[i].now_seen = now
+        self._log_object(i, EV_PUT, String("body"), t, now)
+        return True
 
     # ── what is derived ───────────────────────────────────────────────
 

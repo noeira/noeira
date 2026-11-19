@@ -28,6 +28,11 @@ A STEP is one command of the body, as the body takes it (`goto:table`,
 - a step to a PLACE is done when the state's `at` is that place, and has
   failed when `timeout_s` passed first;
 - a step with no place is done after `hold_s`.
+- a step about an OBJECT (`Step.pick`, `Step.put`) is done on the object's
+  record: held for a pick, put down at the step's place for a put
+  (`noeira.brain.objects`); failed after `timeout_s`, and at once, before the
+  body is given anything, when the state has no pose for the object or it is
+  missing.
 A command the body refuses fails its step (`refuse_step`).
 
 THE CLOCK is the caller's, in seconds (`t`): simulated time in a headless run,
@@ -41,6 +46,7 @@ spoken command always replaced the running one.
 """
 
 from .events import EV_TASK_STARTED, EV_STEP_STARTED, EV_STEP_DONE, EV_TASK_DONE, EV_TASK_FAILED, EV_TASK_CANCELLED
+from .objects import OBJ_HELD, OBJ_PUT
 from .state import WorldState, Task, Step, TASK_RUNNING, TASK_DONE, TASK_FAILED, TASK_CANCELLED, STEP_PENDING, STEP_RUNNING, STEP_DONE, STEP_FAILED
 
 
@@ -63,6 +69,11 @@ comptime NOTICE_REFUSED = "refused"
 comptime NOTICE_ALL_DONE = "all_done"
 """A task of several steps is finished (a single step ends silently: its
 arrival is its own report)."""
+comptime NOTICE_NO_OBJECT = "no_object"
+"""A step's object has no pose in the state, or it is missing: the robot does
+not know where it is. Nothing was given to the body."""
+comptime NOTICE_NOT_DONE = "not_done"
+"""A step's object was not picked up (or not put at its place) in time."""
 
 
 @fieldwise_init
@@ -71,10 +82,12 @@ struct ExecAction(Copyable, Movable):
     var command: String
     var notice: String
     var place: String
+    var obj: String
+    """The object the notice is about; "" for none."""
 
     @staticmethod
     def none() -> ExecAction:
-        return ExecAction(EX_NONE, String(""), String(""), String(""))
+        return ExecAction(EX_NONE, String(""), String(""), String(""), String(""))
 
 
 def _finish(mut ws: WorldState, status: Int, reason: String, t: Float64, now: Int):
@@ -127,8 +140,9 @@ def refuse_step(mut ws: WorldState, t: Float64, now: Int) -> ExecAction:
     ws.task.steps[k].status = STEP_FAILED
     var cmd = ws.task.steps[k].command.copy()
     var place = ws.task.steps[k].place.copy()
+    var obj = ws.task.steps[k].obj.copy()
     _finish(ws, TASK_FAILED, "the robot has no command '" + cmd + "'", t, now)
-    return ExecAction(EX_NOTICE, String(""), String(NOTICE_REFUSED), place)
+    return ExecAction(EX_NOTICE, String(""), String(NOTICE_REFUSED), place, obj)
 
 
 def tick_tasks(mut ws: WorldState, t: Float64, now: Int) -> ExecAction:
@@ -136,16 +150,35 @@ def tick_tasks(mut ws: WorldState, t: Float64, now: Int) -> ExecAction:
     if not ws.has_task:
         return ExecAction.none()
     var k = ws.task.at
+    var obj = ws.task.steps[k].obj.copy()
+    var oi = ws.object_index(obj) if obj != "" else -1
     if ws.task.steps[k].status == STEP_PENDING:
+        if obj != "" and (oi < 0 or not ws.objects[oi].has_pose or ws.objects[oi].missing):
+            ws.task.steps[k].status = STEP_FAILED
+            var place0 = ws.task.steps[k].place.copy()
+            _finish(ws, TASK_FAILED, "where the " + obj + " is is not known", t, now)
+            return ExecAction(EX_NOTICE, String(""), String(NOTICE_NO_OBJECT), place0, obj)
         ws.task.steps[k].status = STEP_RUNNING
         ws.task.steps[k].t_start = t
         var started = ws.task.steps[k].label.copy()
         ws.record(EV_STEP_STARTED, started, String("executive"), now)
-        return ExecAction(EX_START, ws.task.steps[k].command.copy(), String(""), ws.task.steps[k].place.copy())
+        return ExecAction(EX_START, ws.task.steps[k].command.copy(), String(""), ws.task.steps[k].place.copy(), obj)
     var place = ws.task.steps[k].place.copy()
     var elapsed = t - ws.task.steps[k].t_start
     var done = False
-    if place != "":
+    if obj != "":
+        # ⚠ BEFORE the place: a put step HAS a place, and the robot standing
+        # there says nothing about where the object is
+        if oi >= 0 and place == "":
+            done = ws.objects[oi].where == OBJ_HELD
+        elif oi >= 0:
+            done = ws.objects[oi].where == OBJ_PUT and ws.objects[oi].put_at == place
+        if not done and elapsed > ws.task.steps[k].timeout_s:
+            ws.task.steps[k].status = STEP_FAILED
+            var what = ("the " + obj + " was not picked up") if place == "" else ("the " + obj + " was not put at the " + place)
+            _finish(ws, TASK_FAILED, what + " after " + String(Int(ws.task.steps[k].timeout_s)) + " seconds", t, now)
+            return ExecAction(EX_NOTICE, String(STOP_COMMAND), String(NOTICE_NOT_DONE), place, obj)
+    elif place != "":
         if ws.at == place:
             done = True
         elif elapsed > ws.task.steps[k].timeout_s:
@@ -154,7 +187,7 @@ def tick_tasks(mut ws: WorldState, t: Float64, now: Int) -> ExecAction:
                 ws, TASK_FAILED,
                 "the " + place + " was not reached after " + String(Int(ws.task.steps[k].timeout_s)) + " seconds", t, now,
             )
-            return ExecAction(EX_NOTICE, String(STOP_COMMAND), String(NOTICE_NOT_REACHED), place)
+            return ExecAction(EX_NOTICE, String(STOP_COMMAND), String(NOTICE_NOT_REACHED), place, String(""))
     elif elapsed >= ws.task.steps[k].hold_s:
         done = True
     if not done:
@@ -168,7 +201,7 @@ def tick_tasks(mut ws: WorldState, t: Float64, now: Int) -> ExecAction:
     var several = len(ws.task.steps) > 1
     _finish(ws, TASK_DONE, String(""), t, now)
     if several:
-        return ExecAction(EX_NOTICE, String(""), String(NOTICE_ALL_DONE), place)
+        return ExecAction(EX_NOTICE, String(""), String(NOTICE_ALL_DONE), place, String(""))
     return ExecAction.none()
 
 
@@ -186,4 +219,28 @@ def notice_text(ref ws: WorldState, act: ExecAction) -> String:
         return String("Je ne sais pas faire ça.") if fr else String("I do not know how to do that.")
     if act.notice == NOTICE_ALL_DONE:
         return String("C'est fait.") if fr else String("Done.")
+    var thing = ws.word_for(act.obj, ws.language)
+    if act.notice == NOTICE_NO_OBJECT:
+        if fr:
+            return "Je ne sais pas où est " + thing + "."
+        return "I do not know where " + thing + " is."
+    if act.notice == NOTICE_NOT_DONE:
+        if act.place == "":
+            if fr:
+                return "Je n'ai pas réussi à prendre " + thing + "."
+            return "I could not pick up " + thing + "."
+        if fr:
+            return "Je n'ai pas réussi à porter " + thing + " " + jusqua(place) + "."
+        return "I could not carry " + thing + " to " + place + "."
     return String("")
+
+
+def jusqua(word: String) -> String:
+    """« jusqu'à » before a French noun phrase, with its contractions:
+    `la table` -> `jusqu'à la table`, `le frigo` -> `jusqu'au frigo`,
+    `les chaises` -> `jusqu'aux chaises`."""
+    if word.startswith("le "):
+        return "jusqu'au " + String(word[byte=3:])
+    if word.startswith("les "):
+        return "jusqu'aux " + String(word[byte=4:])
+    return "jusqu'à " + word

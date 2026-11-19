@@ -37,6 +37,10 @@ else is reported in `ws.memory_error` and that day is left out.
 
 `save_places` / `load_places`: the places the robot knows, with their names
 in people's languages, in `<dir>/places.json`.
+
+`restore_objects`: the movable objects where the log last put them, as
+`remembered` (`noeira.brain.objects`). No file of their own: each object event
+carries the whole record, so the last one IS the object's memory.
 """
 
 from std.os import listdir, makedirs
@@ -48,7 +52,9 @@ from noeira.io.fileio import read_file_bytes, write_text_atomic
 from noeira.io.json import JsonWriter, parse_json
 from .events import (
     BrainEvent, parse_event, EV_HEARD, EV_TASK_DONE, EV_TASK_FAILED, EV_TASK_CANCELLED,
+    EV_SAW, EV_TOLD_WHERE, EV_LOST, EV_PICKED, EV_PUT,
 )
+from .objects import ObjectXY, parse_object_event, HOW_REMEMBERED
 from .bb1 import normalise, has_phrase
 from .geometry import PlaceXY
 from .people import name_given
@@ -390,3 +396,70 @@ def load_places(mut ws: WorldState, dir: String) raises -> Int:
         for k in range(doc.size(words)):
             ws.call_place(name, doc.key_at(words, k), doc.string(doc.at(words, k)))
     return len(ws.places)
+
+
+def is_object_event(kind: String) -> Bool:
+    """The kinds whose text is a whole object record (`object_event_text`)."""
+    return kind == EV_SAW or kind == EV_TOLD_WHERE or kind == EV_LOST or kind == EV_PICKED or kind == EV_PUT
+
+
+def restore_objects(mut ws: WorldState, dir: String, now: Int) -> Int:
+    """Each object of the last `MEM_DAYS` days of `<dir>/log`, as its LAST
+    event left it, into `ws.objects` as `remembered` (an object already added
+    keeps its size and takes the remembered pose; `missing` when the last event
+    was a `lost`). Call it before `open_log`, as `restore_memory`. The number
+    of objects restored. ⚠ Does not raise: what cannot be read is reported in
+    `ws.memory_error` (a day, or one event's text, is skipped)."""
+    var last = List[ObjectXY]()
+    var n_restored = 0
+    try:
+        var today_days = date_days(date_utc(now))
+        var days = log_days(dir)
+        var first = max(0, len(days) - MEM_DAYS)
+        for di in range(first, len(days)):
+            if today_days - date_days(days[di]) < 0:
+                continue
+            try:
+                var events = read_log(dir + "/log/" + days[di] + ".jsonl")
+                for e in events:
+                    if not is_object_event(e.kind):
+                        continue
+                    try:
+                        var o = parse_object_event(e.text)
+                        o.now_seen = e.t
+                        o.missing = e.kind == EV_LOST
+                        var at = -1
+                        for j in range(len(last)):
+                            if last[j].name == o.name:
+                                at = j
+                        if at >= 0:
+                            last[at] = o^
+                        else:
+                            last.append(o^)
+                    except err:
+                        ws.memory_error = String(err)
+            except err:
+                ws.memory_error = String(err)
+    except err:
+        ws.memory_error = String(err)
+    for j in range(len(last)):
+        ref o = last[j]
+        var i = ws.object_index(o.name)
+        if i < 0:
+            ws.objects.append(o.copy())
+            i = len(ws.objects) - 1
+        else:
+            ws.objects[i].set_pose(o.x, o.y, o.yaw_deg)
+        ws.objects[i].has_pose = True
+        ws.objects[i].where = o.where
+        ws.objects[i].put_at = o.put_at.copy()
+        ws.objects[i].missing = o.missing
+        ws.objects[i].how = String(HOW_REMEMBERED)
+        ws.objects[i].source = String("log")
+        ws.objects[i].score = 0.0
+        ws.objects[i].t_seen = -1.0
+        ws.objects[i].now_seen = o.now_seen
+        ws.objects[i].times_seen = 0
+        ws.objects[i].t_logged = -1.0
+        n_restored += 1
+    return n_restored

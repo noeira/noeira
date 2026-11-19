@@ -62,6 +62,20 @@ comptime EV_TASK_FAILED = "task_failed"
 comptime EV_TASK_CANCELLED = "task_cancelled"
 """`text` = the task in words, then " | " and why."""
 
+comptime EV_SAW = "saw"
+"""A movable object was seen, and it was news (`noeira.brain.objects`: first
+sighting, after a gap, or moved). `text` = the whole record
+(`object_event_text`): `crate | 1.234 0.456 35.0 | floor | crate 0.13 0.215 0.19 180.0 | seen`."""
+comptime EV_TOLD_WHERE = "told_where"
+"""Where an object is was given, not seen (a trials table, a person); the same text."""
+comptime EV_LOST = "lost"
+"""The robot looked where an object should be and did not find it; the same
+text, with the pose it was believed at."""
+comptime EV_PICKED = "picked"
+"""The hands have the object; the same text, `held`."""
+comptime EV_PUT = "put"
+"""The object was put down; the same text, `put <place>` or `floor`."""
+
 
 @fieldwise_init
 struct BrainEvent(Copyable, Movable):
