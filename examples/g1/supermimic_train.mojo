@@ -231,15 +231,18 @@ def _store_paths(spec: String) raises -> List[String]:
 
 def _from_store(spec: String, max_clips: Int) raises -> SMMotionLibrary[Robot]:
     """The clips of every store, concatenated (each store's episodes are
-    contiguous from row 0); `max_clips` > 0 stops after that many."""
+    contiguous from row 0); `max_clips` > 0 stops after that many. Two passes:
+    the clips' lengths first, so the rows are allocated ONCE at their final
+    size (grown store by store, the full SEED's 13.4 GB of rows peaked near
+    twice that on the host), then each store's rows into their place."""
     var paths = _store_paths(spec)
     var lens = List[Int]()
-    var rows = List[Scalar[DT]]()
+    var take = List[Int]()          # rows taken from each store
+    var total = 0
     for p in range(len(paths)):
         if max_clips > 0 and len(lens) >= max_clips:
             break
         var st = TrajectoryStore(paths[p])
-        var refc = st.load_column[DType.float32](String("ref"))
         var n_ep = st.n_episodes()
         if max_clips > 0:
             n_ep = min(n_ep, max_clips - len(lens))
@@ -248,10 +251,16 @@ def _from_store(spec: String, max_clips: Int) raises -> SMMotionLibrary[Robot]:
             var l = Int(st.episodes.ep_len[e])
             lens.append(l)
             rows_n += l
-        var o = len(rows)
-        rows.resize(o + rows_n * S, 0)
-        for i in range(rows_n * S):
+        take.append(rows_n)
+        total += rows_n
+    var rows = List[Scalar[DT]](length=total * S, fill=0)
+    var o = 0
+    for p in range(len(take)):
+        var st = TrajectoryStore(paths[p])
+        var refc = st.load_column[DType.float32](String("ref"))
+        for i in range(take[p] * S):
             rows[o + i] = refc[i]
+        o += take[p] * S
     var frames = len(rows) // S
     print("  library:", len(lens), "clips,", frames, "frames (", Float64(frames) / 50.0 / 3600.0, "h ) from", len(paths), "store(s)")
     return SMMotionLibrary[Robot](rows^, lens, _q0())
