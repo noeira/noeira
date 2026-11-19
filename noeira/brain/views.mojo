@@ -50,12 +50,16 @@ sentences, kept so the bench can compare the two.
 ⚠ THE ARITHMETIC IS DONE HERE (`geometry`): the model is given "left, 4 m" and
 "the nearest place", never coordinates.
 
+OBJECTS (`ws.objects`) get one line, only when the state has one: a room
+without them has the view BB-1 measured, byte for byte.
+
 The decision model's view is not here yet: it is `g1_command_state`
 (`noeira/envs/robots/g1_command_language.mojo`), whose `around` lines the
 state already writes (`WorldState.around_lines`).
 """
 
-from .geometry import PlaceAround
+from .geometry import PlaceAround, PlaceXY, places_around
+from .objects import OBJ_HELD, OBJ_PUT, HOW_TOLD, HOW_REMEMBERED
 from .state import WorldState, TASK_DONE, TASK_FAILED
 from .memory import focused_memory
 from .people import asks_identity, identity_answer
@@ -199,6 +203,52 @@ def task_sentences(ref ws: WorldState) -> String:
     return t + " It was cancelled: " + ws.last_task.reason + "."
 
 
+def object_phrase(ref ws: WorldState, i: Int) -> String:
+    """Where object `i` is, for the reply model: `in your hands`, `on the
+    floor, on your left, 2 m, next to the table`, `next to the table, where you
+    put it`, `you do not know where it is`; with how it is known when it was
+    not seen (`you were told so`)."""
+    ref o = ws.objects[i]
+    if o.missing:
+        return String("you do not know where it is: it was not where you last saw it")
+    if not o.has_pose:
+        return String("you do not know where it is")
+    if o.where == OBJ_HELD:
+        return String("in your hands")
+    var t = String("")
+    if o.where == OBJ_PUT and o.put_at != "":
+        t = "next to the " + o.put_at + ", where you put it"
+    else:
+        var entries: List[PlaceXY] = [PlaceXY(o.name, o.x, o.y)]
+        for p in ws.places:
+            entries.append(p.copy())
+        var a = places_around(entries, ws.x, ws.y, ws.yaw_deg)[0].copy()
+        t = String("on the floor")
+        if ws.pose_known:
+            t += ", " + _side(a.bearing) + ", " + metres(a.distance_m)
+        if a.next_to != "none":
+            t += ", next to the " + a.next_to
+    if o.how == HOW_TOLD:
+        t += " (you were told so; you have not seen it)"
+    elif o.how == HOW_REMEMBERED:
+        t += " (from your memory of an earlier session)"
+    return t
+
+
+def objects_line(ref ws: WorldState) -> String:
+    """`Objects you know: crate (in French: la caisse): in your hands`; "" with no object."""
+    if len(ws.objects) == 0:
+        return String("")
+    var items = List[String]()
+    for i in range(len(ws.objects)):
+        var name = ws.objects[i].name.replace("_", " ")
+        var w = ws.word_for(ws.objects[i].name, ws.language)
+        if ws.language != "" and ws.language != "en" and w != "the " + ws.objects[i].name:
+            name += " (in " + language_name(ws.language) + ": " + w + ")"
+        items.append(name + ": " + object_phrase(ws, i))
+    return "Objects you know: " + _join(items, "; ") + "."
+
+
 def memory_section(ref ws: WorldState) -> String:
     """What the log says of earlier sessions and days (`noeira.brain.memory`),
     as a section of its own after the facts; "" for a robot without a memory.
@@ -240,6 +290,9 @@ def reply_live(ref ws: WorldState, style: Int = REPLY_VIEW_LINES) -> String:
             t += " Before this you were at the " + before[0] + ", and before that at the " + before[1] + "."
         else:
             t += " You have not been anywhere else yet."
+        var ol = objects_line(ws)
+        if ol != "":
+            t += " " + ol
         t += " You know of no other place or object in this room."
         return t + memory_section(ws)
     var t = String("Facts, true right now:\n")
@@ -263,6 +316,9 @@ def reply_live(ref ws: WorldState, style: Int = REPLY_VIEW_LINES) -> String:
         t += "- Before this you were at: " + _join(before, ", then ") + ".\n"
     else:
         t += "- You have not been anywhere else yet.\n"
+    var objs = objects_line(ws)
+    if objs != "":
+        t += "- " + objs + "\n"
     t += "- You know of no other place or object in this room."
     if ws.people_on:
         t += "\n- " + speaker_sentence(ws)  # last: the line that changes most (module note)

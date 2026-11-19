@@ -15,6 +15,12 @@ executive's `pick:` / `put:` steps, and the record read back from the log.
 6. `restore_objects`: the last event of each object, as remembered, into a
    new process's state, with and without the object added first; a damaged
    object event is reported and skipped.
+7. The voice side: « Où est la caisse ? » answered from the record (on the
+   floor, held, put, told, missing; French and English); an order to carry it
+   is a no for a body that does not carry, and a task of `pick:` / `put:`
+   for one that does (`Body.add_carry`, its skill line and the limit gone);
+   « porte » the door is not the verb; the reply view gains one objects line,
+   and a room without objects keeps its view.
 Exits non-zero on a failure.
 """
 
@@ -29,6 +35,8 @@ from noeira.brain import (
     Task, Step, give_task, tick_tasks, notice_text, jusqua,
     EX_NONE, EX_START, EX_NOTICE, NOTICE_NO_OBJECT, NOTICE_NOT_DONE, NOTICE_ALL_DONE, STOP_COMMAND,
     TASK_DONE, TASK_FAILED, restore_objects, BrainEvent, EventLog,
+    object_named, place_named, object_answer, computed_turn, carry_turn, capabilities_answer,
+    reply_live, reply_stable, objects_line,
 )
 
 
@@ -58,7 +66,15 @@ def room() -> WorldState:
     ws.call_place("crate", "fr", "la caisse")
     ws.call_place("table", "fr", "la table")
     ws.call_place("fridge", "fr", "le frigo")
+    ws.call_place("sofa", "fr", "le canapé")
     return ws^
+
+
+def ask(mut ws: WorldState, text: String) -> String:
+    """`computed_turn` for `text`: `answer | decides | command`."""
+    ws.asked = text.copy()
+    var ct = computed_turn(ws)
+    return ct.text + " | " + ("d1" if ct.decides else "settled") + " | " + ct.command
 
 
 def main() raises:
@@ -261,6 +277,84 @@ def main() raises:
     check(fails, a.kind == EX_START, "a remembered crate can be picked up")
     var w3 = room()
     check(fails, restore_objects(w3, dir + "_none", now) == 0 and len(w3.objects) == 0, "no log: nothing")
+
+    print("7. the voice side")
+    var v = room()
+    v.language = String("fr")
+    var bare = reply_live(v)
+    v.add_object(ObjectXY.box("crate", "crate", 0.13, 0.215, 0.19))
+    v.observe_pose(0.0, 0.0, 0.0)
+    check(fails, object_named(v, "Où est la caisse ?") == 0 and object_named(v, "Where is the crate?") == 0
+          and object_named(v, "Où est la table ?") == -1, "object_named: la caisse, the crate, not the table")
+    check(fails, place_named(v, "Porte-la au frigo.") == "fridge" and place_named(v, "à la table") == "table"
+          and place_named(v, "Prends la caisse.") == "", "place_named: au frigo, la table, none")
+    var r = ask(v, "Où est la caisse ?")
+    check(fails, r == "Je ne sais pas où est la caisse. | settled | ", "no pose: " + r)
+    _ = v.saw_object("crate", 2.0, 0.0, 0.0, 500.0, "sim", 1.0, 3000)
+    r = ask(v, "Où est la caisse ?")
+    check(fails, r == "La caisse est devant moi, à 2 mètres, près du frigo. | settled | ", "seen: " + r)
+    _ = v.saw_object("crate", 0.0, 1.5, 0.0, 500.0, "sim", 1.1, 3000)
+    r = ask(v, "Elle est où, la caisse ? Où est la caisse ?")
+    check(fails, r == "La caisse est à ma gauche, à 1,5 mètre, près du canapé. | settled | ", "left: " + r)
+    _ = v.told_object("crate", 2.0, 0.0, 0.0, "trials", 1.2, 3001)
+    r = ask(v, "Où est la caisse ?")
+    check(fails, r == "D'après ce qu'on m'a dit, la caisse est devant moi, à 2 mètres, près du frigo. | settled | ", "told: " + r)
+    v.language = String("en")
+    r = ask(v, "Where is the crate?")
+    check(fails, r == "I was told the crate is ahead of me, 2 m away, next to the fridge. | settled | ", "told, English: " + r)
+    v.language = String("fr")
+    _ = v.picked_up("crate", 1.3, 3002)
+    r = ask(v, "Où est la caisse ?")
+    check(fails, r == "La caisse est dans mes mains. | settled | ", "held: " + r)
+    _ = v.put_down("crate", "table", 0.0, -1.6, 0.0, 1.4, 3003)
+    _ = v.saw_object("crate", 0.0, -1.6, 0.0, 500.0, "sim", 1.5, 3003)
+    r = ask(v, "Où est la caisse ?")
+    check(fails, r == "La caisse est près de la table. | settled | ", "put: " + r)
+    _ = v.object_missing("crate", 1.6, 3004)
+    r = ask(v, "Où est la caisse ?")
+    check(fails, r == "Je ne sais pas où est la caisse. | settled | ", "missing: " + r)
+    _ = v.saw_object("crate", 2.0, 0.0, 0.0, 500.0, "sim", 1.7, 3005)
+    r = ask(v, "Où est la table ?")
+    check(fails, r == " | d1 | ", "a place, not an object: left to the models: " + r)
+
+    r = ask(v, "Porte la caisse à la table.")
+    check(fails, r == "Non, je ne peux pas porter la caisse. | settled | ", "a body that does not carry: " + r)
+    r = ask(v, "Noé, prends la caisse.")
+    check(fails, r == "Non, je ne peux pas prendre la caisse. | settled | ", "  take: " + r)
+    r = ask(v, "Regarde la caisse près de la porte.")
+    check(fails, r == " | d1 | ", "« la porte » is not the verb: " + r)
+    var lines_before = reply_stable(v)
+    v.body.add_carry("crate", "the crate", "la caisse")
+    check(fails, v.body.can_carry("crate") and not v.body.can_carry("ball"), "add_carry: can_carry")
+    var stable = reply_stable(v)
+    check(fails, stable.find("pick up the crate and carry it to a place; talk and answer questions") >= 0, "  the can line")
+    check(fails, stable.find("pick things up") < 0 and lines_before.find("pick things up") >= 0
+          and stable.find("you cannot: open the door; sit down.") >= 0, "  the limit gone, the others kept")
+    var caps = capabilities_answer(v)
+    check(fails, caps.find("porter la caisse jusqu'à un endroit de la pièce") >= 0, "  « " + caps + " »")
+    r = ask(v, "Porte la caisse à la table.")
+    check(fails, r == "D'accord ! | settled | task:put:crate:table", "carry: " + r)
+    r = ask(v, "Prends la caisse.")
+    check(fails, r == "D'accord ! | settled | task:pick:crate", "take: " + r)
+    r = ask(v, "Est-ce que tu peux porter la caisse au frigo ?")
+    check(fails, r == "Oui ! | settled | task:put:crate:fridge", "asked: " + r)
+    r = ask(v, "Pose la caisse près du canapé.")
+    check(fails, r == "D'accord ! | settled | task:put:crate:sofa", "put at a place: " + r)
+    r = ask(v, "Pose la caisse.")
+    check(fails, r == " | d1 | ", "put at no place: left to the decision: " + r)
+    v.language = String("en")
+    r = ask(v, "Bring the crate to the fridge.")
+    check(fails, r == "Okay! | settled | task:put:crate:fridge", "English: " + r)
+    v.language = String("fr")
+
+    var plain = room()
+    plain.language = String("fr")
+    check(fails, reply_live(plain) == bare and bare.find("Objects") < 0, "a room without objects: the view unchanged")
+    check(fails, bare.find("\n- \n") < 0 and bare.find("you were at") < 0 and bare.find("anywhere else yet.\n- You know of no other") >= 0,
+          "  no empty line: the closing line follows the last fact")
+    var line = objects_line(v)
+    check(fails, line == "Objects you know: crate (in French: la caisse): on the floor, ahead of you, 2 m, next to the fridge.", line)
+    check(fails, reply_live(v).find("- " + line + "\n- You know of no other place or object in this room.") >= 0, "  in the view, before the closing line")
 
     if fails > 0:
         print("FAILED:", fails)

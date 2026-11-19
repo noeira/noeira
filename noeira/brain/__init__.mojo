@@ -18,7 +18,9 @@ speaker is, whether the task is finished, what the body can do — `Skill`,
 `reply_sentences`: how long the model's own reply may be. Movable objects
 (`ObjectXY`, `noeira.brain.objects`): one record each, written from sightings,
 the hands and what is told, the `pick:` / `put:` steps that end on them, and
-`restore_objects`. A second body (B5) is not here yet.
+`restore_objects`; where one is (`object_answer`, the reply view's objects
+line) and an order to carry it (`carry_turn`, `Body.add_carry`). A second
+body (B5) is not here yet.
 """
 
 from .geometry import (
@@ -54,5 +56,9 @@ from .answers import (
     asks_task_done, task_done_answer, computed_reply, computed_reply_final, computed_turn, ComputedTurn,
     asks_capabilities, capabilities_answer, asks_can, can_turn,
     asks_for_more, reply_sentences, REPLY_SENTENCES, REPLY_SENTENCES_MORE,
+    object_named, place_named, asks_where, object_answer, object_turn, carry_turn,
 )
-from .views import ReplyView, reply_view, reply_stable, reply_live, task_sentences, speaker_sentence, memory_section, metres, language_name, REPLY_VIEW_LINES, REPLY_VIEW_SENTENCES
+from .views import (
+    ReplyView, reply_view, reply_stable, reply_live, task_sentences, speaker_sentence, memory_section, metres, language_name,
+    object_phrase, objects_line, REPLY_VIEW_LINES, REPLY_VIEW_SENTENCES,
+)

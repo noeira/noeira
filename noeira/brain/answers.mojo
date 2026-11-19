@@ -8,10 +8,14 @@
     var ct = computed_turn(ws)             # ct.text "" = the model replies
     voice.set_reply_override(ct.text, ct.final, ct.decides, ct.command)
 
-Four questions today:
+Six questions today:
 
 - who the speaker is (`noeira.brain.people.identity_answer`, B4);
 - whether the robot has finished what it was asked (`task_done_answer`);
+- where a movable object is (`object_answer`, from `ws.objects`);
+- an order to carry one (`carry_turn`): a task of `pick:` / `put:` steps
+  when the body carries it, a no otherwise (« Porte la caisse à la table »
+  must not send the robot walking to the table);
 - what it can do (`capabilities_answer`, from `Body.skills`);
 - whether it can do one thing, or an order to do it (`can_turn`): a limit is a
   no, a skill with a command is run (`ct.command`), and both SETTLE the turn
@@ -35,6 +39,8 @@ before — rather than a confident sentence about the wrong request.
 
 from .bb1 import normalise, has_phrase
 from .events import EV_BEGAN, EV_TASK_DONE, EV_TASK_FAILED, EV_TASK_CANCELLED
+from .geometry import PlaceXY, places_around
+from .objects import OBJ_HELD, OBJ_PUT, HOW_TOLD, HOW_REMEMBERED
 from .people import asks_identity, identity_answer
 from .state import WorldState, Skill, TASK_DONE, TASK_FAILED
 
@@ -309,8 +315,8 @@ def capabilities_answer(ref ws: WorldState) -> String:
             for p in ws.places:
                 ps.append(_a_fr(ws.word_for(p.name, String("fr"))) if fr else ws.word_for(p.name, ws.language))
             items.append((String("aller ") if fr else String("walk to ")) + _list_fr(ps, String("ou") if fr else String("or")))
-        elif s.command == "" and not s.to_places and len(s.forms) == 0:
-            continue    # talking
+        elif s.talking():
+            continue
         elif fr:
             items.append(s.fr)
         else:
@@ -436,14 +442,267 @@ def reply_sentences(ref ws: WorldState) -> Int:
     return REPLY_SENTENCES_MORE if asks_for_more(ws.asked) else REPLY_SENTENCES
 
 
+# ── movable objects (« Où est la caisse ? », « Porte la caisse à la table. ») ──
+
+
+def _no_article(word: String) -> String:
+    """`la caisse` -> `caisse`, `l'étagère` -> `étagère`, `the crate` -> `crate`."""
+    var arts: List[String] = ["le ", "la ", "les ", "un ", "une ", "the ", "a "]
+    for a in arts:
+        if word.startswith(a):
+            return String(word[byte=a.byte_length():])
+    if word.startswith("l'"):
+        return String(word[byte=2:])
+    return word.copy()
+
+
+def _forms_of(ws: WorldState, name: String) -> List[String]:
+    """The words that name a place or an object: its name, and each of its
+    words with and without the article."""
+    var out: List[String] = [name.replace("_", " ")]
+    for w in ws.place_words:
+        if w.place == name:
+            out.append(w.word.copy())
+            out.append(_no_article(w.word))
+    return out^
+
+
+def object_named(ws: WorldState, text: String) -> Int:
+    """The object a sentence names (`ws.objects`), by its longest form; -1 for none."""
+    var t = _plain(text)
+    var best = -1
+    var best_n = 0
+    for i in range(len(ws.objects)):
+        var forms = _forms_of(ws, ws.objects[i].name)
+        forms.append(ws.objects[i].label.copy())
+        for f in forms:
+            var p = _plain(f)
+            if len(p) > best_n and has_phrase(t, p):
+                best = i
+                best_n = len(p)
+    return best
+
+
+def place_named(ws: WorldState, text: String) -> String:
+    """The place a sentence names (`ws.places`), by its longest form; "" for none."""
+    var t = _plain(text)
+    var best = String("")
+    var best_n = 0
+    for pl in ws.places:
+        for f in _forms_of(ws, pl.name):
+            var p = _plain(f)
+            if len(p) > best_n and has_phrase(t, p):
+                best = pl.name.copy()
+                best_n = len(p)
+    return best
+
+
+def asks_where(text: String) -> Bool:
+    """Whether a sentence asks where something is (French and English)."""
+    var t = _plain(text)
+    var forms: List[String] = [
+        "où est", "où se trouve", "où sont", "où tu as mis", "où as-tu mis", "où tu l'as mis", "où l'as-tu mis",
+        "c'est où", "where is", "where's", "where are", "where did you put",
+    ]
+    return _any(t, forms)
+
+
+def _cap(s: String) -> String:
+    """The first letter upper case (ASCII): `la caisse` -> `La caisse`."""
+    if s.byte_length() == 0:
+        return s.copy()
+    var b = s.as_bytes()
+    if b[0] >= 97 and b[0] <= 122:
+        return chr(Int(b[0]) - 32) + String(s[byte=1:])
+    return s.copy()
+
+
+def _pres_de(word: String) -> String:
+    """« près de » before a French noun phrase: près de la table, près du frigo, près des chaises."""
+    if word.startswith("le "):
+        return "près du " + String(word[byte=3:])
+    if word.startswith("les "):
+        return "près des " + String(word[byte=4:])
+    return "près de " + word
+
+
+def _metres_fr(d: Float64) -> String:
+    """`2 mètres`, `2,5 mètres`, `0,5 mètre`: a distance already rounded to 0.5 m."""
+    var whole = Int(d)
+    var n = String(whole) if Float64(whole) == d else String(d).replace(".", ",")
+    return n + (String(" mètre") if d < 2.0 else String(" mètres"))
+
+
+def _metres_en(d: Float64) -> String:
+    var whole = Int(d)
+    return (String(whole) if Float64(whole) == d else String(d)) + " m"
+
+
+def object_answer(ref ws: WorldState, i: Int) -> String:
+    """Where object `i` is, as the record has it, in the conversation's
+    language (French, else English): « La caisse est devant moi, à 2 mètres,
+    près de la table. », « La caisse est dans mes mains. », « Je ne sais pas
+    où est la caisse. ». A told or remembered pose says so (« D'après ce
+    qu'on m'a dit, … », « Si je me souviens bien, … »).
+
+    ⚠ A TEMPLATE, like `task_done_answer`: the record is exact, and the
+    places' arithmetic is `geometry`'s, from where the robot stands."""
+    var fr = ws.language == "fr"
+    ref o = ws.objects[i]
+    var word = ws.word_for(o.name, ws.language)
+    if o.missing or not o.has_pose:
+        return ("Je ne sais pas où est " + word + ".") if fr else ("I do not know where " + word + " is.")
+    if o.where == OBJ_HELD:
+        # the hands know: no "I was told"
+        return _cap(word) + (String(" est dans mes mains.") if fr else String(" is in my hands."))
+    var where = String("")
+    if o.where == OBJ_PUT and o.put_at != "":
+        var pw = ws.word_for(o.put_at, ws.language)
+        where = _pres_de(pw) if fr else ("next to " + pw)
+    else:
+        var entries: List[PlaceXY] = [PlaceXY(o.name, o.x, o.y)]
+        for p in ws.places:
+            entries.append(p.copy())
+        var a = places_around(entries, ws.x, ws.y, ws.yaw_deg)[0].copy()
+        var parts = List[String]()
+        if ws.pose_known:
+            if a.distance_m < 1.0:
+                parts.append(String("juste à côté de moi") if fr else String("right next to me"))
+            else:
+                var side = String("")
+                if a.bearing == "ahead":
+                    side = String("devant moi") if fr else String("ahead of me")
+                elif a.bearing == "left":
+                    side = String("à ma gauche") if fr else String("on my left")
+                elif a.bearing == "right":
+                    side = String("à ma droite") if fr else String("on my right")
+                else:
+                    side = String("derrière moi") if fr else String("behind me")
+                parts.append(side)
+                parts.append(("à " + _metres_fr(a.distance_m)) if fr else (_metres_en(a.distance_m) + " away"))
+        if a.next_to != "none":
+            var nw = ws.word_for(a.next_to, ws.language)
+            parts.append(_pres_de(nw) if fr else ("next to " + nw))
+        if len(parts) == 0:
+            return ("Je ne sais pas où est " + word + ".") if fr else ("I do not know where " + word + " is.")
+        for k in range(len(parts)):
+            if k > 0:
+                where += ", "
+            where += parts[k]
+    var said = (word + " est " + where) if fr else (word + " is " + where)
+    if o.how == HOW_TOLD:
+        return ("D'après ce qu'on m'a dit, " + said + ".") if fr else ("I was told " + said + ".")
+    if o.how == HOW_REMEMBERED:
+        return ("Si je me souviens bien, " + said + ".") if fr else ("As far as I remember, " + said + ".")
+    return _cap(said) + "."
+
+
+def object_turn(ref ws: WorldState) -> ComputedTurn:
+    """« Où est la caisse ? »: `object_answer`, the turn settled. "" when the
+    sentence asks for no object the state knows."""
+    if not asks_where(ws.asked):
+        return ComputedTurn(String(""))
+    var i = object_named(ws, ws.asked)
+    if i < 0:
+        return ComputedTurn(String(""))
+    return ComputedTurn(object_answer(ws, i), True, False)
+
+
+def _verb_of(ref ws: WorldState, ref t: List[UInt8]) -> Int:
+    """0 none, 1 take (prends, ramasse, pick up), 2 carry (porte, apporte,
+    bring), 3 put (pose, mets, put): the verb of an order about an object.
+
+    ⚠ A FRENCH IMPERATIVE COUNTS AT THE SENTENCE'S HEAD ONLY: « porte » is
+    also the door (« La caisse est près de la porte, prends-la. » is a take,
+    not a carry), « range » a row. The infinitives (« tu peux porter … ? »)
+    and the English verbs count anywhere."""
+    var h = _head(t, ws.body.name)
+    var put_head: List[String] = ["pose", "dépose", "mets", "range", "place"]
+    var put_any: List[String] = ["poser", "déposer", "mettre", "ranger", "put", "set down"]
+    var carry_head: List[String] = ["porte", "apporte", "rapporte", "amène", "ramène", "emmène", "emporte", "déplace"]
+    var carry_any: List[String] = [
+        "porter", "apporter", "rapporter", "amener", "ramener", "emmener", "emporter", "déplacer", "carry", "bring", "move", "take",
+    ]
+    var take_head: List[String] = ["prends", "ramasse", "attrape", "soulève"]
+    var take_any: List[String] = ["prendre", "ramasser", "attraper", "soulever", "pick up", "grab", "lift"]
+    for f in put_head:
+        if _starts(t, h, _plain(f)):
+            return 3
+    for f in carry_head:
+        if _starts(t, h, _plain(f)):
+            return 2
+    for f in take_head:
+        if _starts(t, h, _plain(f)):
+            return 1
+    if _any(t, put_any):
+        return 3
+    if _any(t, carry_any):
+        return 2
+    if _any(t, take_any):
+        return 1
+    return 0
+
+
+def carry_turn(ref ws: WorldState) -> ComputedTurn:
+    """« Porte la caisse à la table. », « Prends la caisse. », « Tu peux poser
+    la caisse près du frigo ? »: an order (or a request) about an object the
+    state knows, by its verb.
+
+    - with a place: the task `task:put:<object>:<place>`;
+    - without one, taken or carried: `task:pick:<object>`; put down with no
+      place: no answer (the decision reads it);
+    - a body that does not carry it (`Body.can_carry`): « Non, je ne peux pas
+      porter la caisse. », the turn settled. ⚠ Left to the decision, « Porte
+      la caisse à la table » named a place, and a place is a walk.
+
+    The answer is « D'accord ! » / « Oui ! »: the executive's notices say how
+    it ends (`noeira.brain.tasks`)."""
+    var none = ComputedTurn(String(""))
+    var t = _plain(ws.asked)
+    var verb = _verb_of(ws, t)
+    if verb == 0:
+        return none^
+    var i = object_named(ws, ws.asked)
+    if i < 0:
+        return none^
+    var fr = ws.language == "fr"
+    var obj = ws.objects[i].name.copy()
+    var place = place_named(ws, ws.asked)
+    var asking = asks_can(ws.asked)
+    if not ws.body.can_carry(obj):
+        var word = ws.word_for(obj, ws.language)
+        var v_fr = String("prendre") if verb == 1 else (String("poser") if verb == 3 else String("porter"))
+        var v_en = String("pick up") if verb == 1 else (String("put down") if verb == 3 else String("carry"))
+        if fr:
+            return ComputedTurn("Non, je ne peux pas " + v_fr + " " + word + ".", True, False)
+        return ComputedTurn("No, I cannot " + v_en + " " + word + ".", True, False)
+    var cmd = String("")
+    if place != "":
+        cmd = "task:put:" + obj + ":" + place
+    elif verb == 3:
+        return none^
+    else:
+        cmd = "task:pick:" + obj
+    var yes = (String("Oui !") if fr else String("Yes!")) if asking else (String("D'accord !") if fr else String("Okay!"))
+    return ComputedTurn(yes, True, False, cmd)
+
+
 def computed_turn(ref ws: WorldState) -> ComputedTurn:
     """What code answers to `ws.asked`, and what the decision may still do;
     `text` "" = nothing computed. In order: who the speaker is, whether the task
-    is finished, what the robot can do, whether it can do one thing."""
+    is finished, where an object is, an order to carry one, what the robot can
+    do, whether it can do one thing."""
     if ws.people_on and asks_identity(ws.asked):
         return ComputedTurn(identity_answer(ws), computed_reply_final(ws))
     if asks_task_done(ws.asked):
         return ComputedTurn(task_done_answer(ws))
+    if len(ws.objects) > 0:
+        var ot = object_turn(ws)
+        if ot.text != "":
+            return ot^
+        var cr = carry_turn(ws)
+        if cr.text != "":
+            return cr^
     if asks_capabilities(ws.asked):
         return ComputedTurn(capabilities_answer(ws), True, False)
     return can_turn(ws)

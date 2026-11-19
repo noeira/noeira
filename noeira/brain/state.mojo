@@ -82,6 +82,10 @@ struct Skill(Copyable, Movable):
     """Walking to a place: « aller au frigo, à la porte… », the places listed."""
     var motion: Bool
     """A named motion (`Body.add_motion`): the list of skills names two of them, not all."""
+    var carries: String
+    """Carrying an object (`Body.add_carry`): its name; "" otherwise. Asked
+    for by `answers.carry_turn`, which needs the object and the place, not by
+    `forms`."""
 
     def __init__(out self, var en: String, var fr: String, var command: String, var forms: List[String],
                  to_places: Bool = False, motion: Bool = False):
@@ -91,6 +95,11 @@ struct Skill(Copyable, Movable):
         self.forms = forms^
         self.to_places = to_places
         self.motion = motion
+        self.carries = String("")
+
+    def talking(self) -> Bool:
+        """The skill with nothing to run and no words: talking."""
+        return self.command == "" and not self.to_places and len(self.forms) == 0 and self.carries == ""
 
 
 def known_motion(name: String) -> Bool:
@@ -170,15 +179,46 @@ struct Body(Copyable, Movable):
         `g1_room`'s five. Only a body that has the motions adds them."""
         var s = motion_skill(name)
         s.motion = True
+        self._insert_before_talking(s^)
+
+    def _insert_before_talking(mut self, var s: Skill):
         var at = len(self.skills)
         for i in range(len(self.skills)):
-            if self.skills[i].command == "" and not self.skills[i].to_places and len(self.skills[i].forms) == 0:
+            if self.skills[i].talking():
                 at = i
                 break
         # ⚠ `can` and `skills` in the same order, so the view and the answers list them alike
         var k = len(self.can) - (len(self.skills) - at)
         self.can.insert(k, s.en)
         self.skills.insert(at, s^)
+
+    def can_carry(self, obj: String) -> Bool:
+        """`add_carry` was called for `obj`."""
+        for s in self.skills:
+            if s.carries == obj:
+                return True
+        return False
+
+    def add_carry(mut self, obj: String, obj_en: String, obj_fr: String):
+        """It can pick up the object `obj` and carry it to a place: a skill
+        before talking (« porter la caisse jusqu'à un endroit de la pièce »),
+        and the limit that says it cannot carry anything is dropped. Only a
+        body whose policy carries it (the room's `Locomotion.knows("carry")`)
+        adds it: the reply view's `can` line then changes."""
+        var i = 0
+        while i < len(self.limits):
+            if self.limits[i].en == "pick things up or carry them":
+                for k in range(len(self.cannot)):
+                    if self.cannot[k] == self.limits[i].en:
+                        _ = self.cannot.pop(k)
+                        break
+                _ = self.limits.pop(i)
+            else:
+                i += 1
+        var s = Skill("pick up " + obj_en + " and carry it to a place", "porter " + obj_fr + " jusqu'à un endroit de la pièce",
+                      String(""), List[String]())
+        s.carries = obj.copy()
+        self._insert_before_talking(s^)
 
     @staticmethod
     def g1_room(name: String) -> Body:
