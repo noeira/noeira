@@ -8,7 +8,7 @@ far the interface's action is from the tracker's own.
 
     pixi run mojo build -I . examples/g1/supermimic_object_trace_cpu.mojo -o build/sm_obj_trace
     pixi run ./build/sm_obj_trace --ckpt TRACKER.ckpt --store CARRY_50HZ.h5 --object-dir OBJECT_CSV_DIR \\
-        --only NAME[,NAME…] --out-dir DIR [--interface INTERFACE.ckpt] [--gain 0.1]
+        --only NAME[,NAME…] --out-dir DIR [--interface INTERFACE.ckpt] [--gain 0.1] [--near 0.6 --far 1.0]
         [--squeeze 40] [--ref-squeeze 0.05] [--ref-lower 1.0] [--trials 8 --seed 0] [--lead-in 50] [--csv OUT.csv]
         [--teacher 1 --ft-squeeze 10 --ft-squeeze-max 60 --ft-mu 0.5 --ft-mass 1 --ft-kp 200 --ft-kd 20 --ft-kr 5 --ft-kw 0.5
          --ft-point 0.11,-0.01,0 --ft-fmax 60 --ft-rel 1 --ft-mmax 1.5
@@ -18,6 +18,9 @@ far the interface's action is from the tracker's own.
                      carry, `object_task.SMObjCarryTally`, and the same kernels): the laptop's stand-in for the
                      device benchmark. A run's last step is in neither the carry's account nor the kernels here.
 
+    --near A --far B the interface's gain by the box's horizontal distance to the robot's root: whole within A metres,
+                     zero beyond B, linear between (the tracker alone walks up to a box it has never seen from afar).
+                     0 0, the default: the gain is whole everywhere.
     --squeeze F      the scripted squeeze on the executed actions (`object_task.sm_squeeze_lane`), F newtons
     --ref-squeeze D  the reference's hands D metres toward the box while it is lifted (`sm_squeeze_reference`)
     --teacher 1      the force teacher on the executed actions (`object_task.sm_force_teacher_lane`): the wrench that
@@ -141,6 +144,8 @@ def main() raises:
     var only = _opt(args, String("--only"), String(""))
     var out_dir = _opt(args, String("--out-dir"), String(""))
     var gain = Float64(_opt(args, String("--gain"), String(OC.DEF_GAIN)))
+    var near = Float64(_opt(args, String("--near"), String("0")))
+    var far = Float64(_opt(args, String("--far"), String("0")))
     var squeeze = Float64(_opt(args, String("--squeeze"), String("0")))
     var ref_squeeze = Float64(_opt(args, String("--ref-squeeze"), String("0")))
     var ref_lower = Float64(_opt(args, String("--ref-lower"), String("0")))
@@ -319,6 +324,11 @@ def main() raises:
                     o_t.data[7 + k] = Scalar[DT](env.lanes[0].sim.box_qvel(k))
                 for k in range(SM_OREF):
                     oref_t.data[k] = orefs[fr * SM_OREF + k]
+                if far > 0.0:
+                    var bx = Float64(o_t.data[0]) - Float64(s_t.data[0])
+                    var by = Float64(o_t.data[1]) - Float64(s_t.data[1])
+                    var dist = sqrt(bx * bx + by * by)
+                    tr.gain = gain * min(max((far - dist) / max(far - near, 1e-9), 0.0), 1.0)
                 var a = tr.act[1](hist, goals, s_t, o_t, oref_t)
                 var ab = tr.base.act[1](hist, goals)
                 if squeeze > 0.0:
