@@ -86,6 +86,10 @@ struct Skill(Copyable, Movable):
     """Carrying an object (`Body.add_carry`): its name; "" otherwise. Asked
     for by `answers.carry_turn`, which needs the object and the place, not by
     `forms`."""
+    var picks_alone: Bool
+    """A carry skill that also picks the object up with no place to take it
+    to (`task:pick:<object>`). False for the room's crate: its body runs the
+    whole carry (walk up, pick up, carry, put down) or nothing."""
 
     def __init__(out self, var en: String, var fr: String, var command: String, var forms: List[String],
                  to_places: Bool = False, motion: Bool = False):
@@ -96,6 +100,7 @@ struct Skill(Copyable, Movable):
         self.to_places = to_places
         self.motion = motion
         self.carries = String("")
+        self.picks_alone = False
 
     def talking(self) -> Bool:
         """The skill with nothing to run and no words: talking."""
@@ -199,12 +204,21 @@ struct Body(Copyable, Movable):
                 return True
         return False
 
-    def add_carry(mut self, obj: String, obj_en: String, obj_fr: String):
+    def can_pick_alone(self, obj: String) -> Bool:
+        """`add_carry` was called for `obj` with `picks_alone`."""
+        for s in self.skills:
+            if s.carries == obj:
+                return s.picks_alone
+        return False
+
+    def add_carry(mut self, obj: String, obj_en: String, obj_fr: String, picks_alone: Bool = True):
         """It can pick up the object `obj` and carry it to a place: a skill
         before talking (« porter la caisse jusqu'à un endroit de la pièce »),
         and the limit that says it cannot carry anything is dropped. Only a
         body whose policy carries it (the room's `Locomotion.knows("carry")`)
-        adds it: the reply view's `can` line then changes."""
+        adds it: the reply view's `can` line then changes. `picks_alone`
+        False: an order to pick it up with no place is answered by asking
+        where (`answers.carry_turn`), not given to the body."""
         var i = 0
         while i < len(self.limits):
             if self.limits[i].en == "pick things up or carry them":
@@ -218,6 +232,7 @@ struct Body(Copyable, Movable):
         var s = Skill("pick up " + obj_en + " and carry it to a place", "porter " + obj_fr + " jusqu'à un endroit de la pièce",
                       String(""), List[String]())
         s.carries = obj.copy()
+        s.picks_alone = picks_alone
         self._insert_before_talking(s^)
 
     @staticmethod
@@ -271,6 +286,10 @@ struct Step(Copyable, Movable):
     var hold_s: Float64
     var status: Int
     var t_start: Float64
+    var held: Bool
+    """A `put:` step: its object was seen held while the step ran (the
+    executive's own note). Let go afterwards anywhere but at the place, the
+    step has failed."""
 
     def __init__(out self, var command: String, var label: String, var place: String):
         self.command = command^
@@ -281,6 +300,7 @@ struct Step(Copyable, Movable):
         self.hold_s = STEP_HOLD_S
         self.status = STEP_PENDING
         self.t_start = 0.0
+        self.held = False
 
     @staticmethod
     def goto(place: String) -> Step:
@@ -303,8 +323,9 @@ struct Step(Copyable, Movable):
     @staticmethod
     def put(obj: String, place: String) -> Step:
         """Put an object at a place (`put:crate:table`): done when it was put
-        down there, failed after `timeout_s`. The body decides whether that
-        includes walking there and picking it up first."""
+        down there, failed after `timeout_s`, or as soon as it is let go
+        elsewhere after being held. The body decides whether that includes
+        walking there and picking it up first."""
         var s = Step("put:" + obj + ":" + place, "put the " + obj + " at the " + place, place.copy())
         s.obj = obj.copy()
         return s^

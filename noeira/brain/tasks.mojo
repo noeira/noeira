@@ -32,8 +32,11 @@ A STEP is one command of the body, as the body takes it (`goto:table`,
   record: held for a pick, put down at the step's place for a put
   (`noeira.brain.objects`); failed after `timeout_s`, and at once, before the
   body is given anything, when the state has no pose for the object or it is
-  missing.
-A command the body refuses fails its step (`refuse_step`).
+  missing. A put step whose object was held and then let go anywhere but at
+  its place has failed at once (`NOTICE_PUT_ELSEWHERE`): no timeout to wait.
+A command the body refuses fails its step (`refuse_step`, with the body's
+reason for the log); for an object step the notice names the object and the
+place (« Je ne peux pas porter la caisse jusqu'à la table. »).
 
 THE CLOCK is the caller's, in seconds (`t`): simulated time in a headless run,
 so a scripted episode replays exactly. `now` (epoch seconds) only dates the
@@ -74,6 +77,8 @@ comptime NOTICE_NO_OBJECT = "no_object"
 not know where it is. Nothing was given to the body."""
 comptime NOTICE_NOT_DONE = "not_done"
 """A step's object was not picked up (or not put at its place) in time."""
+comptime NOTICE_PUT_ELSEWHERE = "put_elsewhere"
+"""A put step's object was held, then let go somewhere other than its place."""
 
 
 @fieldwise_init
@@ -131,9 +136,10 @@ def cancel_task(mut ws: WorldState, reason: String, t: Float64, now: Int):
         _finish(ws, TASK_CANCELLED, reason, t, now)
 
 
-def refuse_step(mut ws: WorldState, t: Float64, now: Int) -> ExecAction:
+def refuse_step(mut ws: WorldState, t: Float64, now: Int, why: String = "") -> ExecAction:
     """The body did not take the command `tick_tasks` just started: the step
-    and its task fail, and the person is told."""
+    and its task fail, and the person is told. `why`: the body's reason, for
+    the log ("" = it has no such command)."""
     if not ws.has_task:
         return ExecAction.none()
     var k = ws.task.at
@@ -141,7 +147,7 @@ def refuse_step(mut ws: WorldState, t: Float64, now: Int) -> ExecAction:
     var cmd = ws.task.steps[k].command.copy()
     var place = ws.task.steps[k].place.copy()
     var obj = ws.task.steps[k].obj.copy()
-    _finish(ws, TASK_FAILED, "the robot has no command '" + cmd + "'", t, now)
+    _finish(ws, TASK_FAILED, ("the robot has no command '" + cmd + "'") if why == "" else ("the body refused '" + cmd + "': " + why), t, now)
     return ExecAction(EX_NOTICE, String(""), String(NOTICE_REFUSED), place, obj)
 
 
@@ -173,6 +179,15 @@ def tick_tasks(mut ws: WorldState, t: Float64, now: Int) -> ExecAction:
             done = ws.objects[oi].where == OBJ_HELD
         elif oi >= 0:
             done = ws.objects[oi].where == OBJ_PUT and ws.objects[oi].put_at == place
+            if ws.objects[oi].where == OBJ_HELD:
+                ws.task.steps[k].held = True
+            elif not done and ws.task.steps[k].held:
+                # held, then let go elsewhere: the body has ended its carry
+                ws.task.steps[k].status = STEP_FAILED
+                var at = ws.objects[oi].put_at.copy()
+                _finish(ws, TASK_FAILED, "the " + obj + " was put down " + (("at the " + at) if at != "" else String("at no place"))
+                        + ", not at the " + place, t, now)
+                return ExecAction(EX_NOTICE, String(""), String(NOTICE_PUT_ELSEWHERE), place, obj)
         if not done and elapsed > ws.task.steps[k].timeout_s:
             ws.task.steps[k].status = STEP_FAILED
             var what = ("the " + obj + " was not picked up") if place == "" else ("the " + obj + " was not put at the " + place)
@@ -215,11 +230,23 @@ def notice_text(ref ws: WorldState, act: ExecAction) -> String:
         if fr:
             return "Je n'ai pas réussi à atteindre " + place + "."
         return "I could not reach " + place + "."
-    if act.notice == NOTICE_REFUSED:
-        return String("Je ne sais pas faire ça.") if fr else String("I do not know how to do that.")
     if act.notice == NOTICE_ALL_DONE:
         return String("C'est fait.") if fr else String("Done.")
     var thing = ws.word_for(act.obj, ws.language)
+    if act.notice == NOTICE_REFUSED:
+        if act.obj == "":
+            return String("Je ne sais pas faire ça.") if fr else String("I do not know how to do that.")
+        if act.place == "":
+            if fr:
+                return "Je ne peux pas prendre " + thing + "."
+            return "I cannot pick up " + thing + "."
+        if fr:
+            return "Je ne peux pas porter " + thing + " " + jusqua(place) + "."
+        return "I cannot carry " + thing + " to " + place + "."
+    if act.notice == NOTICE_PUT_ELSEWHERE:
+        if fr:
+            return "J'ai posé " + thing + ", mais pas " + pres_de(place) + "."
+        return "I put " + thing + " down, but not at " + place + "."
     if act.notice == NOTICE_NO_OBJECT:
         if fr:
             return "Je ne sais pas où est " + thing + "."
@@ -233,6 +260,15 @@ def notice_text(ref ws: WorldState, act: ExecAction) -> String:
             return "Je n'ai pas réussi à porter " + thing + " " + jusqua(place) + "."
         return "I could not carry " + thing + " to " + place + "."
     return String("")
+
+
+def pres_de(word: String) -> String:
+    """« près de » before a French noun phrase: près de la table, près du frigo, près des chaises."""
+    if word.startswith("le "):
+        return "près du " + String(word[byte=3:])
+    if word.startswith("les "):
+        return "près des " + String(word[byte=4:])
+    return "près de " + word
 
 
 def jusqua(word: String) -> String:

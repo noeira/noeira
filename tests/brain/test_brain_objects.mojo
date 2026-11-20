@@ -32,7 +32,8 @@ from noeira.brain import (
     WorldState, Body, PlaceXY, ObjectXY, object_event_text, parse_object_event, heading_mod, heading_diff,
     OBJ_FLOOR, OBJ_HELD, OBJ_PUT, HOW_SEEN, HOW_TOLD, HOW_REMEMBERED, OBJ_GAP_S,
     EV_SAW, EV_TOLD_WHERE, EV_LOST, EV_PICKED, EV_PUT,
-    Task, Step, give_task, tick_tasks, notice_text, jusqua,
+    Task, Step, give_task, tick_tasks, refuse_step, notice_text, jusqua, pres_de,
+    NOTICE_REFUSED, NOTICE_PUT_ELSEWHERE,
     EX_NONE, EX_START, EX_NOTICE, NOTICE_NO_OBJECT, NOTICE_NOT_DONE, NOTICE_ALL_DONE, STOP_COMMAND,
     TASK_DONE, TASK_FAILED, restore_objects, BrainEvent, EventLog,
     object_named, place_named, object_answer, computed_turn, carry_turn, capabilities_answer,
@@ -215,10 +216,25 @@ def main() raises:
     give_task(ex, wrong^, c, 2020)
     _ = tick_tasks(ex, c, 2020)
     _ = ex.picked_up("crate", c, 2021)
+    a = tick_tasks(ex, c + 0.5, 2021)
+    check(fails, a.kind == EX_NONE and ex.has_task and ex.task.steps[0].held, "put: held, carrying")
     _ = ex.put_down("crate", "sofa", -2.0, 0.6, 0.0, c + 1.0, 2022)
     a = tick_tasks(ex, c + 1.0, 2022)
-    check(fails, a.kind == EX_NONE and ex.has_task, "put at the sofa: not the table, not done")
-    a = tick_tasks(ex, c + 61.0, 2082)
+    check(fails, a.kind == EX_NOTICE and a.notice == NOTICE_PUT_ELSEWHERE and a.command == "" and not ex.has_task
+          and ex.last_task.status == TASK_FAILED, "  let go at the sofa: failed at once, no stop")
+    check(fails, notice_text(ex, a) == "J'ai posé la caisse, mais pas près de la table.", "  « " + notice_text(ex, a) + " »")
+    check(fails, ex.last_task.reason == "the crate was put down at the sofa, not at the table", "  " + ex.last_task.reason)
+    ex.language = String("en")
+    check(fails, notice_text(ex, a) == "I put the crate down, but not at the table.", "  " + notice_text(ex, a))
+    ex.language = String("fr")
+
+    var slow = Task(String("porte la caisse à la table"))
+    slow.steps.append(Step.put("crate", "table"))
+    give_task(ex, slow^, c + 2.0, 2024)
+    _ = tick_tasks(ex, c + 2.0, 2024)
+    a = tick_tasks(ex, c + 3.0, 2025)
+    check(fails, a.kind == EX_NONE and ex.has_task, "a put never picked up: put at the sofa from before is not a failure")
+    a = tick_tasks(ex, c + 63.0, 2085)
     check(fails, a.kind == EX_NOTICE and a.notice == NOTICE_NOT_DONE and a.command == STOP_COMMAND, "  timed out: stop, a notice")
     check(fails, notice_text(ex, a) == "Je n'ai pas réussi à porter la caisse jusqu'à la table.", "  « " + notice_text(ex, a) + " »")
     ex.language = String("en")
@@ -240,6 +256,30 @@ def main() raises:
     check(fails, a.kind == EX_NOTICE and a.notice == NOTICE_NO_OBJECT, "a missing crate: not where it was, a notice")
     check(fails, jusqua("le frigo") == "jusqu'au frigo" and jusqua("les chaises") == "jusqu'aux chaises"
           and jusqua("la porte") == "jusqu'à la porte", "jusqu'au / jusqu'aux / jusqu'à")
+    check(fails, pres_de("le frigo") == "près du frigo" and pres_de("les chaises") == "près des chaises"
+          and pres_de("la table") == "près de la table", "près du / près des / près de")
+
+    _ = ex.saw_object("crate", 2.0, 0.0, 0.0, 500.0, "sim", 170.0, 2170)
+    var nope = Task(String("porte la caisse à la table"))
+    nope.steps.append(Step.put("crate", "table"))
+    give_task(ex, nope^, 170.0, 2170)
+    a = tick_tasks(ex, 170.0, 2170)
+    check(fails, a.kind == EX_START and a.command == "put:crate:table", "a put the body will refuse: given")
+    a = refuse_step(ex, 170.0, 2170, "no chain reaches the destination")
+    check(fails, a.kind == EX_NOTICE and a.notice == NOTICE_REFUSED and a.obj == "crate" and a.place == "table"
+          and not ex.has_task, "  refused: a notice at once, the task over")
+    check(fails, notice_text(ex, a) == "Je ne peux pas porter la caisse jusqu'à la table.", "  « " + notice_text(ex, a) + " »")
+    check(fails, ex.last_task.reason == "the body refused 'put:crate:table': no chain reaches the destination", "  " + ex.last_task.reason)
+    ex.language = String("en")
+    check(fails, notice_text(ex, a) == "I cannot carry the crate to the table.", "  " + notice_text(ex, a))
+    ex.language = String("fr")
+    var nopick = Task(String("prends la caisse"))
+    nopick.steps.append(Step.pick("crate"))
+    give_task(ex, nopick^, 171.0, 2171)
+    _ = tick_tasks(ex, 171.0, 2171)
+    a = refuse_step(ex, 171.0, 2171)
+    check(fails, notice_text(ex, a) == "Je ne peux pas prendre la caisse." and ex.last_task.reason == "the robot has no command 'pick:crate'",
+          "  a refused pick: « " + notice_text(ex, a) + " », " + ex.last_task.reason)
 
     print("6. restore_objects")
     var dir = getenv("TMPDIR", "/tmp") + "/noeira_brain_objects_" + String(perf_counter_ns())
@@ -346,6 +386,25 @@ def main() raises:
     r = ask(v, "Bring the crate to the fridge.")
     check(fails, r == "Okay! | settled | task:put:crate:fridge", "English: " + r)
     v.language = String("fr")
+    check(fails, v.body.can_pick_alone("crate"), "add_carry's default: it picks up alone")
+
+    var w = room()
+    w.language = String("fr")
+    w.add_object(ObjectXY.box("crate", "crate", 0.13, 0.215, 0.19))
+    w.call_place("crate", "fr", "la caisse")
+    _ = w.saw_object("crate", 2.0, 0.0, 0.0, 500.0, "sim", 1.0, 3000)
+    w.body.add_carry("crate", "the crate", "la caisse", picks_alone=False)
+    check(fails, w.body.can_carry("crate") and not w.body.can_pick_alone("crate"), "a body that carries only to a place")
+    r = ask(w, "Prends la caisse.")
+    check(fails, r == "Dis-moi où porter la caisse. | settled | ", "  take, no place: asks where, nothing run: " + r)
+    r = ask(w, "Porte la caisse.")
+    check(fails, r == "Dis-moi où porter la caisse. | settled | ", "  carry, no place: " + r)
+    r = ask(w, "Prends la caisse et pose-la sur la table.")
+    check(fails, r == "D'accord ! | settled | task:put:crate:table", "  with a place: the whole carry: " + r)
+    w.language = String("en")
+    r = ask(w, "Pick up the crate.")
+    check(fails, r == "Tell me where to take the crate. | settled | ", "  English: " + r)
+    w.language = String("fr")
 
     var plain = room()
     plain.language = String("fr")

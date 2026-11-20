@@ -43,6 +43,7 @@ from .geometry import PlaceXY, places_around
 from .objects import OBJ_HELD, OBJ_PUT, HOW_TOLD, HOW_REMEMBERED
 from .people import asks_identity, identity_answer
 from .state import WorldState, Skill, TASK_DONE, TASK_FAILED
+from .tasks import pres_de
 
 
 def _plain(text: String) -> List[UInt8]:
@@ -517,15 +518,6 @@ def _cap(s: String) -> String:
     return s.copy()
 
 
-def _pres_de(word: String) -> String:
-    """« près de » before a French noun phrase: près de la table, près du frigo, près des chaises."""
-    if word.startswith("le "):
-        return "près du " + String(word[byte=3:])
-    if word.startswith("les "):
-        return "près des " + String(word[byte=4:])
-    return "près de " + word
-
-
 def _metres_fr(d: Float64) -> String:
     """`2 mètres`, `2,5 mètres`, `0,5 mètre`: a distance already rounded to 0.5 m."""
     var whole = Int(d)
@@ -558,7 +550,7 @@ def object_answer(ref ws: WorldState, i: Int) -> String:
     var where = String("")
     if o.where == OBJ_PUT and o.put_at != "":
         var pw = ws.word_for(o.put_at, ws.language)
-        where = _pres_de(pw) if fr else ("next to " + pw)
+        where = pres_de(pw) if fr else ("next to " + pw)
     else:
         var entries: List[PlaceXY] = [PlaceXY(o.name, o.x, o.y)]
         for p in ws.places:
@@ -582,7 +574,7 @@ def object_answer(ref ws: WorldState, i: Int) -> String:
                 parts.append(("à " + _metres_fr(a.distance_m)) if fr else (_metres_en(a.distance_m) + " away"))
         if a.next_to != "none":
             var nw = ws.word_for(a.next_to, ws.language)
-            parts.append(_pres_de(nw) if fr else ("next to " + nw))
+            parts.append(pres_de(nw) if fr else ("next to " + nw))
         if len(parts) == 0:
             return ("Je ne sais pas où est " + word + ".") if fr else ("I do not know where " + word + " is.")
         for k in range(len(parts)):
@@ -652,7 +644,11 @@ def carry_turn(ref ws: WorldState) -> ComputedTurn:
     - without one, taken or carried: `task:pick:<object>`; put down with no
       place: no answer (the decision reads it);
     - a body that does not carry it (`Body.can_carry`): « Non, je ne peux pas
-      porter la caisse. », the turn settled. ⚠ Left to the decision, « Porte
+      porter la caisse. », the turn settled;
+    - a body that carries it only to a place (`Body.can_pick_alone` False),
+      taken or carried with no place: « Dis-moi où porter la caisse. », the
+      turn settled, nothing given to the body (the room's crate: its body runs
+      the whole carry or nothing). ⚠ Left to the decision, « Porte
       la caisse à la table » named a place, and a place is a walk.
 
     The answer is « D'accord ! » / « Oui ! »: the executive's notices say how
@@ -681,6 +677,11 @@ def carry_turn(ref ws: WorldState) -> ComputedTurn:
         cmd = "task:put:" + obj + ":" + place
     elif verb == 3:
         return none^
+    elif not ws.body.can_pick_alone(obj):
+        var w = ws.word_for(obj, ws.language)
+        if fr:
+            return ComputedTurn("Dis-moi où porter " + w + ".", True, False)
+        return ComputedTurn("Tell me where to take " + w + ".", True, False)
     else:
         cmd = "task:pick:" + obj
     var yes = (String("Oui !") if fr else String("Yes!")) if asking else (String("D'accord !") if fr else String("Okay!"))
