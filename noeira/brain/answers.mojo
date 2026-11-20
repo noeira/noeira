@@ -86,7 +86,11 @@ def asks_task_done(text: String) -> Bool:
 
     An inverted form is a question by itself (« as-tu fini », "have you
     finished"). A plain one (« tu as fini ») counts only with a question mark
-    or « est-ce que »: « Quand tu as fini, va à la porte. » is a request."""
+    or « est-ce que », or when it is the whole sentence after a call
+    (« Noé, tu as fini. »): « Quand tu as fini, va à la porte. » is a request.
+    ⚠ The recogniser drops the question mark of a question said by its
+    intonation: « Tu as fini ? » came back « Tu as fini. » (the carry replay on
+    the Orin, docs/ROBOT_BRAIN_PLAN.md §22), and the decision answered it."""
     var t = _plain(text)
     var inverted: List[String] = [
         "as-tu fini", "as-tu terminé", "as-tu réussi", "avez-vous fini", "avez-vous terminé", "avez-vous réussi",
@@ -103,7 +107,34 @@ def asks_task_done(text: String) -> Bool:
     if not _any(t, plain):
         return False
     var marks: List[String] = ["?", "est-ce que", "est-ce qu'"]
-    return _any(t, marks)
+    if _any(t, marks):
+        return True
+    # the whole sentence, after the last comma (a call: « Noé, »): « c'est fini. » said is not asked
+    var whole: List[String] = [
+        "tu as fini", "tu as terminé", "tu as réussi", "t'as fini", "t'as terminé", "vous avez fini", "vous avez terminé",
+        "you have finished", "you finished",
+    ]
+    var a = 0
+    for i in range(len(t)):
+        if t[i] == 44:
+            a = i + 1
+    var b = len(t)
+    while a < b and (t[a] == 32 or t[a] == 46 or t[a] == 33):
+        a += 1
+    while b > a and (t[b - 1] == 32 or t[b - 1] == 46 or t[b - 1] == 33):
+        b -= 1
+    for f in whole:
+        var p = _plain(f)
+        if len(p) != b - a:
+            continue
+        var same = True
+        for k in range(len(p)):
+            if t[a + k] != p[k]:
+                same = False
+                break
+        if same:
+            return True
+    return False
 
 
 def task_done_answer(ref ws: WorldState) -> String:

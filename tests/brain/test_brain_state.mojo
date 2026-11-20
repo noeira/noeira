@@ -624,6 +624,10 @@ def main() raises:
     check(fails, not asks_task_done("Quand tu as fini, va à la porte.") and not asks_task_done("Quand auras-tu fini ?")
           and not asks_task_done("Où est le frigo ?") and not asks_task_done("Va à la table.") and not asks_task_done("You are done here."),
           "a request, another question and a statement are not it")
+    check(fails, asks_task_done("Tu as fini.") and asks_task_done("Noé, tu as fini.") and asks_task_done("You finished")
+          and not asks_task_done("C'est fini.") and not asks_task_done("Tu as fini la danse, va à la porte.")
+          and not asks_task_done("Si tu as fini, tu as fini de ranger."),
+          "the bare sentence, its question mark lost by the recogniser (the carry replay)")
     var q = WorldState(Body.g1_room("Noé"), String("a furnished room"))
     q.language = String("fr")
     q.call_place(String("table"), String("fr"), String("la table"))
