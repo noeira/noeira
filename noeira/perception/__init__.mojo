@@ -19,6 +19,10 @@ buying it, so nothing here is written for one sensor or one robot:
                     or localisation in a frozen prior map
   places.mojo       `PlaceMap` (labelled returns per object), oriented
                     footprints, approach points that face into the room
+  objects.mojo      an object of KNOWN size from the depth returns labelled as
+                    it: `fit_box_on_floor` (place and heading from one image),
+                    `track_box` (the 6-DoF pose at every image, also in the
+                    hands), `find_box` (found again from its returns alone)
   detector.mojo     NOT re-exported here (it pulls SAM 3 and the GPU in):
                     `Sam3Service` (words -> masks on the camera's RGB, in this
                     process on its own thread), `mask_place`, and
@@ -83,4 +87,8 @@ from .slam import ScanToMapSlam
 from .places import (
     PlaceMap, PlaceBox, Approach, oriented_box, box_in_frame, dominant_orientation, NO_FRAME,
     choose_approach, free_centroid,
+)
+from .objects import (
+    BoxOnFloor, BoxPose, yaw_nearest, fit_box_on_floor, refine_box_on_floor,
+    carry_box, track_box, box_lowest, returns_off_box, returns_centre, find_box,
 )
