@@ -48,6 +48,21 @@ as SURE. Between the two a target is LIKELY: the loop has little room around
 it and gives up more often. Under the loop's threshold it is REFUSED. Both
 are calibrated on runs of the whole command, not derived here.
 
+HOW FAST THE HAND MOVES is set by two lengths, and the defaults are fast. They
+are the ones the skill's success rates were measured with (240 targets a
+hand); read on the Unitree G1 in simulation, on 30 targets a hand:
+
+    the way out, `SMReachLoop.ramp_steps`    1 s (the default): the hand peaks at
+        0.7 to 0.9 m/s in the median and up to 2.0 m/s on the farthest targets.
+        2 s: half that (up to 1.3 m/s), with the hand as often within 5 cm at
+        8 s and at 30 s. Keep the loop's first update a second after the
+        ramp's end: `first = ramp_steps + 50`.
+    the way back, `SMZRamp.steps`            1 s (the default): up to 1.75 m/s.
+        2 s: 1.0 m/s on the targets taken as sure, 1.3 m/s on the likely ones.
+
+A caller that moves a real arm near people should set both rather than take
+the defaults, and measure its own.
+
 ⚠ z is not portable: a file belongs to the tracker, the prompt interface and
 the pool its pairs were collected with.
 """
@@ -213,7 +228,8 @@ struct SMReachLoop(Movable):
                                 is scaled back to its edge; `stuck_max` such updates in a row and the loop GIVES UP: the
                                 correction is dropped, z is the interface's at the target, and it stays so (`gave`).
 
-    The defaults are the ones the skill was measured with. Changing one is a new skill to measure."""
+    The defaults are the ones the skill was measured with. Changing one is a new skill to measure; the ramp's length is
+    the one that was (the module's note: the default moves the hand at up to 2 m/s)."""
 
     var ramp_steps: Int
     var z_every: Int
@@ -350,7 +366,8 @@ struct SMReachLoop(Movable):
 
 struct SMZRamp(Movable):
     """z ramped from one value to another (min-jerk, a value every `z_every` steps): the way out of a reach, back to the
-    stand's z. `step` once a control step before the simulator's; True when `z` is new. `on` falls when the ramp is over."""
+    stand's z. `step` once a control step before the simulator's; True when `z` is new. `on` falls when the ramp is over.
+    `steps` is the ramp's length in control steps: the default, 1 s, is fast (the module's note)."""
 
     var steps: Int
     var z_every: Int
