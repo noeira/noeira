@@ -52,6 +52,8 @@ Appendix B and G; `noeira-docs/SUPERMIMIC_BFM_HYBRID_PLAN.md` §0):
     prompt_trainer.mojo SMPromptTrainer: a tracker, frozen, and the two new networks
     prompt_agent.mojo   the loop on the CPU env (smoke scale)
     prompt_agent_gpu.mojo  the loop on the device env
+    reach.mojo          a hand held at a world point: target -> z fitted on the tracker's own
+                        successes, its domain, and the loop that holds the point (no simulator in it)
 The replay is the shared `deep_agents.data.EpisodicReplay` (host) or
 `EpisodicReplayGpu` (device).
 """

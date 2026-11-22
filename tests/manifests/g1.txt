@@ -140,6 +140,9 @@ tests/deep_agents/supermimic/test_supermimic_imag.mojo /tmp/sm_imag
 tests/deep_agents/supermimic/test_supermimic_prompt.mojo /tmp/sm_prompt
 tests/deep_agents/supermimic/test_supermimic_prompt_imag.mojo
 tests/deep_agents/supermimic/test_supermimic_prompt_data.mojo
+# The reach (`deep_agents/supermimic/reach.mojo`): a hand held at a world point through z. Its interface and its loop on
+# interfaces written by hand, answers known by construction (no simulator, no policy, no data).
+tests/deep_agents/supermimic/test_supermimic_reach.mojo
 # SuperMimic M2: the motion library (bins, goal window, reference rows by our
 # FK) and the return-based reset sampler, against the reproduction's
 # MotionLibrary and MultiClipMotionCommand:
