@@ -5,7 +5,8 @@ Two structs in this file:
 * ``MPPICPU`` — host-side reference implementation. Used by the
   TDMPC2 eval ``select_action`` path (single env) and by isolated
   property tests on stub models (LinearQuadratic etc.) where a CPU
-  implementation gives a tractable closed-form oracle.
+  implementation gives a tractable closed-form oracle. Its noise is its
+  own seeded stream (``_PlanNoise``), not the global ``std.random`` one.
 
 * ``MPPIGPUBatched`` — production GPU implementation that plans for
   ``N_ENVS`` environments in one batched kernel grid per
@@ -22,7 +23,7 @@ Reference: Hansen et al., 2023 — TD-MPC2.
 """
 
 from std.math import exp, sqrt, cos, log
-from std.random import random_float64
+from std.random.philox import Random as PhiloxRandom
 from max.gpu.host import DeviceContext, DeviceBuffer, HostBuffer
 
 from noeira.nn.constants import DT as dtype
@@ -49,18 +50,48 @@ from noeira.core.tiles import Tile, tile
 # =============================================================================
 
 
-@always_inline
-def _gaussian_sample() -> Float64:
-    """Box-Muller transform to draw a standard normal sample.
+struct _PlanNoise:
+    """The random numbers of ONE ``MPPICPU.plan`` call: a Philox stream keyed
+    by ``(seed, plan index)`` and read in the order the plan draws.
 
-    Uses the global ``std.random`` RNG — callers seed via ``_set_seed``
-    before invoking ``MPPICPU.plan`` for determinism.
+    ⚠ NOT the global ``std.random`` generator, which this planner used until
+    Nov 2026. A plan's draws then depended on everything else the process had
+    drawn, and the planner's own draws (a count that follows the trajectory)
+    shifted every later draw of the process: two machines whose robots walked
+    a hair apart ran different experiments from the second trial on. Now a
+    plan's noise is a function of the planner's seed and of how many plans it
+    has made, and of nothing else; the planner neither reads nor moves the
+    global generator. Same scheme as the GPU planner below (``rng_base_seed``)
+    and as ``noeira/tasks/sampler.mojo``: Philox, its own counters as the key.
     """
-    var u1 = random_float64()
-    var u2 = random_float64()
-    if u1 < 1e-10:
-        u1 = 1e-10
-    return sqrt(-2.0 * log(u1)) * cos(2.0 * 3.14159265358979 * u2)
+
+    var rng: PhiloxRandom[]
+    var buf: SIMD[DType.float32, 4]
+    var k: Int
+
+    def __init__(out self, seed: UInt64, plan: UInt64):
+        self.rng = PhiloxRandom(seed=seed, subsequence=plan, offset=UInt64(0))
+        self.buf = SIMD[DType.float32, 4](0.0)
+        self.k = 4
+
+    @always_inline
+    def uniform(mut self) -> Float64:
+        """Uniform in [0, 1): the four values of a Philox step, one a call."""
+        if self.k == 4:
+            self.buf = self.rng.step_uniform()
+            self.k = 0
+        var u = Float64(self.buf[self.k])
+        self.k += 1
+        return u
+
+    @always_inline
+    def gaussian(mut self) -> Float64:
+        """Standard normal, by the Box-Muller transform."""
+        var u1 = self.uniform()
+        var u2 = self.uniform()
+        if u1 < 1e-10:
+            u1 = 1e-10
+        return sqrt(-2.0 * log(u1)) * cos(2.0 * 3.14159265358979 * u2)
 
 
 @always_inline
@@ -73,12 +104,11 @@ def _clamp(x: Float64, lo: Float64, hi: Float64) -> Float64:
 
 
 @always_inline
-def _weighted_sample(weights: List[Float64], n: Int) -> Int:
+def _weighted_sample(weights: List[Float64], n: Int, u: Float64) -> Int:
     """Inverse-CDF multinomial sampling — one index proportional to
-    ``weights``. Matches reference TD-MPC2's
+    ``weights``, from the uniform ``u``. Matches reference TD-MPC2's
     ``torch.multinomial(score, 1)`` call.
     """
-    var u = random_float64()
     var cumsum: Float64 = 0.0
     for i in range(n):
         cumsum += weights[i]
@@ -114,6 +144,13 @@ struct MPPICPU[
     next ``plan()`` call should treat the episode as just-started
     (warm-start disabled, mean reset to zero). Callers reset the
     episode boundary via ``start_episode()``.
+
+    Randomness is the planner's own (``_PlanNoise``): ``rng_seed`` given at
+    construction, and plan number ``plans`` selects the Philox subsequence.
+    Two planners built with the same seed and fed the same inputs return the
+    same actions whatever else the process draws. ``reseed(s)`` starts the
+    stream again; ``start_episode()`` does NOT (an RL caller wants fresh
+    exploration noise at every episode).
     """
 
     comptime TOTAL_SAMPLES = Self.NUM_SAMPLES + Self.NUM_PI_TRAJS
@@ -142,7 +179,12 @@ struct MPPICPU[
     # ── Episode-edge flag ──────────────────────────────────────────
     var t0: Bool
 
-    def __init__(out self) raises:
+    # ── Randomness (the planner's own stream, see ``_PlanNoise``) ──
+    var rng_seed: UInt64
+    var plans: UInt64
+    """``plan()`` calls made since construction or the last ``reseed``."""
+
+    def __init__(out self, rng_seed: UInt64 = 42) raises:
         if Self.HORIZON < 1:
             raise Error("MPPICPU: HORIZON must be >= 1")
         if Self.NUM_SAMPLES < 1:
@@ -162,13 +204,22 @@ struct MPPICPU[
         self.returns = List[Float64](length=Self.TOTAL_SAMPLES, fill=0.0)
         self.weights = List[Float64](length=Self.TOTAL_SAMPLES, fill=0.0)
         self.t0 = True
+        self.rng_seed = rng_seed
+        self.plans = 0
 
     def start_episode(mut self):
         """Mark the start of a new episode — disables warm-start on
         the next ``plan()`` call. Caller invokes once per
-        environment reset.
+        environment reset. The random stream goes on (``reseed``).
         """
         self.t0 = True
+
+    def reseed(mut self, rng_seed: UInt64):
+        """Start the planner's random stream again from ``rng_seed``: the
+        plans that follow draw what a planner just built with that seed
+        would. Warm-start state is untouched (``start_episode``)."""
+        self.rng_seed = rng_seed
+        self.plans = 0
 
     def plan[
         CB: RolloutCallbackCPU
@@ -201,6 +252,8 @@ struct MPPICPU[
         """
         if len(z0) != Self.LATENT_DIM:
             raise Error("MPPICPU.plan: z0 length must equal LATENT_DIM")
+        var noise_src = _PlanNoise(self.rng_seed, self.plans)
+        self.plans += 1
 
         # ── 1. Warm-start mean (shift prev_mean by 1 step) ─────────
         var mean_size = Self.HORIZON * Self.ACTION_DIM
@@ -235,7 +288,7 @@ struct MPPICPU[
                         s * Self.HORIZON * Self.ACTION_DIM + t * Self.ACTION_DIM
                     )
                     for a in range(Self.ACTION_DIM):
-                        var noise = _gaussian_sample() * 0.1
+                        var noise = noise_src.gaussian() * 0.1
                         var act = pi_mean[a] + noise
                         act = _clamp(act, -1.0, 1.0)
                         a_step[a] = act
@@ -250,7 +303,7 @@ struct MPPICPU[
                     for a in range(Self.ACTION_DIM):
                         var mu = self.mean[t * Self.ACTION_DIM + a]
                         var sigma = self.std[t * Self.ACTION_DIM + a]
-                        var noise = _gaussian_sample()
+                        var noise = noise_src.gaussian()
                         var act = mu + sigma * noise
                         act = _clamp(act, -1.0, 1.0)
                         var idx = (
@@ -275,13 +328,13 @@ struct MPPICPU[
         self.t0 = False
 
         # ── 4. Action selection: multinomial + per-step exploration ─
-        var selected = _weighted_sample(self.weights, Self.TOTAL_SAMPLES)
+        var selected = _weighted_sample(self.weights, Self.TOTAL_SAMPLES, noise_src.uniform())
         var result = List[Float64](length=Self.ACTION_DIM, fill=0.0)
         for a in range(Self.ACTION_DIM):
             var base = selected * Self.HORIZON * Self.ACTION_DIM
             var act = self.actions[base + a]
             if not deterministic:
-                act += _gaussian_sample() * self.std[a]
+                act += noise_src.gaussian() * self.std[a]
             act = _clamp(act * action_scale, -action_scale, action_scale)
             result[a] = act
         return result^

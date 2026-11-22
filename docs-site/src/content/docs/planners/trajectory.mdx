@@ -159,6 +159,26 @@ optimal control is known in closed form, which is what makes the divergence
 visible at all.
 :::
 
+**Both planners own their noise.** Neither reads the global `std.random`
+generator. `MPPIGPUBatched.plan_gpu` takes `rng_base_seed` and derives one seed
+per horizon step. `MPPICPU` takes `rng_seed` at construction, and each `plan()`
+call reads its own Philox subsequence, numbered by how many plans the planner
+has made: a plan's draws depend on the seed and that count, and on nothing else
+the process draws. `reseed(s)` starts the stream again; `start_episode()` only
+clears the warm start.
+
+```mojo
+var planner = MPPICPU[LATENT, ACTION, HORIZON, SAMPLES, PI_TRAJS, ITERS, ELITES](rng_seed=7)
+var a1 = planner.plan(cb, z0, gamma=0.95, temperature=10.0)
+planner.reseed(7)          # the next plan draws what the first one drew
+```
+
+This matters when a run must repeat. A planner that shares the global generator
+draws a number of values that follows the trajectory, so every later draw of
+the process shifts with it: two machines whose robots walked a hair apart then
+run different experiments. `UnicycleNavigator` passes its `seed` argument
+through for the same reason.
+
 ## iLQR
 
 The outlier in the package. Everything above is gradient-free — it needs only

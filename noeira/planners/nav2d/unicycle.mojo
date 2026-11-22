@@ -245,10 +245,16 @@ struct UnicycleNavigator[
     var mppi: MPPICPU[5, 2, Self.HORIZON, Self.NUM_SAMPLES, Self.NUM_PI_TRAJS, Self.NUM_ITERATIONS, Self.NUM_ELITES]
     var temperature: Float64
 
-    def __init__(out self, var grid: NavGrid, var response: ResponseMap, p: NavParams) raises:
+    def __init__(out self, var grid: NavGrid, var response: ResponseMap, p: NavParams, seed: UInt64 = 42) raises:
+        """`seed`: the planner's own random stream (`MPPICPU.rng_seed`). Two navigators built with the same seed and given
+        the same goals and states send the same commands, whatever else the process draws."""
         self.cb = UnicycleNavCallback(grid^, response^, p)
-        self.mppi = MPPICPU[5, 2, Self.HORIZON, Self.NUM_SAMPLES, Self.NUM_PI_TRAJS, Self.NUM_ITERATIONS, Self.NUM_ELITES]()
+        self.mppi = MPPICPU[5, 2, Self.HORIZON, Self.NUM_SAMPLES, Self.NUM_PI_TRAJS, Self.NUM_ITERATIONS, Self.NUM_ELITES](seed)
         self.temperature = 0.5
+
+    def reseed(mut self, seed: UInt64):
+        """The planner's random stream again from `seed` (`MPPICPU.reseed`)."""
+        self.mppi.reseed(seed)
 
     def set_goal(mut self, gx: Float64, gy: Float64) raises:
         self.cb.grid.set_goal(gx, gy)

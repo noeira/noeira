@@ -10,7 +10,6 @@ hit the box, or the obstacle was not in the way and the arm proves nothing.
 """
 
 from std.math import atan2, cos, exp, sin, sqrt, pi
-from std.random import seed as _set_seed
 from std.testing import assert_true
 
 from noeira.planners.nav2d import (
@@ -108,14 +107,13 @@ struct Plant(Movable):
 
 
 def test_mppi_goes_around_a_box() raises:
-    _set_seed(0x5EED)
     var fp = List[Footprint]()
     fp.append(Footprint.rect(0.0, 0.0, 0.3, 1.0, 0.0))     # ON the straight line
     var inflate = 0.35
     var p = nav_params_default()
     var nav = UnicycleNavigator[](
         NavGrid(fp, -3.0, -3.0, 3.0, 3.0, 0.05, inflate),
-        ResponseMap.identity(p.v_min, p.v_max, p.w_max), p,
+        ResponseMap.identity(p.v_min, p.v_max, p.w_max), p, 0x5EED,
     )
     nav.set_goal(2.0, 0.0)
 
@@ -177,7 +175,6 @@ struct SlowPlant(Movable):
 
 def _overshoot(slow_radius: Float64) raises -> Float64:
     """Max distance PAST a goal 3 m ahead, on an open floor."""
-    _set_seed(0xA11CE)
     var fp = List[Footprint]()
     fp.append(Footprint.circle(10.0, 10.0, 0.1))   # far away: an open floor
     var p = nav_params_default()
@@ -185,7 +182,7 @@ def _overshoot(slow_radius: Float64) raises -> Float64:
     p.slow_radius = slow_radius
     var nav = UnicycleNavigator[](
         NavGrid(fp, -3.0, -3.0, 3.0, 3.0, 0.05, 0.3),
-        ResponseMap.identity(p.v_min, p.v_max, p.w_max), p,
+        ResponseMap.identity(p.v_min, p.v_max, p.w_max), p, 0xA11CE,
     )
     nav.set_goal(1.5, 0.0)
     var r = SlowPlant()

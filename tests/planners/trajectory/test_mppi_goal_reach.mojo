@@ -30,7 +30,6 @@ Usage:
 """
 
 from std.math import abs as math_abs
-from std.random import seed as _set_seed
 from std.testing import assert_true
 
 from noeira.planners.trajectory import MPPICPU, RolloutCallbackCPU
@@ -115,7 +114,6 @@ def test_mppi_converges_to_goal() raises:
     ``a* = goal - z0 = [1, 1, 1]``, which after clamp + per-axis noise
     should land within L_inf ≤ 0.20 of (1, 1, 1) in deterministic mode.
     """
-    _set_seed(0xC0FFEE)
     var planner = MPPICPU[
         LATENT_DIM,
         ACTION_DIM,
@@ -124,7 +122,7 @@ def test_mppi_converges_to_goal() raises:
         NUM_PI_TRAJS,
         NUM_ITERATIONS,
         NUM_ELITES,
-    ]()
+    ](0xC0FFEE)
     var cb = GoalReachRolloutCallback(goal_x=1.0, goal_y=1.0, goal_z=1.0)
     var z0: List[Float64] = [0.0, 0.0, 0.0]
 
@@ -157,7 +155,6 @@ def test_mppi_at_goal_stays() raises:
     test since the optimum is interior and Gaussian sampling pushes off
     it).
     """
-    _set_seed(0x60A1)
     var planner = MPPICPU[
         LATENT_DIM,
         ACTION_DIM,
@@ -166,7 +163,7 @@ def test_mppi_at_goal_stays() raises:
         NUM_PI_TRAJS,
         NUM_ITERATIONS,
         NUM_ELITES,
-    ]()
+    ](0x60A1)
     var cb = GoalReachRolloutCallback(goal_x=1.0, goal_y=1.0, goal_z=1.0)
     var z0: List[Float64] = [1.0, 1.0, 1.0]  # already at goal
 
@@ -201,7 +198,6 @@ def test_mppi_warm_start_improves_consecutive_calls() raises:
     Asserts: |action_2 - goal_direction| ≤ |action_1 - goal_direction|
     (within a small tolerance allowing for noise).
     """
-    _set_seed(0x12121212)
     var planner = MPPICPU[
         LATENT_DIM,
         ACTION_DIM,
@@ -210,7 +206,7 @@ def test_mppi_warm_start_improves_consecutive_calls() raises:
         NUM_PI_TRAJS,
         NUM_ITERATIONS,
         NUM_ELITES,
-    ]()
+    ](0x12121212)
     var cb = GoalReachRolloutCallback(goal_x=1.0, goal_y=1.0, goal_z=1.0)
     var z0: List[Float64] = [0.0, 0.0, 0.0]
 
@@ -261,7 +257,6 @@ def test_mppi_start_episode_resets_warm_start() raises:
     Verifies the contract by checking that
     ``planner.t0 == True`` after ``start_episode()``.
     """
-    _set_seed(0xEDEDEDED)
     var planner = MPPICPU[
         LATENT_DIM,
         ACTION_DIM,
@@ -270,7 +265,7 @@ def test_mppi_start_episode_resets_warm_start() raises:
         NUM_PI_TRAJS,
         NUM_ITERATIONS,
         NUM_ELITES,
-    ]()
+    ](0xEDEDEDED)
     var cb = GoalReachRolloutCallback(goal_x=1.0, goal_y=1.0, goal_z=1.0)
     var z0: List[Float64] = [0.0, 0.0, 0.0]
 

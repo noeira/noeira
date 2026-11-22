@@ -24,7 +24,7 @@ that's fine for short-horizon MPPI dominated by rollout reward.
 """
 
 from std.math import abs as math_abs
-from std.random import seed as _set_seed
+from std.random import random_float64, seed as _set_seed
 from std.testing import assert_true
 
 from noeira.planners.trajectory import MPPICPU, RolloutCallbackCPU
@@ -95,7 +95,6 @@ def test_mppi_recovers_lqr_action() raises:
     bound — MPPI's softmax is a soft argmax, and 6 iters with
     256 samples at NUM_PI_TRAJS=0 doesn't fully concentrate.
     """
-    _set_seed(0xA1B2)
     var lq = LinearQuadratic1D(A=0.9, B=1.0, Q=1.0, R=0.1)
     var cb = LQRolloutCallback(lq=lq.copy())
     var planner = MPPICPU[
@@ -106,7 +105,7 @@ def test_mppi_recovers_lqr_action() raises:
         NUM_PI_TRAJS,
         NUM_ITERATIONS,
         NUM_ELITES,
-    ]()
+    ](0xA1B2)
     var z0: List[Float64] = [1.0]
     var action = planner.plan(
         cb,
@@ -150,7 +149,6 @@ def test_mppi_zero_state_no_op() raises:
     exploration noise) at moderate iters the result should be
     small in absolute value.
     """
-    _set_seed(0xBEEF)
     var lq = LinearQuadratic1D(A=0.9, B=1.0, Q=1.0, R=0.1)
     var cb = LQRolloutCallback(lq=lq.copy())
     var planner = MPPICPU[
@@ -161,7 +159,7 @@ def test_mppi_zero_state_no_op() raises:
         NUM_PI_TRAJS,
         NUM_ITERATIONS,
         NUM_ELITES,
-    ]()
+    ](0xBEEF)
     var z0: List[Float64] = [0.0]
     var action = planner.plan(
         cb,
@@ -184,7 +182,6 @@ def test_mppi_deterministic_same_seed() raises:
     var lq = LinearQuadratic1D(A=0.9, B=1.0, Q=1.0, R=0.1)
     var z0: List[Float64] = [1.0]
 
-    _set_seed(0xC0DE)
     var cb1 = LQRolloutCallback(lq=lq.copy())
     var planner1 = MPPICPU[
         LATENT_DIM,
@@ -194,7 +191,7 @@ def test_mppi_deterministic_same_seed() raises:
         NUM_PI_TRAJS,
         NUM_ITERATIONS,
         NUM_ELITES,
-    ]()
+    ](0xC0DE)
     var a1 = planner1.plan(
         cb1,
         z0,
@@ -204,7 +201,6 @@ def test_mppi_deterministic_same_seed() raises:
         deterministic=True,
     )
 
-    _set_seed(0xC0DE)
     var cb2 = LQRolloutCallback(lq=lq.copy())
     var planner2 = MPPICPU[
         LATENT_DIM,
@@ -214,7 +210,7 @@ def test_mppi_deterministic_same_seed() raises:
         NUM_PI_TRAJS,
         NUM_ITERATIONS,
         NUM_ELITES,
-    ]()
+    ](0xC0DE)
     var a2 = planner2.plan(
         cb2,
         z0,
@@ -235,6 +231,81 @@ def test_mppi_deterministic_same_seed() raises:
     )
 
 
+def _plan_once(rng_seed: UInt64, disturb: Bool) raises -> Float64:
+    """The first action of a fresh planner built with `rng_seed`, on the
+    LQ problem at z = 1; `disturb` draws from the GLOBAL generator first."""
+    if disturb:
+        for _ in range(7):
+            _ = random_float64()
+    var lq = LinearQuadratic1D(A=0.9, B=1.0, Q=1.0, R=0.1)
+    var cb = LQRolloutCallback(lq=lq.copy())
+    var planner = MPPICPU[
+        LATENT_DIM,
+        ACTION_DIM,
+        HORIZON,
+        NUM_SAMPLES,
+        NUM_PI_TRAJS,
+        NUM_ITERATIONS,
+        NUM_ELITES,
+    ](rng_seed)
+    var z0: List[Float64] = [1.0]
+    var a = planner.plan(
+        cb, z0, gamma=0.95, temperature=10.0, action_scale=1.0, deterministic=False,
+    )
+    return a[0]
+
+
+def test_mppi_noise_is_its_own_stream() raises:
+    """The planner's draws come from its seed alone, and it leaves the
+    global `std.random` generator where it found it.
+
+    Until Nov 2026 `MPPICPU` drew from the global generator: whatever else
+    the process drew changed the plan, and the plan's draws shifted every
+    later draw of the process.
+    """
+    # 1. the global generator's state does not enter the plan
+    _set_seed(1)
+    var a = _plan_once(0xC0DE, False)
+    _set_seed(2)
+    var b = _plan_once(0xC0DE, True)
+    assert_true(a == b, "the global generator changed the plan: " + String(a) + " vs " + String(b))
+
+    # 2. the seed does: another seed, another plan
+    var c = _plan_once(0xC0DF, False)
+    assert_true(a != c, "two seeds gave the same action: " + String(a))
+
+    # 3. a plan does not move the global generator
+    _set_seed(77)
+    var r1 = random_float64()
+    _set_seed(77)
+    _ = _plan_once(0xC0DE, False)
+    var r2 = random_float64()
+    assert_true(r1 == r2, "a plan drew from the global generator: " + String(r1) + " vs " + String(r2))
+
+    # 4. `reseed` starts the stream again; without it the second plan differs
+    var lq = LinearQuadratic1D(A=0.9, B=1.0, Q=1.0, R=0.1)
+    var cb = LQRolloutCallback(lq=lq.copy())
+    var planner = MPPICPU[
+        LATENT_DIM,
+        ACTION_DIM,
+        HORIZON,
+        NUM_SAMPLES,
+        NUM_PI_TRAJS,
+        NUM_ITERATIONS,
+        NUM_ELITES,
+    ](0xC0DE)
+    var z0: List[Float64] = [1.0]
+    var p1 = planner.plan(cb, z0, gamma=0.95, temperature=10.0, action_scale=1.0, deterministic=False)
+    planner.start_episode()
+    var p2 = planner.plan(cb, z0, gamma=0.95, temperature=10.0, action_scale=1.0, deterministic=False)
+    planner.start_episode()
+    planner.reseed(0xC0DE)
+    var p3 = planner.plan(cb, z0, gamma=0.95, temperature=10.0, action_scale=1.0, deterministic=False)
+    assert_true(p1[0] == a, "a planner built with the seed differs from _plan_once: " + String(p1[0]) + " vs " + String(a))
+    assert_true(p2[0] != p1[0], "the second plan drew the first plan's numbers: " + String(p2[0]))
+    assert_true(p3[0] == p1[0], "reseed did not start the stream again: " + String(p3[0]) + " vs " + String(p1[0]))
+
+
 def main() raises:
     print("=== Phase 2 planners: MPPICPU on LinearQuadratic ===")
     test_mppi_recovers_lqr_action()
@@ -243,4 +314,6 @@ def main() raises:
     print("  PASS MPPI at zero state stays near zero")
     test_mppi_deterministic_same_seed()
     print("  PASS same-seed runs bit-identical")
+    test_mppi_noise_is_its_own_stream()
+    print("  PASS the noise is the planner's own stream (seed in, global generator untouched)")
     print("OK")
