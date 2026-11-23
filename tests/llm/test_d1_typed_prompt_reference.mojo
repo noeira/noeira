@@ -17,7 +17,9 @@ number and code grids, a box, boxes of 16 / 4 / 1 blocks, a 2-row mix):
 6. each row's state positions — per token span, JSON string paths, pointer
    width — equal d1's (`state_positions`);
 7. every text d1 tokenized gives its offset mapping exactly (`encode_offsets`);
-8. the calibration tables' `through` and `level` equal d1's over a sweep.
+8. the calibration tables' `through` and `level` equal d1's over a sweep;
+9. ten grids' values equal d1's `Grid.values` bit for bit (some end where
+   `low + (size - 1) * step` is not `high`).
 
 Mutants run against it (11-23): each of these fails it — a box's `after`
 newline, `plain_offsets`' boundaries, `:g` zeros, edges as codes, unquoted
@@ -34,7 +36,7 @@ from std.os.path import exists
 from noeira.io.json import JsonDoc, load_json, J_NULL
 from noeira.text.bpe import ByteLevelBPE
 from noeira.llm.d1.prompt import (
-    D1Record, D1Question, parse_questions, py_json_dumps, prefix_text, suffix_layout, question_slots, pack_rows,
+    D1Record, D1Question, D1Grid, parse_questions, py_json_dumps, prefix_text, suffix_layout, question_slots, pack_rows,
     plain, SLOT_CODES, SLOT_START, SLOT_END, BOS, IM_START, HEADER,
 )
 from noeira.llm.d1.positions import state_positions
@@ -285,6 +287,27 @@ def main() raises:
     check(fails, n_t > 0 and ok_t == n_t and cal.default == doc.number(doc.field(rn, "temperature")),
           String(ok_t) + " / " + String(n_t) + " calibration reads equal d1's exactly (" + String(len(cal.names))
           + " tables, temperature " + String(cal.default) + ")")
+
+    # 9. grids
+    var gn = doc.field(root, "grids")
+    var g_ok = 0
+    for i in range(doc.size(gn)):
+        var e = doc.at(gn, i)
+        var g = D1Grid(doc.number(doc.field(e, "low")), doc.number(doc.field(e, "high")), doc.integer(doc.field(e, "size")))
+        var vals = g.values()
+        var wv = doc.field(e, "values")
+        var good = len(vals) == doc.size(wv)
+        for k in range(min(len(vals), doc.size(wv))):
+            if good and vals[k] != doc.number(doc.at(wv, k)):
+                print("    grid", i, "value", k, ": mojo", vals[k], "d1", doc.number(doc.at(wv, k)), "(high parsed",
+                      g.high, ")")
+            good = good and vals[k] == doc.number(doc.at(wv, k))
+        if good:
+            g_ok += 1
+        else:
+            print("    grid", i, ": values differ")
+    check(fails, doc.size(gn) > 0 and g_ok == doc.size(gn), String(g_ok) + " / " + String(doc.size(gn))
+          + " grids' values equal d1's bit for bit")
 
     if fails > 0:
         raise Error(String(fails) + " FAILED")

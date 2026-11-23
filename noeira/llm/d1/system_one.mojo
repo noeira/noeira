@@ -18,8 +18,9 @@ own table calibrates it. Answers: `noul` P(yes); `choice` the likeliest option,
 its confidence and every probability; `score` the MEDIAN level (d1's default
 `score_readout`), its confidence, probabilities and legend; a `multiple`
 choice each option's P(yes) through the `multiple` table and the options at
-0.5 or more (docs/NN_MODEL_PORTS_PLAN.md §12.9). Reads, estimates and boxes
-are laid out but refused until they are read (T3-T5).
+0.5 or more; an estimate the median and p10-p90 of its grid distribution at
+the `estimate` table's levels (`answers.mojo`) (docs/NN_MODEL_PORTS_PLAN.md
+§12.9). Reads and boxes are laid out but refused until they are read (T4-T5).
 
 Pictures (d1's `media`, LFM3-VL's tower: `noeira.llm.lfm3.vision`): their
 markup heads the user turn, before the state (`<|vision_start|>`, one
@@ -52,10 +53,12 @@ from noeira.nn.constants import DT
 from noeira.llm.lfm3 import Lfm3Text, Lfm3Vision, Lfm3Audio, Picture
 from noeira.text.bpe import ByteLevelBPE
 from .prompt import (
-    D1Question, D1Record, D1Row, D1Slot, Q_NOUL, Q_CHOICE, Q_SCORE, Q_MULTI, SLOT_CODES, parse_questions,
+    D1Question, D1Record, D1Row, D1Slot, Q_NOUL, Q_CHOICE, Q_SCORE, Q_MULTI, Q_READ, Q_ESTIMATE, Q_BOX, Q_BOXES,
+    SLOT_CODES, parse_questions,
     py_json_dumps, prefix_text, suffix_layout, pack_rows, question_slots, typed,
 )
 from .calibration import D1Calibration
+from .answers import answer_estimate
 
 
 struct D1(Movable):
@@ -148,9 +151,9 @@ struct D1(Movable):
         if len(qs) == 0:
             raise Error("d1: no questions")
         for ref q in qs:
-            if q.kind != Q_NOUL and q.kind != Q_CHOICE and q.kind != Q_SCORE and q.kind != Q_MULTI:
+            if q.kind == Q_READ or q.kind == Q_BOX or q.kind == Q_BOXES:
                 raise Error("d1: '" + q.name + "': text, number, date, box and boxes answers are laid out but not "
-                            + "yet read (docs/NN_MODEL_PORTS_PLAN.md §12.9, T3-T5)")
+                            + "yet read (docs/NN_MODEL_PORTS_PLAN.md §12.9, T4-T5)")
         var media = String("")
         var feats = Optional[DeviceBuffer[DT]](None)
         var image_token = -1
@@ -222,6 +225,8 @@ struct D1(Movable):
         for i in range(len(qs)):
             if qs[i].kind == Q_MULTI:
                 _answer_multiple(w, qs[i], probs[i], self.calibration)
+            elif qs[i].kind == Q_ESTIMATE:
+                answer_estimate(w, qs[i], probs[i], self.calibration)
             else:
                 _answer(w, qs[i], probs[i][0])
         w.end_object()

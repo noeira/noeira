@@ -25,6 +25,8 @@ Writes `<out>/cases.json`:
                   pointer mask) for every row of a case with a state
                   offsets: each tokenized text and transformers' offset mapping for it
     calibration   each table's `through` at a sweep of values, and `level("estimate", share)`
+    grids         `grid.Grid(low, high, size).values` for ten grids, some where `low + (size - 1) * step`
+                  is not `high` (the grid ends on `high` itself)
 
 and copies `calibration.json` and `config.json` beside it.
 
@@ -123,6 +125,8 @@ def cases(images):
                      "range": [0, 100]},
             "big": {"type": "number", "instructions": "How many centimetres to the sofa?", "range": [0, 1270],
                     "step": 10, "unit": "cm"},
+            "clamped": {"type": "number", "instructions": "How far is the sofa, in metres?", "range": [0, 0.7],
+                        "step": 0.01, "unit": "m"},
         }),
         "box_one": ("The robot's head camera sees this.", [pic], {
             "door": {"type": "box", "instructions": "Where is the door?"},
@@ -249,7 +253,12 @@ def main():
         calib["through"][tname] = [[x, cal.through(tname, x)] for x in xs]
     calib["level"] = [[s, cal.level("estimate", s)] for s in sweep]
 
-    json.dump({"record": record, "tables": tables, "cases": out_cases, "calibration": calib},
+    G = importlib.import_module(pkg + ".grid").Grid
+    # ranges where low + (n - 1) * step is not `high`: d1's grid ends on `high` itself
+    grids = [{"low": lo, "high": hi, "size": n, "values": list(G(lo, hi, n).values)}
+             for lo, hi, n in [(0, 0.7, 71), (0, 0.35, 36), (1, 1.84, 85), (1, 1.91, 92), (0, 0.1, 12),
+                               (0, 3, 31), (0, 100, 128), (0, 0.999, 1000), (0, 1, 128), (-2.5, 7.5, 9)]]
+    json.dump({"record": record, "tables": tables, "cases": out_cases, "calibration": calib, "grids": grids},
               open(os.path.join(args.out, "cases.json"), "w"), ensure_ascii=False)
     for f in ("calibration.json", "config.json"):
         shutil.copy(os.path.join(args.model, f), os.path.join(args.out, f))

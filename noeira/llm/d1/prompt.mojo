@@ -125,6 +125,13 @@ struct D1Record(Copyable, Movable):
         return INSTANCES if self.prompt == 1 else MAX_INSTANCES
 
 
+@no_inline
+def mul_unfused(a: Float64, b: Float64) -> Float64:
+    """`a * b` rounded on its own: the call boundary keeps LLVM from fusing it
+    into the addition that uses it (Python rounds `a * b + c` twice)."""
+    return a * b
+
+
 @fieldwise_init
 struct D1Grid(Copyable, Movable):
     """`grid.Grid`: `size` equally spaced values from `low` to `high`."""
@@ -137,11 +144,14 @@ struct D1Grid(Copyable, Movable):
         return (self.high - self.low) / Float64(self.size - 1)
 
     def values(self) -> List[Float64]:
-        """`low + i * step` for all but the last, which is `high` itself."""
+        """`low + i * step` for all but the last, which is `high` itself —
+        rounded twice, as Python does: the product goes through `mul_unfused`,
+        or LLVM fuses it into the addition (an FMA: `1 + 14 * 0.01` gave 1.14
+        where Python's is 1.1400000000000001)."""
         var out = List[Float64](capacity=self.size)
         var st = self.step()
         for i in range(self.size - 1):
-            out.append(self.low + Float64(i) * st)
+            out.append(self.low + mul_unfused(Float64(i), st))
         out.append(self.high)
         return out^
 

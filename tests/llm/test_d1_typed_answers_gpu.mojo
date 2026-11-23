@@ -19,7 +19,18 @@ T2 reads `multiple` choices: each option a yes/no slot, raw, then the
 states, so a temperature applied to a typed slot (or left off an untyped one)
 moves the raw distributions.
 
-`--w8a8`: `D1.load(w8a8=True)`: the same picks, probabilities within W8A8_BOUND.
+T3 reads estimates: one slot over the grid's values (the tokenizer's numbers
+for an integer grid, codes otherwise: digits up to 10 values, option codes
+above), raw; the answer's median, interval and unit EXACTLY d1's — the values
+are the grid's, read at the `estimate` table's levels, which move four of the
+case's answers against the plain 0.1 / 0.5 / 0.9. Mutants caught: the levels
+not applied; the grid's values themselves are gated bit for bit on the host
+(`test_d1_typed_prompt_reference`, item 9). A plain sum for `math.fsum` moves
+nothing here (it only matters where a cumulative share sits exactly on a
+level): not gated.
+
+`--w8a8`: `D1.load(w8a8=True)`: the same picks, probabilities within W8A8_BOUND,
+estimates within W8A8_GRID_SHARE of their range.
 """
 
 from std.os import getenv
@@ -28,13 +39,21 @@ from std.time import perf_counter_ns
 from max.gpu.host import DeviceContext
 
 from noeira.io.json import load_json, parse_json, JsonDoc, J_NUMBER, J_ARRAY, J_OBJECT, J_NULL
-from noeira.llm.d1 import D1, parse_questions, Q_MULTI
+from noeira.llm.d1 import D1, parse_questions, Q_MULTI, Q_ESTIMATE
 from noeira.llm.d1.prompt import py_json_dumps
 from noeira.llm.lfm3.model import LF_BF16
 
 
 comptime PROB_BOUND: Float64 = 3e-3 if LF_BF16 else 1e-4
 comptime W8A8_BOUND: Float64 = 0.1
+comptime W8A8_GRID_SHARE: Float64 = 0.2
+"""`--w8a8`: an estimate's median and interval within this share of its range
+of d1's fp32 values (the fp32 build: exactly). Measured 0.13, 0.10 and 0.06 on
+three versions of the case (the Orin, 2026-11-23: the row's other questions
+change the context): `tenth`'s interval, 31 values over 0-3 with max p 0.35,
+moved by 0.4 under W8A8's 0.058 in raw probabilities — its p90 is read at a
+0.77 share, where a broad distribution's cumulative mass crosses several bins;
+the flat 128-value grids (`free`, `big`, max p 0.03) moved 1-3 bins."""
 
 
 def check(mut fails: Int, ok: Bool, what: String):
@@ -75,6 +94,7 @@ def main() raises:
     print("  d1 loaded in", (perf_counter_ns() - t0) // 1_000_000, "ms")
     var asked = 0
     var multi_asked = 0
+    var estimates_asked = 0
     for ci in range(doc.size(cases)):
         var name = doc.key_at(cases, ci)
         var c = doc.at(cases, ci)
@@ -113,6 +133,8 @@ def main() raises:
         for qi in range(len(qs)):
             var r = doc.field(raw, qs[qi].name)
             ref mine = d1.last_probs[qi]
+            if qs[qi].kind == Q_ESTIMATE:
+                estimates_asked += 1
             var before = worst_raw
             worst_raw = 0.0
             if qs[qi].kind == Q_MULTI:
@@ -139,6 +161,7 @@ def main() raises:
         var ga = got.field(got.root(), "answers")
         var wa = doc.field(fw, "answers")
         var worst = 0.0
+        var worst_share = 0.0
         var same = got.size(ga) == doc.size(wa)
         for i in range(doc.size(wa)):
             var qn = doc.key_at(wa, i)
@@ -150,6 +173,29 @@ def main() raises:
             var kind = doc.string(doc.field(w, "type"))
             if kind == "noul":
                 worst = max(worst, abs(got.number(got.field(g, "noul")) - doc.number(doc.field(w, "noul"))))
+                continue
+            if kind == "number" and doc.field(w, "interval") >= 0:  # an estimate: values read off the grid
+                var wi = doc.field(w, "interval")
+                var gi = got.field(g, "interval")
+                var wun = doc.field(w, "unit")
+                var gun = got.field(g, "unit")
+                var unit_ok = (doc.kind_of(wun) == J_NULL) == (got.kind_of(gun) == J_NULL)
+                if unit_ok and doc.kind_of(wun) != J_NULL:
+                    unit_ok = doc.string(wun) == got.string(gun)
+                var span = 1.0
+                for qq in qs:
+                    if qq.name == qn:
+                        span = qq.grid.high - qq.grid.low
+                var share = 0.0
+                if gi >= 0 and got.size(gi) == 2:
+                    share = max(abs(got.number(got.field(g, "number")) - doc.number(doc.field(w, "number"))),
+                                abs(got.number(got.at(gi, 0)) - doc.number(doc.at(wi, 0))),
+                                abs(got.number(got.at(gi, 1)) - doc.number(doc.at(wi, 1)))) / span
+                worst_share = max(worst_share, share)
+                if gi < 0 or got.size(gi) != 2 or not unit_ok or share > (W8A8_GRID_SHARE if w8a8 else 0.0):
+                    same = False
+                    print("    ", name, "/", qn, ": estimate", got.number(got.field(g, "number")), "vs",
+                          doc.number(doc.field(w, "number")), ", worst share of the range", share)
                 continue
             var wc = doc.field(w, "choices")
             if wc >= 0:  # a multiple choice
@@ -178,9 +224,11 @@ def main() raises:
         check(fails, shape_ok and worst_raw < bound, name + ": raw slot distributions, worst |d| = " + String(worst_raw))
         check(fails, same and worst < bound and wu == gu,
               name + ": " + String(doc.size(wa)) + " answers, same picks, worst probability |d| = " + String(worst)
-              + ", " + String(gu) + " tokens (" + String(ms) + " ms)")
-    check(fails, asked >= 2 and multi_asked >= 4,
-          String(asked) + " cases asked, " + String(multi_asked) + " multiple choices among them")
+              + ", " + String(gu) + " tokens (" + String(ms) + " ms)"
+              + (", estimates off by " + String(worst_share) + " of their range" if worst_share > 0.0 else ""))
+    check(fails, asked >= 3 and multi_asked >= 4 and estimates_asked >= 5,
+          String(asked) + " cases asked, " + String(multi_asked) + " multiple choices and " + String(estimates_asked)
+          + " estimates among them")
     if fails > 0:
         raise Error(String(fails) + " FAILED")
     print("ALL PASS")

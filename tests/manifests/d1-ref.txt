@@ -27,8 +27,10 @@ tests/text/test_bpe_reference.mojo
 # (multiple choices, text / number / date reads, estimates on number and code
 # grids, box, boxes of 16 / 4 / 1 blocks), every slot's readout tokens, 9 packed
 # rows, their state positions (per token span, JSON string paths, pointer
-# width), 88 offset mappings, and calibration.json's tables over a sweep — all
-# exact. Ten mutants caught (listed in the test's header).
+# width), offset mappings, calibration.json's tables over a sweep, and ten
+# grids' values against d1's `Grid.values` — all exact. Twelve mutants caught
+# (the test's header; with T3: the grid's top value, and the grid's product
+# fused into an FMA — LLVM's default, where Python rounds twice).
 tests/llm/test_d1_typed_prompt_reference.mojo
 
 # The LFM3 text backbone on the device (noeira/llm/lfm3) against d1's own code,
@@ -90,8 +92,12 @@ tests/llm/test_d1_finetune_smoke_gpu.mojo
 # choices mixed with untyped questions: each slot's raw distribution
 # (`D1.last_probs`) and the answers within 1e-4 (measured <= 3.4e-6), the same
 # choices; four mutants caught (a temperature on typed slots, none on untyped
-# ones, the `multiple` table skipped, `lm_head`'s 9-15 slot pass). Its `--w8a8`
-# leg: the same choices, within 0.1 (measured 0.08). ⚠ GPU: the Orin.
+# ones, the `multiple` table skipped, `lm_head`'s 9-15 slot pass). T3,
+# estimates on number and code grids: raw within 1e-4, the median, interval
+# and unit EXACTLY d1's (read at the `estimate` table's levels; a mutant
+# reading plain 0.1 / 0.5 / 0.9 caught). Its `--w8a8` leg: the same choices,
+# probabilities within 0.1 (measured 0.08), estimates within 0.2 of their range
+# (measured 0.06-0.13). ⚠ GPU: the Orin.
 tests/llm/test_d1_typed_answers_gpu.mojo
 
 # D1Service (noeira/llm/d1/service.mojo): d1 on its own thread behind the
