@@ -425,6 +425,41 @@ class Precomputed:
         return dets
 
 
+class PrecomputedWords:
+    """Detections a separate program wrote for the WORDS themselves
+    (`--detectors words:<dir>`): `<dir>/nyu_<i>.det` per frame, as
+    `Precomputed`'s format but the first field is the word's index in `WORDS`'
+    order (fridge, table, door, sofa). A detection with h = w = 0 has no mask
+    (d1's boxes): it is scored on its box (AP, box-centre 3D) only.
+    `tools/perception/d1_frames.mojo` (d1-2B's `boxes`) and
+    `tools/perception/sam3_frames.mojo` (the Mojo SAM 3) write them."""
+
+    def __init__(self, dev, path=""):
+        self.dir = os.path.expanduser(path)
+        self.name = "words-" + os.path.basename(self.dir.rstrip("/"))
+        self.frame = None
+
+    def __call__(self, img, words):
+        b = open(os.path.join(self.dir, f"nyu_{self.frame:04d}.det"), "rb").read()
+        names = list(WORDS)
+        n = int(np.frombuffer(b, "<u4", 1, 0)[0])
+        at, dets = 4, []
+        for _ in range(n):
+            wi = int(np.frombuffer(b, "<u4", 1, at)[0])
+            sc = float(np.frombuffer(b, "<f4", 1, at + 4)[0])
+            box = np.frombuffer(b, "<f4", 4, at + 8).astype(np.float64)
+            h, w = (int(v) for v in np.frombuffer(b, "<u4", 2, at + 24))
+            nb = (h * w + 7) // 8
+            mask = None
+            if h * w:
+                bits = np.unpackbits(np.frombuffer(b, np.uint8, nb, at + 32), bitorder="little")[: h * w]
+                mask = bits.reshape(h, w).astype(bool)
+            at += 32 + nb
+            if names[wi] in words:
+                dets.append((names[wi], sc, box, mask))
+        return dets
+
+
 class RfDetrFt:
     """A FINE-TUNED RF-DETR-Seg-Small (`--detectors rfdetr-ft:<checkpoint>`,
     `finetune_rfdetr.py`): its own classes, named in the checkpoint; a word
@@ -529,6 +564,8 @@ def main():
     def _pick(d):
         if d.startswith("precomputed:"):
             return partial(Precomputed, path=d.split(":", 1)[1])
+        if d.startswith("words:"):
+            return partial(PrecomputedWords, path=d.split(":", 1)[1])
         if d.startswith("rfdetr-ft:"):
             return partial(RfDetrFt, path=d.split(":", 1)[1])
         return table[d.strip()]
@@ -572,15 +609,16 @@ def main():
                         recs[w]["scores"].append(sc)
                         recs[w]["tps"].append(0)
                 if best_match is not None:
-                    pm = best_match[2] if best_match[2] is not None else sam(img, best_match[0])
                     gm = best_match[1]
-                    inter = (pm & gm).sum()
-                    uni = (pm | gm).sum()
-                    recs[w]["mask_iou"].append(inter / uni if uni else 0.0)
-                    cp = centroid3d(pm, dep)
                     cg = centroid3d(gm, dep)
-                    if cp is not None and cg is not None:
-                        recs[w]["err3d"].append(float(np.linalg.norm(cp - cg)))
+                    pm = best_match[2] if best_match[2] is not None else (sam(img, best_match[0]) if sam else None)
+                    if pm is not None:  # a box-only detector without SAM: box metrics only
+                        inter = (pm & gm).sum()
+                        uni = (pm | gm).sum()
+                        recs[w]["mask_iou"].append(inter / uni if uni else 0.0)
+                        cp = centroid3d(pm, dep)
+                        if cp is not None and cg is not None:
+                            recs[w]["err3d"].append(float(np.linalg.norm(cp - cg)))
                     cb = centroid3d(box_centre_mask(best_match[0], dep.shape), dep)
                     if cb is not None and cg is not None:
                         recs[w]["err3d_box"].append(float(np.linalg.norm(cb - cg)))
