@@ -7,8 +7,8 @@
 
 - A read (`text`, `number`, `date`): its found through `found:<type>`; when
   it is 0.5 or more, the text and span its slots point at (and the JSON path
-  of the string it lies in). A number's or a date's value needs d1's parser
-  (T6): null until then.
+  of the string it lies in); a number's or a date's value parsed from that
+  text in the state's context (`parsing.mojo`).
 - A box: presence then four edges, each edge a distribution over the
   thousandths 0-0.999 (or 128 codes over 0-1); `found` through `found:box`,
   the edges at their medians (or, `d1_box_edges: interp`, where the CDF
@@ -30,6 +30,7 @@ from noeira.io.json import JsonWriter
 from .prompt import D1Question, D1Grid, mul_unfused
 from .calibration import D1Calibration
 from .pointer import D1Read
+from .parsing import D1Parser, cps
 
 
 def fsum(xs: List[Float64]) -> Float64:
@@ -143,19 +144,43 @@ def answer_estimate(mut w: JsonWriter, q: D1Question, slots: List[List[Float64]]
     w.end_object()
 
 
-def answer_read(mut w: JsonWriter, q: D1Question, rd: D1Read, cal: D1Calibration) raises:
-    """`api.answer` for a read: `{"type", <type>: value, "span", "found"[, "text"][, "path"][, "unit"]}`."""
+def answer_read(mut w: JsonWriter, q: D1Question, rd: D1Read, cal: D1Calibration, parser: D1Parser,
+                state_text: String) raises:
+    """`api.answer` for a read: `{"type", <type>: value, "span", "found"[, "text"][, "path"][, "unit"]}`.
+    A number's value is `parse_number(text, state_text, unit=q.unit)` and its unit `q.unit or
+    written_unit(text)`; a date's value `parse_date(text, state_text)`'s ISO date."""
     var found = cal.through(String("found:") + q.read_type, rd.found)
     var present = found >= 0.5
     var has = present and rd.has_text
+    var has_unit = q.has_unit
+    var unit = q.unit
     w.key(q.name)
     w.begin_object()
     w.member("type", q.read_type)
     w.key(q.read_type)
-    if has and q.read_type == "text":
+    if not has:
+        w.null()
+    elif q.read_type == "text":
         w.string(rd.text)
+    elif q.read_type == "number":
+        var t = cps(rd.text)
+        if not (q.has_unit and q.unit.byte_length() > 0):  # `unit or written_unit(text)`
+            var wu = parser.written_unit(t)
+            has_unit = wu[0]
+            unit = wu[1]
+        var v = parser.parse_number(t, cps(state_text), q.unit, q.has_unit)
+        if v.kind == 1:
+            w.integer(v.i)
+        elif v.kind == 2:
+            w.number(v.f)
+        else:
+            w.null()
     else:
-        w.null()  # a number's or a date's value: d1's parser (T6)
+        var d = parser.parse_date(cps(rd.text), cps(state_text))
+        if d.found:
+            w.string(d.iso)
+        else:
+            w.null()
     w.key("span")
     if has:
         w.begin_array()
@@ -175,8 +200,8 @@ def answer_read(mut w: JsonWriter, q: D1Question, rd: D1Read, cal: D1Calibration
         w.member("path", rd.path)
     if q.read_type == "number":
         w.key("unit")
-        if q.has_unit:
-            w.string(q.unit)
+        if has_unit:
+            w.string(unit)
         else:
             w.null()
     w.end_object()

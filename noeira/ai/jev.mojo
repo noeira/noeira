@@ -29,6 +29,12 @@ control policy: it emits labels, not joint targets, and its own docs list
 arithmetic, counting and numeric comparison as failure modes — so put
 thresholds IN THE STATE as booleans or words, not raw numbers to compare.
 
+Typed answers (d1-2B in this process, `D1Service`; docs/NN_MODEL_PORTS_PLAN.md
+§12.9): `choices` (every option that applies), `read` (a text, number or date
+read from the state, with its span), `estimate` (a judged number with an
+interval), `box` / `boxes` (where something is in the one picture of
+`start_seeing`). Their answers carry `found` / `confidence` the same way.
+
 ⚠ `confidence` IS THE PRODUCT. Act above a threshold, escalate (ask the LLM,
 ask a human, stop) below it; a choice read without its confidence throws the
 calibration away.
@@ -38,7 +44,7 @@ from std.os import getenv
 
 from noeira.ai.picture import Picture
 from noeira.io.http import HttpClient
-from noeira.io.json import J_NUMBER, J_OBJECT, J_STRING, JsonDoc, JsonWriter, parse_json
+from noeira.io.json import J_NULL, J_NUMBER, J_OBJECT, J_STRING, JsonDoc, JsonWriter, parse_json
 
 from noeira.ai.keys import api_key, find_api_key
 from noeira.ai.transport import warm_up, ApiCall, CALL_IDLE
@@ -125,6 +131,105 @@ struct JevQuestions(Copyable, Movable):
         self.ids.append(id^)
         self._json.append(w.done())
 
+    def choices(
+        mut self,
+        var id: String,
+        var instructions: String,
+        options: List[String],
+        descriptions: List[String] = List[String](),
+    ) raises:
+        """Every option that applies (a `choice` with `multiple: true`): each
+        option its own yes/no, the answer's `choices` those at 0.5 or more and
+        each one's probability (`JevAnswers.choices`, `probability`)."""
+        if len(options) == 0:
+            raise Error("jev choices '" + id + "': at least one option")
+        if len(descriptions) != 0 and len(descriptions) != len(options):
+            raise Error("jev choices '" + id + "': one description per option")
+        var w = JsonWriter()
+        w.begin_object()
+        w.member("type", String("choice"))
+        w.key("multiple")
+        w.boolean(True)
+        w.member("instructions", instructions)
+        w.key("criteria")
+        w.begin_object()
+        for i in range(len(options)):
+            w.member(options[i], descriptions[i] if len(descriptions) > 0 else options[i])
+        w.end_object()
+        w.end_object()
+        self.ids.append(id^)
+        self._json.append(w.done())
+
+    def read(mut self, var id: String, var instructions: String, kind: String = "text", unit: String = "") raises:
+        """A value read FROM THE STATE: `kind` "text", "number" or "date". The
+        answer is the span it was read from and, for a number or a date, its
+        value parsed from it (`JevAnswers.text`, `number`, `date`, `span`,
+        `found`); nothing when it is absent (`found` < 0.5). `unit`: a
+        number's, when the question names one."""
+        if kind != "text" and kind != "number" and kind != "date":
+            raise Error("jev read '" + id + "': kind is text, number or date, not " + kind)
+        var w = JsonWriter()
+        w.begin_object()
+        w.member("type", kind)
+        w.member("instructions", instructions)
+        if unit.byte_length() > 0:
+            w.member("unit", unit)
+        w.end_object()
+        self.ids.append(id^)
+        self._json.append(w.done())
+
+    def estimate(
+        mut self, var id: String, var instructions: String, low: Float64, high: Float64, step: Float64 = 0.0,
+        unit: String = "",
+    ) raises:
+        """A number ESTIMATED over [`low`, `high`] (`step` apart when given,
+        at most 128 values): the answer's median and its p10-p90 interval
+        (`JevAnswers.number`, `interval`). Not read from the state: judged."""
+        if not low < high:
+            raise Error("jev estimate '" + id + "': low below high")
+        var w = JsonWriter()
+        w.begin_object()
+        w.member("type", String("number"))
+        w.member("instructions", instructions)
+        w.key("range")
+        w.begin_array()
+        w.number(low)
+        w.number(high)
+        w.end_array()
+        if step > 0.0:
+            w.member("step", step)
+        if unit.byte_length() > 0:
+            w.member("unit", unit)
+        w.end_object()
+        self.ids.append(id^)
+        self._json.append(w.done())
+
+    def box(mut self, var id: String, var instructions: String) raises:
+        """Where something is in THE picture (`start_seeing`, exactly one):
+        its four edges as fractions of the picture, or none (`JevAnswers.box`)."""
+        var w = JsonWriter()
+        w.begin_object()
+        w.member("type", String("box"))
+        w.member("instructions", instructions)
+        w.end_object()
+        self.ids.append(id^)
+        self._json.append(w.done())
+
+    def boxes(mut self, var id: String, var instructions: String, max: Int = 0) raises:
+        """Every instance of something in THE picture, in reading order
+        (`JevAnswers.boxes`, `count`, `at_least`). `max` (1 to 16 on d1-2B):
+        the most read; 0 for the model's default (16). Each block costs ~20
+        tokens, so a small `max` is cheaper."""
+        var w = JsonWriter()
+        w.begin_object()
+        w.member("type", String("boxes"))
+        w.member("instructions", instructions)
+        if max > 0:
+            w.member("max", max)
+        w.end_object()
+        self.ids.append(id^)
+        self._json.append(w.done())
+
     def write_to_json(self, mut w: JsonWriter) raises:
         w.begin_object()
         for i in range(len(self.ids)):
@@ -188,6 +293,102 @@ struct JevAnswers(Movable):
         var p = self.noul(id)
         return p if p > 0.5 else 1.0 - p
 
+    def choices(self, id: String) raises -> List[String]:
+        """A multiple choice's options at 0.5 or more, in the question's order."""
+        var c = self.doc.field(self._answer(id), "choices")
+        if c < 0:
+            raise Error("jev: answer '" + id + "' is not a multiple choice")
+        var out = List[String]()
+        for i in range(self.doc.size(c)):
+            out.append(self.doc.string(self.doc.at(c, i)))
+        return out^
+
+    def found(self, id: String) raises -> Float64:
+        """A read's or a box's calibrated P(it is there); a value or box is
+        given when this is 0.5 or more."""
+        return self._num(id, String("found"))
+
+    def has_value(self, id: String) raises -> Bool:
+        """A read's or an estimate's value is there (not null): a number read
+        can be found yet unparsed ("3.1 m" has no number by d1's rules)."""
+        var a = self._answer(id)
+        var t = self.doc.field(a, "type")
+        var v = self.doc.field(a, self.doc.string(t))
+        return v >= 0 and self.doc.kind_of(v) != J_NULL
+
+    def text(self, id: String) raises -> String:
+        """The text a read points at ("" when nothing was found)."""
+        var t = self.doc.field(self._answer(id), "text")
+        if t < 0 or self.doc.kind_of(t) != J_STRING:
+            return String("")
+        return self.doc.string(t)
+
+    def number(self, id: String) raises -> Float64:
+        """A number read's parsed value, or an estimate's median. Raises when
+        there is none (`has_value`)."""
+        var n = self.doc.field(self._answer(id), "number")
+        if n < 0 or self.doc.kind_of(n) != J_NUMBER:
+            raise Error("jev: answer '" + id + "' has no number")
+        return self.doc.number(n)
+
+    def date(self, id: String) raises -> String:
+        """A date read's ISO 8601 value ("" when none)."""
+        var d = self.doc.field(self._answer(id), "date")
+        if d < 0 or self.doc.kind_of(d) != J_STRING:
+            return String("")
+        return self.doc.string(d)
+
+    def unit(self, id: String) raises -> String:
+        """A number's unit: the question's, else the one written in the span ("" for none)."""
+        var u = self.doc.field(self._answer(id), "unit")
+        if u < 0 or self.doc.kind_of(u) != J_STRING:
+            return String("")
+        return self.doc.string(u)
+
+    def span(self, id: String) raises -> Tuple[Int, Int]:
+        """A read's `[start, end)` in the state's text, in characters; (-1, -1) for none."""
+        var s = self.doc.field(self._answer(id), "span")
+        if s < 0 or self.doc.kind_of(s) == J_NULL:
+            return (-1, -1)
+        return (self.doc.integer(self.doc.at(s, 0)), self.doc.integer(self.doc.at(s, 1)))
+
+    def interval(self, id: String) raises -> Tuple[Float64, Float64]:
+        """An estimate's p10-p90 interval."""
+        var s = self.doc.field(self._answer(id), "interval")
+        if s < 0:
+            raise Error("jev: answer '" + id + "' is not an estimate")
+        return (self.doc.number(self.doc.at(s, 0)), self.doc.number(self.doc.at(s, 1)))
+
+    def box(self, id: String) raises -> JevBox:
+        """A `box` question's box (`JevBox.drawn` False when there is none)."""
+        var a = self._answer(id)
+        var b = self.doc.field(a, "box")
+        var found = self.doc.number(self.doc.field(a, "found"))
+        var conf = self.doc.number(self.doc.field(a, "confidence"))
+        if b < 0 or self.doc.kind_of(b) == J_NULL:
+            return JevBox(False, 0.0, 0.0, 0.0, 0.0, found, conf)
+        return _box_of(self.doc, b, found, conf)
+
+    def boxes(self, id: String) raises -> List[JevBox]:
+        """A `boxes` question's boxes, in reading order."""
+        var l = self.doc.field(self._answer(id), "boxes")
+        if l < 0:
+            raise Error("jev: answer '" + id + "' is not a boxes answer")
+        var out = List[JevBox]()
+        for i in range(self.doc.size(l)):
+            var e = self.doc.at(l, i)
+            out.append(_box_of(self.doc, self.doc.field(e, "box"), self.doc.number(self.doc.field(e, "found")),
+                               self.doc.number(self.doc.field(e, "confidence"))))
+        return out^
+
+    def count(self, id: String) raises -> Int:
+        """How many boxes a `boxes` answer drew."""
+        return self.doc.integer(self.doc.field(self._answer(id), "count"))
+
+    def at_least(self, id: String) raises -> Bool:
+        """Every block read was present: there may be more than `count`."""
+        return self.doc.boolean(self.doc.field(self._answer(id), "at_least"))
+
     def probability(self, id: String, option: String) raises -> Float64:
         """P(option) for a choice, or P(level) for a score (`"0"`, `"1"`…)."""
         var probs = self.doc.field(self._answer(id), "probabilities")
@@ -195,6 +396,26 @@ struct JevAnswers(Movable):
         if p < 0:
             return 0.0
         return self.doc.number(p)
+
+
+@fieldwise_init
+struct JevBox(Copyable, Movable):
+    """A box in a picture, edges as fractions of it (0 = top / left)."""
+
+    var drawn: Bool
+    var top: Float64
+    var bottom: Float64
+    var left: Float64
+    var right: Float64
+    var found: Float64
+    """Calibrated P(it is there); for `boxes`, P(at least this many)."""
+    var confidence: Float64
+    """Calibrated P(this box is right: IoU >= 0.5 with the truth)."""
+
+
+def _box_of(ref doc: JsonDoc, b: Int, found: Float64, conf: Float64) raises -> JevBox:
+    return JevBox(True, doc.number(doc.field(b, "top")), doc.number(doc.field(b, "bottom")),
+                  doc.number(doc.field(b, "left")), doc.number(doc.field(b, "right")), found, conf)
 
 
 trait DecisionService(Movable & Deinitable):

@@ -32,8 +32,8 @@ level): not gated.
 T4 reads `text`, `number` and `date` spans: each read's two slots against the
 row's state positions (`pointer.mojo`); its raw found within the bound, its
 text, span and JSON path EXACTLY d1's, and the answer's (found through
-`found:<type>`). A number's or a date's VALUE is d1's parser's (T6): the gate
-sets `D1.unparsed_reads` and leaves those values out, and says how many.
+`found:<type>`). T6: a number's or a date's VALUE (and a number's unit),
+parsed from that text by d1's rules, EXACTLY d1's.
 Mutants caught: the pointer without 1/sqrt(D), found read off position 1
 instead of the BOS, invalid positions scored, whitespace kept at a span's
 edge, a span not clipped to its JSON string (`label`: its first token " \"("
@@ -173,14 +173,13 @@ def main() raises:
     var cases = doc.field(doc.root(), "cases")
     var t0 = perf_counter_ns()
     var d1 = D1.load(DeviceContext(), model_dir, vision=True, w8a8=w8a8)
-    d1.unparsed_reads = True  # number / date reads: their spans now, their values with the parser (T6)
     print("  d1 loaded in", (perf_counter_ns() - t0) // 1_000_000, "ms")
     var asked = 0
     var multi_asked = 0
     var estimates_asked = 0
     var reads_asked = 0
     var reads_found = 0
-    var values_waiting = 0
+    var values_checked = 0
     var boxes_asked = 0
     var boxes_drawn = 0
     for ci in range(doc.size(cases)):
@@ -364,8 +363,22 @@ def main() raises:
                           and doc.integer(doc.at(sw, 0)) == got.integer(got.at(sg, 0))
                           and doc.integer(doc.at(sw, 1)) == got.integer(got.at(sg, 1)))
                 ok = ok and ((pw >= 0) == (pg >= 0)) and (pw < 0 or doc.string(pw) == got.string(pg))
-                if kind != "text":
-                    values_waiting += 1  # its value (and a number's written unit): d1's parser, T6
+                if kind != "text":  # the value parsed from the text (T6), and a number's unit
+                    values_checked += 1
+                    var vw = doc.field(w, kind)
+                    var vg = got.field(g, kind)
+                    var v_ok = (doc.kind_of(vw) == J_NULL) == (got.kind_of(vg) == J_NULL)
+                    if v_ok and doc.kind_of(vw) != J_NULL:
+                        v_ok = (doc.number(vw) == got.number(vg)) if kind == "number" else (doc.string(vw) == got.string(vg))
+                    if kind == "number":
+                        var uw = doc.field(w, "unit")
+                        var ug = got.field(g, "unit")
+                        v_ok = v_ok and ((doc.kind_of(uw) == J_NULL) == (got.kind_of(ug) == J_NULL))
+                        if v_ok and doc.kind_of(uw) != J_NULL:
+                            v_ok = doc.string(uw) == got.string(ug)
+                    if not v_ok:
+                        ok = False
+                        print("    ", name, "/", qn, ": parsed value or unit differs")
                 if not ok:
                     same = False
                     print("    ", name, "/", qn, ": answer's read differs")
@@ -424,11 +437,11 @@ def main() raises:
               + (", estimates off by " + String(worst_share) + " of their range" if worst_share > 0.0 else "")
               + (", box confidence |d| = " + String(worst_conf) if worst_conf > 0.0 else "")
               + (", box edges off by " + String(worst_edge) if worst_edge > 0.0 else ""))
-    check(fails, asked >= 8 and multi_asked >= 5 and estimates_asked >= 6 and reads_asked >= 15 and reads_found >= 8
+    check(fails, asked >= 8 and multi_asked >= 5 and estimates_asked >= 6 and reads_asked >= 15 and reads_found >= 8 and values_checked >= 7
           and boxes_asked >= 4,
           String(asked) + " cases asked: " + String(multi_asked) + " multiple choices, " + String(estimates_asked)
           + " estimates, " + String(reads_asked) + " reads (" + String(reads_found) + " found something; "
-          + String(values_waiting) + " number / date values wait for T6), " + String(boxes_asked) + " box questions ("
+          + String(values_checked) + " number / date values parsed), " + String(boxes_asked) + " box questions ("
           + String(boxes_drawn) + " boxes drawn)")
     if fails > 0:
         raise Error(String(fails) + " FAILED")

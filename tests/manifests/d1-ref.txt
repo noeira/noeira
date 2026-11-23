@@ -104,8 +104,35 @@ tests/llm/test_d1_finetune_smoke_gpu.mojo
 # five boxes questions over an NYU picture (the reference's own pixels), 12
 # boxes drawn: raw within 1e-4, every edge and confidence exactly d1's; W8A8
 # edges within 0.05 of the picture (measured 0.033, a sliver book; the rest
-# 0.001), confidence within 0.2 (0.096). Five box mutants caught. ⚠ GPU: the Orin.
+# 0.001), confidence within 0.2 (0.096). Five box mutants caught. T6: the 7
+# number / date reads' VALUES and units exactly d1's (parsed by
+# noeira/llm/d1/parsing.mojo). ⚠ GPU: the Orin.
 tests/llm/test_d1_typed_answers_gpu.mojo
+
+# d1's parser (noeira/llm/d1/parsing.mojo, its patterns verbatim on the
+# noeira/text/pyre.mojo engine) against d1-2B's own parsing.py and Python's re
+# (docs/NN_MODEL_PORTS_PLAN.md §12.9, T6; host only, no model; reference
+# `tools/d1/dump_d1_parsing_reference.py` -> ~/.cache/noeira/d1/parsing_ref.json):
+# the 13 module patterns as text, 28 patterns x 309 probe texts matched as re
+# matches them (every group's span, finditer and fullmatch), _fold on the
+# corpus and every 13th code point of Unicode, written_unit (96),
+# parse_number (8,640 text x context x unit cases, floats bit for bit) and
+# parse_date (855) — all exact. Twelve mutants caught (engine: lazy, negative
+# look-around, \b, class ignore-case, $ before a final newline, back-references;
+# parser: decimal-mark evidence order, day/month order, lakh, "Billion",
+# fraction truncation; Hangul in the fold). The Unicode tables are generated
+# by tools/d1/make_pyunicode_tables.py with the reference's own Python.
+tests/llm/test_d1_parsing_reference.mojo
+
+# d1's typed answers through the brain's API (docs/NN_MODEL_PORTS_PLAN.md
+# §12.9, T7): every typed reference question built with JevQuestions'
+# builder of its type (choices, read, estimate, box, boxes, and the untyped
+# three) writes the reference's question JSON exactly (25 questions), is asked
+# through D1Service (start / start_text / start_seeing with the reference's
+# pixels), and every answer read through JevAnswers' accessors equals d1's
+# (25 answers: discrete values exactly, probabilities within 1e-4). Three
+# mutants caught. ⚠ GPU: the Orin.
+tests/llm/test_d1_typed_service_gpu.mojo
 
 # D1Service (noeira/llm/d1/service.mojo): d1 on its own thread behind the
 # voice loop's DecisionService (JevQuestions in, JevAnswers out), asked by a

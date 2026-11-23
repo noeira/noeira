@@ -22,11 +22,11 @@ choice each option's P(yes) through the `multiple` table and the options at
 the `estimate` table's levels (`answers.mojo`); a `text` read the span its
 `start` and `end` slots point at in the state (`pointer.mojo`: the slots'
 hidden states against the state positions', on the host), its found through
-`found:text`; a `box` / `boxes` question (exactly one picture) its presence
-and edges (`answers.mojo`: medians, Halton confidence, the box tables)
-(docs/NN_MODEL_PORTS_PLAN.md §12.9). `number` and `date` reads wait for d1's
-parser (T6): refused. Only the vocabulary columns a row's slots read leave the
-device (`Lfm3Text.slot_logz_cols`).
+`found:<type>`, a `number` or `date` read's value parsed from that text by
+d1's own rules (`parsing.mojo`); a `box` / `boxes` question (exactly one
+picture) its presence and edges (`answers.mojo`: medians, Halton confidence,
+the box tables) (docs/NN_MODEL_PORTS_PLAN.md §12.9). Only the vocabulary
+columns a row's slots read leave the device (`Lfm3Text.slot_logz_cols`).
 
 Pictures (d1's `media`, LFM3-VL's tower: `noeira.llm.lfm3.vision`): their
 markup heads the user turn, before the state (`<|vision_start|>`, one
@@ -65,6 +65,7 @@ from .prompt import (
 )
 from .calibration import D1Calibration
 from .answers import answer_estimate, answer_read, answer_box, answer_boxes
+from .parsing import D1Parser
 from .positions import state_positions
 from .pointer import D1Read, position_logits, spans, read as read_span, SPAN_TEXT, SPAN_NUMBER
 
@@ -83,9 +84,8 @@ struct D1(Movable):
     """The rows of the last call (the gate compares them with d1's)."""
     var last_reads: List[D1Read]
     """The last call's reads, per question (`D1Read.nothing` for the others): the gates compare them."""
-    var unparsed_reads: Bool
-    """Let a `number` or `date` read answer before d1's parser is ported (§12.9 T6): its text, span
-    and found, its value null. Off by default (such a read is refused); the gates set it."""
+    var parser: D1Parser
+    """d1's `parsing.py`: a number or date read's value from its text (built once)."""
     var last_probs: List[List[List[Float64]]]
     """The last call's distributions, per question and per slot, as d1's `run` reads them before
     answering: an untyped question's tempered softmax, a typed slot's raw one (the gates compare them)."""
@@ -100,7 +100,7 @@ struct D1(Movable):
     def __init__(
         out self, var lm: Lfm3Text, var tok: ByteLevelBPE, temperature: Float64, var vision: Optional[Lfm3Vision] = None,
         var audio: Optional[Lfm3Audio] = None,
-    ):
+    ) raises:
         self.vision = vision^
         self.audio = audio^
         self.lm = lm^
@@ -113,7 +113,7 @@ struct D1(Movable):
         self.last_rows = List[D1Row]()
         self.last_probs = List[List[List[Float64]]]()
         self.last_reads = List[D1Read]()
-        self.unparsed_reads = False
+        self.parser = D1Parser()
         self.trace = getenv("NOEIRA_D1_TRACE")
         self.traced = 0
 
@@ -169,9 +169,6 @@ struct D1(Movable):
             if (q.kind == Q_BOX or q.kind == Q_BOXES) and len(pictures) != 1:
                 raise Error("d1: '" + q.name + "': a box or boxes question reads exactly one picture; this request has "
                             + String(len(pictures)))
-            if q.kind == Q_READ and q.read_type != "text" and not self.unparsed_reads:
-                raise Error("d1: '" + q.name + "': a " + q.read_type + " read is not yet read: its value needs "
-                            + "d1's parser (docs/NN_MODEL_PORTS_PLAN.md §12.9, T6)")
         var media = String("")
         var feats = Optional[DeviceBuffer[DT]](None)
         var image_token = -1
@@ -298,7 +295,7 @@ struct D1(Movable):
             elif qs[i].kind == Q_ESTIMATE:
                 answer_estimate(w, qs[i], probs[i], self.calibration)
             elif qs[i].kind == Q_READ:
-                answer_read(w, qs[i], reads[i], self.calibration)
+                answer_read(w, qs[i], reads[i], self.calibration, self.parser, block)
             elif qs[i].kind == Q_BOX:
                 answer_box(w, qs[i], probs[i], self.calibration, self.record.box_edges)
             elif qs[i].kind == Q_BOXES:
