@@ -27,6 +27,13 @@ Writes `<out>/cases.json`:
     calibration   each table's `through` at a sweep of values, and `level("estimate", share)`
 
 and copies `calibration.json` and `config.json` beside it.
+
+`--forward` (fp32, a few minutes a case on the Orin's CPU): each case also gets
+`forward` = `raw`, each question's probabilities as d1's `run` returns them
+(an untyped question's tempered distribution; a multiple choice's raw P(yes)
+per option; a box's presence and edge distributions; a read's text, span and
+raw found), and `answers` / `usage`, `system_one`'s output made from them
+(`SystemOneApi.answer`, as `system_one_batch` makes it).
 """
 
 import argparse
@@ -75,6 +82,16 @@ def cases(images):
             "plain_names": {"type": "choice", "multiple": True, "instructions": "Which places are named?",
                             "criteria": {"la porte": "the door", "canapé": "the sofa", 'a "b"': None}},
             "addressed": {"type": "noul", "instructions": "Is the person speaking to the robot?"},
+        }),
+        "multiple_text": ("Le robot entend : « Range la tasse et la caisse, puis va t'asseoir sur le canapé. »", [], {
+            "actions": {"type": "choice", "multiple": True, "instructions": "Which actions does the person ask for?",
+                        "criteria": {"put_away": "put something away", "walk": "walk somewhere",
+                                     "sit": "sit down", "dance": "dance", "open_door": "open the door",
+                                     "wait": "wait"}},
+            "first": {"type": "choice", "instructions": "What should the robot do first?",
+                      "criteria": {"put_away": "put something away", "walk": "walk somewhere", "sit": "sit down"}},
+            "objects": {"type": "choice", "multiple": True, "instructions": "Which objects are named?",
+                        "criteria": {"cup": "a cup", "crate": "a crate", "sofa": "a sofa", "lamp": "a lamp"}},
         }),
         "reads_text": (INVOICE, [], {
             "supplier": {"type": "text", "instructions": "Who issued the invoice?"},
@@ -140,11 +157,14 @@ def main():
     ap.add_argument("--model", default=os.path.expanduser("~/.cache/noeira/local-ai/d1/d1-2B"))
     ap.add_argument("--images", default=os.path.expanduser("~/.cache/noeira/d1/nyu"))
     ap.add_argument("--out", default=os.path.expanduser("~/.cache/noeira/d1/typed_ref"))
+    ap.add_argument("--forward", action="store_true", help="fp32 forward: raw slot probabilities and answers")
+    ap.add_argument("--cases", default="", help="comma-separated case names (default: all)")
     args = ap.parse_args()
     os.makedirs(args.out, exist_ok=True)
 
     torch.set_grad_enabled(False)
-    model = AutoModel.from_pretrained(args.model, trust_remote_code=True, dtype=torch.bfloat16)
+    model = AutoModel.from_pretrained(args.model, trust_remote_code=True,
+                                      dtype=torch.float32 if args.forward else torch.bfloat16)
     eng = model.engine
     pkg = type(model).__module__.rsplit(".", 1)[0]
     P = importlib.import_module(pkg + ".prompt")
@@ -173,7 +193,10 @@ def main():
         return {"text": text, "ids": enc["input_ids"], "offsets": [list(o) for o in enc["offset_mapping"]]}
 
     out_cases = {}
+    wanted = [c for c in args.cases.split(",") if c]
     for name, (state, media, questions) in cases(args.images).items():
+        if wanted and name not in wanted:
+            continue
         qs = [eng.ask(q) for q in questions.values()]
         media = media_list(media)
         prefix, _ = eng._prefix(state, media)
@@ -201,7 +224,17 @@ def main():
                 texts.append(offsets_of(P.question_header(tok, state) + s))
         for s in suffixes:
             texts.append(offsets_of(s))
-        out_cases[name] = {"state": state, "state_is_json": not isinstance(state, str), "pictures": len(media),
+        forward = None
+        if args.forward:
+            import time
+            t0 = time.time()
+            probs, read = eng.run([(state, qs, media)])[0]
+            named = dict(zip(questions, qs))
+            forward = {"raw": dict(zip(questions, probs)),
+                       "answers": {n: eng.answer(state, q, p) for (n, q), p in zip(named.items(), probs)},
+                       "usage": {"input_tokens": read, "output_tokens": 0}}
+            print(f"    {name}: forward {time.time() - t0:.0f} s")
+        out_cases[name] = {"forward": forward, "state": state, "state_is_json": not isinstance(state, str), "pictures": len(media),
                            "names": list(questions), "questions": questions, "prefix": prefix, "suffixes": suffixes,
                            "slot_offsets": offsets, "slots": slots, "rows": rows, "offsets": texts,
                            "tokens": sum(len(r["ids"]) for r in rows)}

@@ -11,11 +11,15 @@
     var heard = d1.system_one(state_json, True, questions_json, clips=clips)  # d1-Omni: heard clips (16 kHz mono)
 
 One forward per row of up to 16 questions (`prompt.pack_rows`), the answers
-read at each question's last token: the best log-probability among each
-option's token forms (`prompt.readout_ids`), divided by the calibration's
-temperature, softmaxed. Answers: `noul` P(yes); `choice` the likeliest option,
+read at each question's slots: the best log-probability among each option's
+token forms (`prompt.question_slots`), softmaxed — divided first by the
+calibration's temperature for an untyped question, raw for a typed one, whose
+own table calibrates it. Answers: `noul` P(yes); `choice` the likeliest option,
 its confidence and every probability; `score` the MEDIAN level (d1's default
-`score_readout`), its confidence, probabilities and legend.
+`score_readout`), its confidence, probabilities and legend; a `multiple`
+choice each option's P(yes) through the `multiple` table and the options at
+0.5 or more (docs/NN_MODEL_PORTS_PLAN.md §12.9). Reads, estimates and boxes
+are laid out but refused until they are read (T3-T5).
 
 Pictures (d1's `media`, LFM3-VL's tower: `noeira.llm.lfm3.vision`): their
 markup heads the user turn, before the state (`<|vision_start|>`, one
@@ -48,8 +52,8 @@ from noeira.nn.constants import DT
 from noeira.llm.lfm3 import Lfm3Text, Lfm3Vision, Lfm3Audio, Picture
 from noeira.text.bpe import ByteLevelBPE
 from .prompt import (
-    D1Question, D1Record, D1Row, Q_NOUL, Q_CHOICE, Q_SCORE, parse_questions, py_json_dumps, prefix_text,
-    suffix_layout, pack_rows, readout_ids,
+    D1Question, D1Record, D1Row, D1Slot, Q_NOUL, Q_CHOICE, Q_SCORE, Q_MULTI, SLOT_CODES, parse_questions,
+    py_json_dumps, prefix_text, suffix_layout, pack_rows, question_slots, typed,
 )
 from .calibration import D1Calibration
 
@@ -66,6 +70,9 @@ struct D1(Movable):
     var set_size: Int
     var last_rows: List[D1Row]
     """The rows of the last call (the gate compares them with d1's)."""
+    var last_probs: List[List[List[Float64]]]
+    """The last call's distributions, per question and per slot, as d1's `run` reads them before
+    answering: an untyped question's tempered softmax, a typed slot's raw one (the gates compare them)."""
     var vision: Optional[Lfm3Vision]
     """The picture encoder (`D1.load(..., vision=True)`); None: text only."""
     var audio: Optional[Lfm3Audio]
@@ -88,6 +95,7 @@ struct D1(Movable):
         self.record = D1Record.d1_2b()
         self.set_size = self.record.set_size
         self.last_rows = List[D1Row]()
+        self.last_probs = List[List[List[Float64]]]()
         self.trace = getenv("NOEIRA_D1_TRACE")
         self.traced = 0
 
@@ -140,9 +148,9 @@ struct D1(Movable):
         if len(qs) == 0:
             raise Error("d1: no questions")
         for ref q in qs:
-            if q.kind != Q_NOUL and q.kind != Q_CHOICE and q.kind != Q_SCORE:
-                raise Error("d1: '" + q.name + "': typed answers (multiple, text, number, date, box, boxes) are "
-                            + "laid out but not yet read (docs/NN_MODEL_PORTS_PLAN.md §12.9, T2-T5)")
+            if q.kind != Q_NOUL and q.kind != Q_CHOICE and q.kind != Q_SCORE and q.kind != Q_MULTI:
+                raise Error("d1: '" + q.name + "': text, number, date, box and boxes answers are laid out but not "
+                            + "yet read (docs/NN_MODEL_PORTS_PLAN.md §12.9, T3-T5)")
         var media = String("")
         var feats = Optional[DeviceBuffer[DT]](None)
         var image_token = -1
@@ -172,8 +180,13 @@ struct D1(Movable):
             suffixes.append(lay[0].copy())
             offsets.append(lay[1].copy())
         var rows = pack_rows(self.tok, prefix, suffixes, self.set_size, offsets)
+        var slots_of = List[List[D1Slot]]()
+        var probs = List[List[List[Float64]]]()
+        """Per question, per slot, the slot's distribution (`SlotReader._padded`)."""
+        for ref q in qs:
+            slots_of.append(question_slots(self.tok, q, self.record))
+            probs.append(List[List[Float64]]())
         var t1 = perf_counter_ns()
-        var probs = List[List[Float64]]()
         var read = 0
         var v = self.lm.cfg.vocab
         for row in rows:
@@ -185,23 +198,32 @@ struct D1(Movable):
             )
             var logz = self.lm.slot_logz(h, len(row.ids), row.slots)
             for s in range(len(row.slots)):
-                ref q = qs[row.slot_q[s]]
+                var qi = row.slot_q[s]
+                ref slot = slots_of[qi][len(probs[qi])]
+                if slot.kind != SLOT_CODES:
+                    raise Error("d1: a pointer slot is not read yet (§12.9 T4)")
+                # a typed answer's slot is read raw: its own table calibrates it (`SlotReader._readout`)
+                var t = 1.0 if typed(qs[qi]) else self.temperature
                 var scores = List[Float64]()
-                for g in readout_ids(self.tok, q, self.record):
+                for ref g in slot.groups:
                     var best = Float64(-1e300)
                     for id in g:
                         best = max(best, Float64(logz[s * v + id]))
-                    scores.append(best / self.temperature)
-                probs.append(_softmax(scores))
+                    scores.append(best / t)
+                probs[qi].append(_softmax(scores))
         var t2 = perf_counter_ns()
         var nrows = len(rows)
         self.last_rows = rows^
+        self.last_probs = probs.copy()
         var w = JsonWriter()
         w.begin_object()
         w.key("answers")
         w.begin_object()
         for i in range(len(qs)):
-            _answer(w, qs[i], probs[i])
+            if qs[i].kind == Q_MULTI:
+                _answer_multiple(w, qs[i], probs[i], self.calibration)
+            else:
+                _answer(w, qs[i], probs[i][0])
         w.end_object()
         w.key("usage")
         w.begin_object()
@@ -254,6 +276,29 @@ def _softmax(scores: List[Float64]) -> List[Float64]:
     for i in range(len(out)):
         out[i] /= tot
     return out^
+
+
+def _answer_multiple(mut w: JsonWriter, q: D1Question, slots: List[List[Float64]], cal: D1Calibration) raises:
+    """`api.answer` for a multiple choice: each option's raw P(yes) through the
+    `multiple` table; the choices are the options at 0.5 or more."""
+    var p = List[Float64]()
+    for ref s in slots:
+        p.append(cal.through("multiple", s[0]))
+    w.key(q.name)
+    w.begin_object()
+    w.member("type", String("choice"))
+    w.key("choices")
+    w.begin_array()
+    for i in range(len(p)):
+        if p[i] >= 0.5:
+            w.string(q.labels[i])
+    w.end_array()
+    w.key("probabilities")
+    w.begin_object()
+    for i in range(len(p)):
+        w.member(q.labels[i], p[i])
+    w.end_object()
+    w.end_object()
 
 
 def _answer(mut w: JsonWriter, q: D1Question, p: List[Float64]) raises:

@@ -172,6 +172,12 @@ struct D1Question(Copyable, Movable):
                           D1Grid(0.0, 1.0, 2), 0)
 
 
+def typed(q: D1Question) -> Bool:
+    """`prompt.typed`: an answer read at its own slots and calibrated by its own
+    table, not the temperature — a read, an estimate, a box, a multiple choice."""
+    return q.kind == Q_MULTI or q.kind == Q_READ or q.kind == Q_ESTIMATE or q.kind == Q_BOX or q.kind == Q_BOXES
+
+
 def _py_round(x: Float64) -> Int:
     """Python's `round(x)`: half to even."""
     var f = floor(x)

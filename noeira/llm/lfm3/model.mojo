@@ -1205,7 +1205,7 @@ struct Lfm3Text(Movable):
             var r = rows.create_sub_buffer[DT](s0 * dm, LM_SLOTS * dm)  # padded: always LM_SLOTS rows from s0
             var lg = logits.create_sub_buffer[DT](s0 * v, min(left, LM_SLOTS) * v)
             var ns = Int64(min(left, LM_SLOTS))
-            if left >= 16:
+            if left > 8:  # 9-15 left: the 16-row kernel writes `ns` of them (the 8-row one dropped rows 9-15)
                 self.ctx.enqueue_function[lm_head_kernel[16]](r, table, lg, Int64(v), Int64(dm), ns, grid_dim=(v + 7) // 8, block_dim=256)
             elif left > 4:
                 self.ctx.enqueue_function[lm_head_kernel[8]](r, table, lg, Int64(v), Int64(dm), ns, grid_dim=(v + 7) // 8, block_dim=256)

@@ -12,7 +12,7 @@
 #       --mat ~/.cache/noeira/datasets/nyu_depth_v2/nyu_depth_v2_labeled.mat --images ~/.cache/noeira/d1/nyu
 #   python tools/d1/dump_d1_vl_reference.py --images ~/.cache/noeira/d1/nyu --out ~/.cache/noeira/d1/ref_vl
 #   # typed questions' layouts (no forward; §12.9 T1), then copy ~/.cache/noeira/d1/typed_ref here:
-#   python tools/d1/dump_d1_typed_reference.py --images ~/.cache/noeira/d1/nyu --out ~/.cache/noeira/d1/typed_ref
+#   python tools/d1/dump_d1_typed_reference.py --forward --images ~/.cache/noeira/d1/nyu --out ~/.cache/noeira/d1/typed_ref
 
 # LFM3's byte-level BPE in Mojo (noeira/text/bpe.mojo) against Hugging Face
 # `tokenizers`: 77 strings exact (each branch of the split regex, non-ASCII,
@@ -83,6 +83,16 @@ tests/llm/test_lfm3_backward_gpu.mojo
 # from fridge (0.97) to the label (sofa) in a few steps, the other two answers
 # keeping their picks. Needs only the checkpoint (no dumps).
 tests/llm/test_d1_finetune_smoke_gpu.mojo
+
+# d1's TYPED answers on the device against d1-2B's own fp32 forward
+# (docs/NN_MODEL_PORTS_PLAN.md §12.9, T2 on): every reference case whose
+# questions are all read by now (the others named and skipped). T2, multiple
+# choices mixed with untyped questions: each slot's raw distribution
+# (`D1.last_probs`) and the answers within 1e-4 (measured <= 3.4e-6), the same
+# choices; four mutants caught (a temperature on typed slots, none on untyped
+# ones, the `multiple` table skipped, `lm_head`'s 9-15 slot pass). Its `--w8a8`
+# leg: the same choices, within 0.1 (measured 0.08). ⚠ GPU: the Orin.
+tests/llm/test_d1_typed_answers_gpu.mojo
 
 # D1Service (noeira/llm/d1/service.mojo): d1 on its own thread behind the
 # voice loop's DecisionService (JevQuestions in, JevAnswers out), asked by a
