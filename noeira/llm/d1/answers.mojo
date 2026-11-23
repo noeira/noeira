@@ -5,6 +5,10 @@
 (`grid.Grid.read`, Python's `math.fsum`), transcribed
 (docs/NN_MODEL_PORTS_PLAN.md §12.9).
 
+- A read (`text`, `number`, `date`): its found through `found:<type>`; when
+  it is 0.5 or more, the text and span its slots point at (and the JSON path
+  of the string it lies in). A number's or a date's value needs d1's parser
+  (T6): null until then.
 - An estimate (`number` with a `range`): its one slot is a distribution over
   the grid's values; the answer is the median and the p10-p90 interval, each
   quantile read at the level the `estimate` table gives it
@@ -15,6 +19,7 @@ from noeira.io.json import JsonWriter
 
 from .prompt import D1Question, D1Grid
 from .calibration import D1Calibration
+from .pointer import D1Read
 
 
 def fsum(xs: List[Float64]) -> Float64:
@@ -125,4 +130,43 @@ def answer_estimate(mut w: JsonWriter, q: D1Question, slots: List[List[Float64]]
         w.string(q.unit)
     else:
         w.null()
+    w.end_object()
+
+
+def answer_read(mut w: JsonWriter, q: D1Question, rd: D1Read, cal: D1Calibration) raises:
+    """`api.answer` for a read: `{"type", <type>: value, "span", "found"[, "text"][, "path"][, "unit"]}`."""
+    var found = cal.through(String("found:") + q.read_type, rd.found)
+    var present = found >= 0.5
+    var has = present and rd.has_text
+    w.key(q.name)
+    w.begin_object()
+    w.member("type", q.read_type)
+    w.key(q.read_type)
+    if has and q.read_type == "text":
+        w.string(rd.text)
+    else:
+        w.null()  # a number's or a date's value: d1's parser (T6)
+    w.key("span")
+    if has:
+        w.begin_array()
+        w.integer(rd.start)
+        w.integer(rd.end)
+        w.end_array()
+    else:
+        w.null()
+    w.member("found", found)
+    if q.read_type != "text":
+        w.key("text")
+        if has:
+            w.string(rd.text)
+        else:
+            w.null()
+    if present and rd.has_path:
+        w.member("path", rd.path)
+    if q.read_type == "number":
+        w.key("unit")
+        if q.has_unit:
+            w.string(q.unit)
+        else:
+            w.null()
     w.end_object()

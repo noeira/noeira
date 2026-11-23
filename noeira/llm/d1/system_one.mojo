@@ -19,8 +19,11 @@ its confidence and every probability; `score` the MEDIAN level (d1's default
 `score_readout`), its confidence, probabilities and legend; a `multiple`
 choice each option's P(yes) through the `multiple` table and the options at
 0.5 or more; an estimate the median and p10-p90 of its grid distribution at
-the `estimate` table's levels (`answers.mojo`) (docs/NN_MODEL_PORTS_PLAN.md
-§12.9). Reads and boxes are laid out but refused until they are read (T4-T5).
+the `estimate` table's levels (`answers.mojo`); a `text` read the span its
+`start` and `end` slots point at in the state (`pointer.mojo`: the slots'
+hidden states against the state positions', on the host), its found through
+`found:text` (docs/NN_MODEL_PORTS_PLAN.md §12.9). `number` and `date` reads
+wait for d1's parser (T6) and boxes for T5: refused.
 
 Pictures (d1's `media`, LFM3-VL's tower: `noeira.llm.lfm3.vision`): their
 markup heads the user turn, before the state (`<|vision_start|>`, one
@@ -54,11 +57,13 @@ from noeira.llm.lfm3 import Lfm3Text, Lfm3Vision, Lfm3Audio, Picture
 from noeira.text.bpe import ByteLevelBPE
 from .prompt import (
     D1Question, D1Record, D1Row, D1Slot, Q_NOUL, Q_CHOICE, Q_SCORE, Q_MULTI, Q_READ, Q_ESTIMATE, Q_BOX, Q_BOXES,
-    SLOT_CODES, parse_questions,
+    SLOT_CODES, SLOT_START, SLOT_END, parse_questions,
     py_json_dumps, prefix_text, suffix_layout, pack_rows, question_slots, typed,
 )
 from .calibration import D1Calibration
-from .answers import answer_estimate
+from .answers import answer_estimate, answer_read
+from .positions import state_positions
+from .pointer import D1Read, position_logits, spans, read as read_span, SPAN_TEXT, SPAN_NUMBER
 
 
 struct D1(Movable):
@@ -73,6 +78,11 @@ struct D1(Movable):
     var set_size: Int
     var last_rows: List[D1Row]
     """The rows of the last call (the gate compares them with d1's)."""
+    var last_reads: List[D1Read]
+    """The last call's reads, per question (`D1Read.nothing` for the others): the gates compare them."""
+    var unparsed_reads: Bool
+    """Let a `number` or `date` read answer before d1's parser is ported (§12.9 T6): its text, span
+    and found, its value null. Off by default (such a read is refused); the gates set it."""
     var last_probs: List[List[List[Float64]]]
     """The last call's distributions, per question and per slot, as d1's `run` reads them before
     answering: an untyped question's tempered softmax, a typed slot's raw one (the gates compare them)."""
@@ -99,6 +109,8 @@ struct D1(Movable):
         self.set_size = self.record.set_size
         self.last_rows = List[D1Row]()
         self.last_probs = List[List[List[Float64]]]()
+        self.last_reads = List[D1Read]()
+        self.unparsed_reads = False
         self.trace = getenv("NOEIRA_D1_TRACE")
         self.traced = 0
 
@@ -151,9 +163,12 @@ struct D1(Movable):
         if len(qs) == 0:
             raise Error("d1: no questions")
         for ref q in qs:
-            if q.kind == Q_READ or q.kind == Q_BOX or q.kind == Q_BOXES:
-                raise Error("d1: '" + q.name + "': text, number, date, box and boxes answers are laid out but not "
-                            + "yet read (docs/NN_MODEL_PORTS_PLAN.md §12.9, T4-T5)")
+            if q.kind == Q_BOX or q.kind == Q_BOXES:
+                raise Error("d1: '" + q.name + "': box and boxes answers are laid out but not yet read "
+                            + "(docs/NN_MODEL_PORTS_PLAN.md §12.9, T5)")
+            if q.kind == Q_READ and q.read_type != "text" and not self.unparsed_reads:
+                raise Error("d1: '" + q.name + "': a " + q.read_type + " read is not yet read: its value needs "
+                            + "d1's parser (docs/NN_MODEL_PORTS_PLAN.md §12.9, T6)")
         var media = String("")
         var feats = Optional[DeviceBuffer[DT]](None)
         var image_token = -1
@@ -186,10 +201,14 @@ struct D1(Movable):
         var slots_of = List[List[D1Slot]]()
         var probs = List[List[List[Float64]]]()
         """Per question, per slot, the slot's distribution (`SlotReader._padded`)."""
+        var reads = List[D1Read]()
+        """Per question, what a read's slots point at (`D1Read.nothing` for the others)."""
         for ref q in qs:
             slots_of.append(question_slots(self.tok, q, self.record))
             probs.append(List[List[Float64]]())
+            reads.append(D1Read.nothing(0.0))
         var t1 = perf_counter_ns()
+        var t_ptr = 0
         var read = 0
         var v = self.lm.cfg.vocab
         for row in rows:
@@ -200,11 +219,27 @@ struct D1(Movable):
                 audio_feats=afeats.copy(), audio_token=audio_token,
             )
             var logz = self.lm.slot_logz(h, len(row.ids), row.slots)
+            var starts = List[Int]()  # per question of the request: its read's start / end slot, -1 for none
+            var ends = List[Int]()
+            for _ in range(len(qs)):
+                starts.append(-1)
+                ends.append(-1)
+            var seen = List[Int]()  # slots met so far, per question
+            for _ in range(len(qs)):
+                seen.append(0)
+            var last_pos = -1
             for s in range(len(row.slots)):
                 var qi = row.slot_q[s]
-                ref slot = slots_of[qi][len(probs[qi])]
-                if slot.kind != SLOT_CODES:
-                    raise Error("d1: a pointer slot is not read yet (§12.9 T4)")
+                ref slot = slots_of[qi][seen[qi]]
+                seen[qi] += 1
+                if slot.kind == SLOT_START:
+                    starts[qi] = row.slots[s]
+                    last_pos = max(last_pos, row.slots[s])
+                    continue
+                if slot.kind == SLOT_END:
+                    ends[qi] = row.slots[s]
+                    last_pos = max(last_pos, row.slots[s])
+                    continue
                 # a typed answer's slot is read raw: its own table calibrates it (`SlotReader._readout`)
                 var t = 1.0 if typed(qs[qi]) else self.temperature
                 var scores = List[Float64]()
@@ -214,10 +249,25 @@ struct D1(Movable):
                         best = max(best, Float64(logz[s * v + id]))
                     scores.append(best / t)
                 probs[qi].append(_softmax(scores))
+            if last_pos >= 0:  # the row's reads: the pointer over its state positions (`pointer.py`)
+                var tp = perf_counter_ns()
+                var full = prefix + suffixes[row.first]
+                var enc = self.tok.encode_offsets(full)
+                var sp = state_positions(self.tok, block, state_is_json, prefix, full, enc[1], enc[2])
+                var dm = self.lm.cfg.hidden
+                var hh = self.lm.download(h, (max(last_pos, sp.pointer_width() - 1) + 1) * dm)
+                for qi in range(len(qs)):
+                    if starts[qi] < 0:
+                        continue
+                    var cap = SPAN_TEXT if qs[qi].read_type == "text" else SPAN_NUMBER
+                    var sp_found = spans(position_logits(hh, dm, starts[qi], sp), position_logits(hh, dm, ends[qi], sp), cap)
+                    reads[qi] = read_span(sp, sp_found[0], sp_found[1], cap, sp_found[2])
+                t_ptr += Int(perf_counter_ns() - tp)
         var t2 = perf_counter_ns()
         var nrows = len(rows)
         self.last_rows = rows^
         self.last_probs = probs.copy()
+        self.last_reads = reads.copy()
         var w = JsonWriter()
         w.begin_object()
         w.key("answers")
@@ -227,6 +277,8 @@ struct D1(Movable):
                 _answer_multiple(w, qs[i], probs[i], self.calibration)
             elif qs[i].kind == Q_ESTIMATE:
                 answer_estimate(w, qs[i], probs[i], self.calibration)
+            elif qs[i].kind == Q_READ:
+                answer_read(w, qs[i], reads[i], self.calibration)
             else:
                 _answer(w, qs[i], probs[i][0])
         w.end_object()
@@ -239,7 +291,8 @@ struct D1(Movable):
         var out = w.done()
         if self.trace != "":
             print("  [d1 trace] request", self.traced - 1, ":", read, "tokens in", nrows, "row(s): CPU",
-                  Int((t1 - t0) // 1_000_000), "ms, forwards + read-out", Int((t2 - t1) // 1_000_000), "ms, answer",
+                  Int((t1 - t0) // 1_000_000), "ms, forwards + read-out", Int((t2 - t1) // 1_000_000), "ms (reads' pointer",
+                  t_ptr // 1_000_000, "ms), answer",
                   Int((perf_counter_ns() - t2) // 1_000_000), "ms")
         return out^
 

@@ -29,6 +29,17 @@ not applied; the grid's values themselves are gated bit for bit on the host
 nothing here (it only matters where a cumulative share sits exactly on a
 level): not gated.
 
+T4 reads `text`, `number` and `date` spans: each read's two slots against the
+row's state positions (`pointer.mojo`); its raw found within the bound, its
+text, span and JSON path EXACTLY d1's, and the answer's (found through
+`found:<type>`). A number's or a date's VALUE is d1's parser's (T6): the gate
+sets `D1.unparsed_reads` and leaves those values out, and says how many.
+Mutants caught: the pointer without 1/sqrt(D), found read off position 1
+instead of the BOS, invalid positions scored, whitespace kept at a span's
+edge, a span not clipped to its JSON string (`label`: its first token " \"("
+starts on the quote). Not gated: the span caps (512 / 32 tokens; no reference
+read comes near 32).
+
 `--w8a8`: `D1.load(w8a8=True)`: the same picks, probabilities within W8A8_BOUND,
 estimates within W8A8_GRID_SHARE of their range.
 """
@@ -39,7 +50,7 @@ from std.time import perf_counter_ns
 from max.gpu.host import DeviceContext
 
 from noeira.io.json import load_json, parse_json, JsonDoc, J_NUMBER, J_ARRAY, J_OBJECT, J_NULL
-from noeira.llm.d1 import D1, parse_questions, Q_MULTI, Q_ESTIMATE
+from noeira.llm.d1 import D1, parse_questions, Q_MULTI, Q_ESTIMATE, Q_READ
 from noeira.llm.d1.prompt import py_json_dumps
 from noeira.llm.lfm3.model import LF_BF16
 
@@ -91,10 +102,14 @@ def main() raises:
     var cases = doc.field(doc.root(), "cases")
     var t0 = perf_counter_ns()
     var d1 = D1.load(DeviceContext(), model_dir, w8a8=w8a8)
+    d1.unparsed_reads = True  # number / date reads: their spans now, their values with the parser (T6)
     print("  d1 loaded in", (perf_counter_ns() - t0) // 1_000_000, "ms")
     var asked = 0
     var multi_asked = 0
     var estimates_asked = 0
+    var reads_asked = 0
+    var reads_found = 0
+    var values_waiting = 0
     for ci in range(doc.size(cases)):
         var name = doc.key_at(cases, ci)
         var c = doc.at(cases, ci)
@@ -137,7 +152,24 @@ def main() raises:
                 estimates_asked += 1
             var before = worst_raw
             worst_raw = 0.0
-            if qs[qi].kind == Q_MULTI:
+            if qs[qi].kind == Q_READ:
+                reads_asked += 1
+                ref rd = d1.last_reads[qi]
+                var wt = doc.field(r, "text")
+                var ws = doc.field(r, "span")
+                var wpth = doc.field(r, "path")
+                worst_raw = max(worst_raw, abs(rd.found - doc.number(doc.field(r, "found"))))
+                var ok = (doc.kind_of(wt) == J_NULL) == (not rd.has_text)
+                if ok and rd.has_text:
+                    reads_found += 1
+                    ok = (rd.text == doc.string(wt) and rd.start == doc.integer(doc.at(ws, 0))
+                          and rd.end == doc.integer(doc.at(ws, 1)))
+                ok = ok and ((wpth >= 0) == rd.has_path) and (wpth < 0 or doc.string(wpth) == rd.path)
+                if not ok:
+                    shape_ok = False
+                    print("    ", name, "/", qs[qi].name, ": read", repr(rd.text), rd.start, rd.end, rd.path,
+                          "vs d1", repr(doc.string(wt)) if doc.kind_of(wt) != J_NULL else String("None"))
+            elif qs[qi].kind == Q_MULTI:
                 multi_asked += 1
                 shape_ok = shape_ok and len(mine) == doc.size(r)
                 for k in range(min(len(mine), doc.size(r))):
@@ -173,6 +205,27 @@ def main() raises:
             var kind = doc.string(doc.field(w, "type"))
             if kind == "noul":
                 worst = max(worst, abs(got.number(got.field(g, "noul")) - doc.number(doc.field(w, "noul"))))
+                continue
+            if (kind == "text" or kind == "number" or kind == "date") and doc.field(w, "found") >= 0:  # a read
+                worst = max(worst, abs(got.number(got.field(g, "found")) - doc.number(doc.field(w, "found"))))
+                var tkey = String("text")
+                var tw = doc.field(w, tkey)
+                var tg = got.field(g, tkey)
+                var sw = doc.field(w, "span")
+                var sg = got.field(g, "span")
+                var pw = doc.field(w, "path")
+                var pg = got.field(g, "path")
+                var ok = (doc.kind_of(tw) == J_NULL) == (got.kind_of(tg) == J_NULL)
+                if ok and doc.kind_of(tw) != J_NULL:
+                    ok = (doc.string(tw) == got.string(tg) and got.kind_of(sg) != J_NULL
+                          and doc.integer(doc.at(sw, 0)) == got.integer(got.at(sg, 0))
+                          and doc.integer(doc.at(sw, 1)) == got.integer(got.at(sg, 1)))
+                ok = ok and ((pw >= 0) == (pg >= 0)) and (pw < 0 or doc.string(pw) == got.string(pg))
+                if kind != "text":
+                    values_waiting += 1  # its value (and a number's written unit): d1's parser, T6
+                if not ok:
+                    same = False
+                    print("    ", name, "/", qn, ": answer's read differs")
                 continue
             if kind == "number" and doc.field(w, "interval") >= 0:  # an estimate: values read off the grid
                 var wi = doc.field(w, "interval")
@@ -226,9 +279,10 @@ def main() raises:
               name + ": " + String(doc.size(wa)) + " answers, same picks, worst probability |d| = " + String(worst)
               + ", " + String(gu) + " tokens (" + String(ms) + " ms)"
               + (", estimates off by " + String(worst_share) + " of their range" if worst_share > 0.0 else ""))
-    check(fails, asked >= 3 and multi_asked >= 4 and estimates_asked >= 5,
-          String(asked) + " cases asked, " + String(multi_asked) + " multiple choices and " + String(estimates_asked)
-          + " estimates among them")
+    check(fails, asked >= 6 and multi_asked >= 5 and estimates_asked >= 6 and reads_asked >= 15 and reads_found >= 8,
+          String(asked) + " cases asked: " + String(multi_asked) + " multiple choices, " + String(estimates_asked)
+          + " estimates, " + String(reads_asked) + " reads (" + String(reads_found) + " found something; "
+          + String(values_waiting) + " number / date values wait for T6)")
     if fails > 0:
         raise Error(String(fails) + " FAILED")
     print("ALL PASS")

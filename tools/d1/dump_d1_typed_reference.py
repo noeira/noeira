@@ -69,6 +69,9 @@ TRICKY = {
     "list": ["first item", 42, True, None, {"nested": "deep value", "n": 3.5}],
     "empty": "",
     "a/b~c": "a key with a slash and a tilde",
+    "price": "1 481,40 €",
+    "warning": "The crate is heavy.",
+    "label": "(fragile)",
 }
 
 MULTI = {"type": "choice", "multiple": True, "instructions": "Which objects does the person mention?",
@@ -108,6 +111,9 @@ def cases(images):
             "robots": {"type": "number", "instructions": "How many robots did Émile see?"},
             "deep": {"type": "text", "instructions": "What is the nested value?"},
             "time": {"type": "text", "instructions": "At what time?"},
+            "price": {"type": "number", "instructions": "What is the price?"},
+            "warning": {"type": "text", "instructions": "What does the warning say?"},
+            "label": {"type": "text", "instructions": "What is written on the label, brackets included?"},
         }),
         "reads_room": (ROOM, [], {
             "object": {"type": "text", "instructions": "Which object should the robot pick up?"},
