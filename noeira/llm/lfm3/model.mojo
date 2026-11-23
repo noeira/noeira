@@ -101,7 +101,7 @@ from noeira.io.json import load_json
 from noeira.io.safetensors import SafeTensors, ST_BF16
 from .kernels import (
     TPB, bf16_to_f32_kernel, embed_kernel, rms_kernel, add_kernel, short_conv_kernel, rope_kernel,
-    scores_kernel, softmax_rows_kernel, attn_out_kernel, swiglu_kernel, gather_rows_kernel,
+    scores_kernel, softmax_rows_kernel, attn_out_kernel, swiglu_kernel, gather_rows_kernel, gather_cols_kernel,
     lm_head_kernel, log_softmax_rows_kernel, f32_to_bf16_kernel, split_heads_kernel, masked_softmax_kernel,
     merge_heads_gate_kernel, LM_SLOTS, rms_bf16_kernel, swiglu_bf16_kernel,
 )
@@ -1172,6 +1172,35 @@ struct Lfm3Text(Movable):
         self.lm_head(rows, logits, s)
         self.ctx.enqueue_function[log_softmax_rows_kernel](logits, Int64(v), grid_dim=s, block_dim=TPB)
         return self.download(logits, s * v)
+
+    def slot_logz_cols(mut self, h: DeviceBuffer[DT], t: Int, slots: List[Int], cols: List[Int]) raises -> List[Float32]:
+        """`slot_logz`'s `[S, vocab]` log-probabilities at the vocabulary
+        columns `cols` only: `[S, len(cols)]` on the host (a box's 80 slots
+        need ~1,000 columns of 125,031)."""
+        var s = len(slots)
+        var dm = self.cfg.hidden
+        var v = self.cfg.vocab
+        var nc = len(cols)
+        if nc == 0 or s == 0:  # no code slot (a row of reads only): no pass over the table at all
+            return List[Float32]()
+        var hs = self.ctx.enqueue_create_host_buffer[DType.int32](s)
+        for i in range(s):
+            hs[i] = Int32(slots[i])
+        var ds = self.ctx.enqueue_create_buffer[DType.int32](s)
+        self.ctx.enqueue_copy(ds, hs)
+        var rows = self.slot_rows(s)
+        self.ctx.enqueue_function[gather_rows_kernel](h, ds, rows, Int64(dm), grid_dim=(_blocks(dm), s), block_dim=TPB)
+        var logits = self.new(s * v)
+        self.lm_head(rows, logits, s)
+        self.ctx.enqueue_function[log_softmax_rows_kernel](logits, Int64(v), grid_dim=s, block_dim=TPB)
+        var hc = self.ctx.enqueue_create_host_buffer[DType.int32](nc)
+        for i in range(nc):
+            hc[i] = Int32(cols[i])
+        var dc = self.ctx.enqueue_create_buffer[DType.int32](nc)
+        self.ctx.enqueue_copy(dc, hc)
+        var picked = self.new(s * nc)
+        self.ctx.enqueue_function[gather_cols_kernel](logits, dc, picked, Int64(v), Int64(nc), grid_dim=(_blocks(nc), s), block_dim=TPB)
+        return self.download(picked, s * nc)
 
     def slot_rows(self, s: Int) raises -> DeviceBuffer[DT]:
         """A zeroed `[S, hidden]` buffer padded to a multiple of LM_SLOTS rows:

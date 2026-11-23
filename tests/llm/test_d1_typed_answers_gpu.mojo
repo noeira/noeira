@@ -40,6 +40,17 @@ edge, a span not clipped to its JSON string (`label`: its first token " \"("
 starts on the quote). Not gated: the span caps (512 / 32 tokens; no reference
 read comes near 32).
 
+T5 reads `box` and `boxes` over a picture (the reference's own pixels,
+`<case>_image0.npy`): each slot raw within the bound (presence, and every
+edge's 1,000-value distribution), every drawn box's edges EXACTLY d1's, found
+and presence within the bound, confidence within CONF_BOUND, the count and
+`at_least` equal. The case holds a box, boxes of 16 / 4 / 1 blocks drawing
+none or one, and two drawing several ("Every picture on the wall." 3, "Every
+book." 6 of max 6, so `at_least`). Mutants caught: no reading-order sort,
+presence not kept non-increasing, the `found:box` and `box` tables skipped,
+the Halton draws in one base. Not gated: the areas' products fused into the
+IoU's sum (it moves an IoU's last bit, which matters only at exactly 0.5).
+
 `--w8a8`: `D1.load(w8a8=True)`: the same picks, probabilities within W8A8_BOUND,
 estimates within W8A8_GRID_SHARE of their range.
 """
@@ -52,11 +63,29 @@ from max.gpu.host import DeviceContext
 from noeira.io.json import load_json, parse_json, JsonDoc, J_NUMBER, J_ARRAY, J_OBJECT, J_NULL
 from noeira.llm.d1 import D1, parse_questions, Q_MULTI, Q_ESTIMATE, Q_READ
 from noeira.llm.d1.prompt import py_json_dumps
+from noeira.llm.lfm3 import Picture
+from noeira.io.npy import load_npy_f64, npy_header_of
 from noeira.llm.lfm3.model import LF_BF16
 
 
 comptime PROB_BOUND: Float64 = 3e-3 if LF_BF16 else 1e-4
+comptime CONF_BOUND: Float64 = 0.02
+"""A box's confidence counts 512 Halton draws through its edges' CDFs: one
+draw crossing IoU 0.5 under fp32 noise moves it by 1/512 before the `box`
+table (slopes up to ~1.3). Measured in the result line."""
+
 comptime W8A8_BOUND: Float64 = 0.1
+comptime W8A8_CONF: Float64 = 0.2
+"""`--w8a8`: a box's confidence within this of d1's fp32 one. Measured 0.096
+(the books, 2026-11-23): W8A8 moves the edge CDFs the 512 draws go through."""
+comptime W8A8_EDGE: Float64 = 0.05
+"""`--w8a8`: a drawn box's largest edge difference with d1's fp32 box, at
+most, as a share of the picture (fp32: the same edges exactly). Edges, not
+IoU: a sliver box (one book drawn 0.242-0.249 tall) shares nothing with its
+W8A8 self (0.275-0.276) after a 0.03 shift. A `boxes` answer is matched as a
+set — each of d1's boxes against our nearest — since neighbours can swap
+reading order. Measured 0.033 (that book; the others <= 0.006), the Orin
+2026-11-23; in the result line."""
 comptime W8A8_GRID_SHARE: Float64 = 0.2
 """`--w8a8`: an estimate's median and interval within this share of its range
 of d1's fp32 values (the fp32 build: exactly). Measured 0.13, 0.10 and 0.06 on
@@ -82,6 +111,48 @@ def _bytes(s: String) -> List[UInt8]:
     return b^
 
 
+def _f5(x: Float64) -> String:
+    var t = String(x)
+    return String(t[byte=0:min(5, t.byte_length())])
+
+
+def rect_iou(ref a: JsonDoc, na: Int, ref b: JsonDoc, nb: Int) raises -> Float64:
+    var at = a.number(a.field(na, "top"))
+    var ab = a.number(a.field(na, "bottom"))
+    var al = a.number(a.field(na, "left"))
+    var ar = a.number(a.field(na, "right"))
+    var bt = b.number(b.field(nb, "top"))
+    var bb = b.number(b.field(nb, "bottom"))
+    var bl = b.number(b.field(nb, "left"))
+    var br = b.number(b.field(nb, "right"))
+    var ov = max(0.0, min(ab, bb) - max(at, bt)) * max(0.0, min(ar, br) - max(al, bl))
+    return ov / ((ab - at) * (ar - al) + (bb - bt) * (br - bl) - ov)
+
+
+def edge_gap(ref a: JsonDoc, na: Int, ref b: JsonDoc, nb: Int) raises -> Float64:
+    var keys: List[String] = ["top", "bottom", "left", "right"]
+    var g = 0.0
+    for k in keys:
+        g = max(g, abs(a.number(a.field(na, k)) - b.number(b.field(nb, k))))
+    return g
+
+
+def same_rect(ref a: JsonDoc, na: Int, ref b: JsonDoc, nb: Int, w8a8: Bool, mut worst_edge: Float64) raises -> Bool:
+    """Both null, or the same four edges exactly (a median bin, or a crossed
+    pair's middle); under `--w8a8` edges within W8A8_EDGE."""
+    if a.kind_of(na) == J_NULL or b.kind_of(nb) == J_NULL:
+        return a.kind_of(na) == J_NULL and b.kind_of(nb) == J_NULL
+    var gap = edge_gap(a, na, b, nb)
+    worst_edge = max(worst_edge, gap)
+    if w8a8:
+        return gap <= W8A8_EDGE
+    var keys: List[String] = ["top", "bottom", "left", "right"]
+    for k in keys:
+        if a.number(a.field(na, k)) != b.number(b.field(nb, k)):
+            return False
+    return True
+
+
 def main() raises:
     var args = argv()
     var w8a8 = False
@@ -101,7 +172,7 @@ def main() raises:
     var doc = load_json(ref_dir + "/cases.json")
     var cases = doc.field(doc.root(), "cases")
     var t0 = perf_counter_ns()
-    var d1 = D1.load(DeviceContext(), model_dir, w8a8=w8a8)
+    var d1 = D1.load(DeviceContext(), model_dir, vision=True, w8a8=w8a8)
     d1.unparsed_reads = True  # number / date reads: their spans now, their values with the parser (T6)
     print("  d1 loaded in", (perf_counter_ns() - t0) // 1_000_000, "ms")
     var asked = 0
@@ -110,6 +181,8 @@ def main() raises:
     var reads_asked = 0
     var reads_found = 0
     var values_waiting = 0
+    var boxes_asked = 0
+    var boxes_drawn = 0
     for ci in range(doc.size(cases)):
         var name = doc.key_at(cases, ci)
         var c = doc.at(cases, ci)
@@ -117,9 +190,15 @@ def main() raises:
         if fw < 0 or doc.kind_of(fw) == J_NULL:
             print("    (", name, ": no forward in the reference — skipped )")
             continue
-        if doc.integer(doc.field(c, "pictures")) > 0:
-            print("    (", name, ": pictures — T5 )")
-            continue
+        var pics = List[Picture]()
+        for k in range(doc.integer(doc.field(c, "pictures"))):
+            var path = ref_dir + "/" + name + "_image" + String(k) + ".npy"
+            var hd = npy_header_of(path)
+            var px = load_npy_f64(path)
+            var rgb = List[UInt8](capacity=len(px))
+            for v in px:
+                rgb.append(UInt8(Int(v)))
+            pics.append(Picture(rgb^, hd.rows, hd.cols // 3))
         var is_json = doc.boolean(doc.field(c, "state_is_json"))
         var snode = doc.field(c, "state")
         var state = py_json_dumps(doc, snode) if is_json else doc.string(snode)
@@ -130,7 +209,7 @@ def main() raises:
         var got_s = String("")
         var refused = String("")
         try:
-            got_s = d1.system_one(state, is_json, qjson)
+            got_s = d1.system_one(state, is_json, qjson, pics)
         except e:
             refused = String(e)
         if refused.byte_length() > 0:
@@ -174,6 +253,14 @@ def main() raises:
                 shape_ok = shape_ok and len(mine) == doc.size(r)
                 for k in range(min(len(mine), doc.size(r))):
                     worst_raw = max(worst_raw, abs(mine[k][0] - doc.number(doc.at(r, k))))
+            elif doc.kind_of(r) == J_ARRAY and doc.size(r) > 0 and doc.kind_of(doc.at(r, 0)) == J_ARRAY:
+                boxes_asked += 1  # a box / boxes: per slot, presence [yes, no] then each edge's distribution
+                shape_ok = shape_ok and len(mine) == doc.size(r)
+                for k in range(min(len(mine), doc.size(r))):
+                    var rk = doc.at(r, k)
+                    shape_ok = shape_ok and len(mine[k]) == doc.size(rk)
+                    for j in range(min(len(mine[k]), doc.size(rk))):
+                        worst_raw = max(worst_raw, abs(mine[k][j] - doc.number(doc.at(rk, j))))
             elif doc.kind_of(r) == J_ARRAY and doc.size(r) > 0 and doc.kind_of(doc.at(r, 0)) == J_NUMBER:
                 shape_ok = shape_ok and len(mine) == 1 and len(mine[0]) == doc.size(r)
                 for k in range(min(len(mine[0]), doc.size(r))):
@@ -193,6 +280,8 @@ def main() raises:
         var ga = got.field(got.root(), "answers")
         var wa = doc.field(fw, "answers")
         var worst = 0.0
+        var worst_conf = 0.0
+        var worst_edge = 0.0
         var worst_share = 0.0
         var same = got.size(ga) == doc.size(wa)
         for i in range(doc.size(wa)):
@@ -205,6 +294,60 @@ def main() raises:
             var kind = doc.string(doc.field(w, "type"))
             if kind == "noul":
                 worst = max(worst, abs(got.number(got.field(g, "noul")) - doc.number(doc.field(w, "noul"))))
+                continue
+            if kind == "box":
+                worst = max(worst, abs(got.number(got.field(g, "found")) - doc.number(doc.field(w, "found"))))
+                worst_conf = max(worst_conf, abs(got.number(got.field(g, "confidence")) - doc.number(doc.field(w, "confidence"))))
+                var wb = doc.field(w, "box")
+                var gb = got.field(g, "box")
+                if (doc.kind_of(wb) == J_NULL) != (got.kind_of(gb) == J_NULL) or not same_rect(doc, wb, got, gb, w8a8, worst_edge):
+                    same = False
+                    print("    ", name, "/", qn, ": box differs")
+                elif doc.kind_of(wb) != J_NULL:
+                    boxes_drawn += 1
+                continue
+            if kind == "boxes":
+                var wl = doc.field(w, "boxes")
+                var gl = got.field(g, "boxes")
+                var wpr = doc.field(w, "presence")
+                var gpr = got.field(g, "presence")
+                var ok = (got.size(gl) == doc.size(wl) and got.integer(got.field(g, "count")) == doc.integer(doc.field(w, "count"))
+                          and got.boolean(got.field(g, "at_least")) == doc.boolean(doc.field(w, "at_least"))
+                          and got.size(gpr) == doc.size(wpr))
+                if ok:
+                    for k in range(doc.size(wpr)):
+                        worst = max(worst, abs(got.number(got.at(gpr, k)) - doc.number(doc.at(wpr, k))))
+                    for k in range(doc.size(wl)):
+                        var wk = doc.at(wl, k)
+                        var gk = got.at(gl, k)
+                        if w8a8:  # neighbours can swap reading order under W8A8: d1's box against our nearest
+                            var best = 2.0
+                            for j in range(got.size(gl)):
+                                var gap_j = edge_gap(doc, doc.field(wk, "box"), got, got.field(got.at(gl, j), "box"))
+                                if gap_j < best:
+                                    best = gap_j
+                                    gk = got.at(gl, j)
+                        worst = max(worst, abs(got.number(got.field(gk, "found")) - doc.number(doc.field(wk, "found"))))
+                        worst_conf = max(worst_conf, abs(got.number(got.field(gk, "confidence"))
+                                                         - doc.number(doc.field(wk, "confidence"))))
+                        ok = ok and same_rect(doc, doc.field(wk, "box"), got, got.field(gk, "box"), w8a8, worst_edge)
+                        boxes_drawn += 1
+                if not ok:
+                    same = False
+                    print("    ", name, "/", qn, ": boxes differ (", got.size(gl), "vs", doc.size(wl), ")")
+                    for k in range(max(got.size(gl), doc.size(wl))):
+                        var line = String("       ")
+                        for side in range(2):
+                            var ok_side = k < (doc.size(wl) if side == 0 else got.size(gl))
+                            if not ok_side:
+                                line += " -                              "
+                                continue
+                            var bx = doc.field(doc.at(wl, k), "box") if side == 0 else got.field(got.at(gl, k), "box")
+                            ref dd = doc if side == 0 else got
+                            line += (String(" d1 " if side == 0 else "  mojo ") + _f5(dd.number(dd.field(bx, "top"))) + " "
+                                     + _f5(dd.number(dd.field(bx, "bottom"))) + " " + _f5(dd.number(dd.field(bx, "left")))
+                                     + " " + _f5(dd.number(dd.field(bx, "right"))))
+                        print(line)
                 continue
             if (kind == "text" or kind == "number" or kind == "date") and doc.field(w, "found") >= 0:  # a read
                 worst = max(worst, abs(got.number(got.field(g, "found")) - doc.number(doc.field(w, "found"))))
@@ -275,14 +418,18 @@ def main() raises:
         var wu = doc.integer(doc.field(doc.field(fw, "usage"), "input_tokens"))
         var gu = got.integer(got.field(got.field(got.root(), "usage"), "input_tokens"))
         check(fails, shape_ok and worst_raw < bound, name + ": raw slot distributions, worst |d| = " + String(worst_raw))
-        check(fails, same and worst < bound and wu == gu,
+        check(fails, same and worst < bound and worst_conf < (W8A8_CONF if w8a8 else CONF_BOUND) and wu == gu,
               name + ": " + String(doc.size(wa)) + " answers, same picks, worst probability |d| = " + String(worst)
               + ", " + String(gu) + " tokens (" + String(ms) + " ms)"
-              + (", estimates off by " + String(worst_share) + " of their range" if worst_share > 0.0 else ""))
-    check(fails, asked >= 6 and multi_asked >= 5 and estimates_asked >= 6 and reads_asked >= 15 and reads_found >= 8,
+              + (", estimates off by " + String(worst_share) + " of their range" if worst_share > 0.0 else "")
+              + (", box confidence |d| = " + String(worst_conf) if worst_conf > 0.0 else "")
+              + (", box edges off by " + String(worst_edge) if worst_edge > 0.0 else ""))
+    check(fails, asked >= 8 and multi_asked >= 5 and estimates_asked >= 6 and reads_asked >= 15 and reads_found >= 8
+          and boxes_asked >= 4,
           String(asked) + " cases asked: " + String(multi_asked) + " multiple choices, " + String(estimates_asked)
           + " estimates, " + String(reads_asked) + " reads (" + String(reads_found) + " found something; "
-          + String(values_waiting) + " number / date values wait for T6)")
+          + String(values_waiting) + " number / date values wait for T6), " + String(boxes_asked) + " box questions ("
+          + String(boxes_drawn) + " boxes drawn)")
     if fails > 0:
         raise Error(String(fails) + " FAILED")
     print("ALL PASS")

@@ -9,6 +9,16 @@
   it is 0.5 or more, the text and span its slots point at (and the JSON path
   of the string it lies in). A number's or a date's value needs d1's parser
   (T6): null until then.
+- A box: presence then four edges, each edge a distribution over the
+  thousandths 0-0.999 (or 128 codes over 0-1); `found` through `found:box`,
+  the edges at their medians (or, `d1_box_edges: interp`, where the CDF
+  crosses one half), crossed edges as one bin about their middle; the
+  confidence is the share of 512 Halton draws through the edge CDFs whose box
+  has IoU >= 0.5 with it, through `box`. `boxes`: blocks of the same, block k
+  present with P(count >= k) through `found:boxes` kept non-increasing, the
+  present ones in reading order (left edge, then top). Every product that
+  feeds an addition is rounded on its own (`mul_unfused`): LLVM would fuse it
+  where Python rounds twice.
 - An estimate (`number` with a `range`): its one slot is a distribution over
   the grid's values; the answer is the median and the p10-p90 interval, each
   quantile read at the level the `estimate` table gives it
@@ -17,7 +27,7 @@
 
 from noeira.io.json import JsonWriter
 
-from .prompt import D1Question, D1Grid
+from .prompt import D1Question, D1Grid, mul_unfused
 from .calibration import D1Calibration
 from .pointer import D1Read
 
@@ -169,4 +179,236 @@ def answer_read(mut w: JsonWriter, q: D1Question, rd: D1Read, cal: D1Calibration
             w.string(q.unit)
         else:
             w.null()
+    w.end_object()
+
+
+# ── boxes (`box.py`) ─────────────────────────────────────────────────────
+
+comptime DRAWS: Int = 512
+
+
+def _halton() -> List[List[Float64]]:
+    """`box.samples`: DRAWS points of the Halton sequence in bases 2, 3, 5, 7."""
+    var out = List[List[Float64]](capacity=DRAWS)
+    var bases: List[Int] = [2, 3, 5, 7]
+    for i in range(1, DRAWS + 1):
+        var pt = List[Float64]()
+        for b in bases:
+            var n = i
+            var value = 0.0
+            var scale = 1.0
+            while n > 0:
+                var digit = n % b
+                n = n // b
+                scale /= Float64(b)
+                value = value + mul_unfused(Float64(digit), scale)
+            pt.append(value)
+        out.append(pt^)
+    return out^
+
+
+def edge_grid_of(row: List[Float64]) -> D1Grid:
+    """`box.read_as`: the thousandths for 1,000 values, else the 128 codes over 0-1."""
+    if len(row) == 1000:
+        return D1Grid(0.0, 0.999, 1000)
+    return D1Grid(0.0, 1.0, 128)
+
+
+@fieldwise_init
+struct Rect(Copyable, Movable):
+    var top: Float64
+    var bottom: Float64
+    var left: Float64
+    var right: Float64
+
+
+def _ordered(a: Float64, b: Float64, g: D1Grid) -> Tuple[Float64, Float64]:
+    """`box.ordered`: crossed edges become one bin about their middle."""
+    if a < b:
+        return (a, b)
+    var half = g.step() / 2.0
+    var middle = min(1.0 - half, max(half, (a + b) / 2.0))
+    return (middle - half, middle + half)
+
+
+def rectangle(e: List[Float64], g: D1Grid) -> Rect:
+    var tb = _ordered(e[0], e[1], g)
+    var lr = _ordered(e[2], e[3], g)
+    return Rect(tb[0], tb[1], lr[0], lr[1])
+
+
+def _area(r: Rect) -> Float64:
+    return mul_unfused(r.bottom - r.top, r.right - r.left)
+
+
+def iou(a: Rect, b: Rect) -> Float64:
+    var overlap = mul_unfused(max(0.0, min(a.bottom, b.bottom) - max(a.top, b.top)),
+                              max(0.0, min(a.right, b.right) - max(a.left, b.left)))
+    return overlap / (_area(a) + _area(b) - overlap)
+
+
+def _median(row: List[Float64], g: D1Grid) -> Float64:
+    """`Grid.read(row)["median"]`: the first value whose cumulative share reaches one half."""
+    var total = fsum(row)
+    var values = g.values()
+    var mass = 0.0
+    for i in range(len(row)):
+        mass += row[i] / total
+        if mass >= 0.5:
+            return values[i]
+    return values[len(values) - 1]
+
+
+def _crossing(row: List[Float64], g: D1Grid) -> Float64:
+    """`box.crossing`: where the CDF crosses one half, each bin's mass spread evenly over it."""
+    var total = fsum(row)
+    var values = g.values()
+    var st = g.step()
+    var mass = 0.0
+    for i in range(len(row)):
+        var share = row[i] / total
+        if share > 0.0 and mass + share >= 0.5:
+            var x = values[i] - st / 2.0 + mul_unfused((0.5 - mass) / share, st)
+            return min(g.high, max(g.low, x))
+        mass += share
+    return g.high
+
+
+def medians(edges: List[List[Float64]], edge_read: String) raises -> Rect:
+    """`box.medians`: the box at the four edge distributions' medians."""
+    var g = edge_grid_of(edges[0])
+    var e = List[Float64]()
+    for k in range(4):
+        if edge_read == "interp":
+            e.append(_crossing(edges[k], g))
+        elif edge_read == "median":
+            e.append(_median(edges[k], g))
+        else:
+            raise Error("d1: box edges read as median or interp, not " + edge_read)
+    return rectangle(e, g)
+
+
+def confidence(edges: List[List[Float64]], box: Rect, draws: List[List[Float64]]) -> Float64:
+    """`box.confidence`: the share of boxes drawn through the edges' CDFs with IoU >= 0.5 against `box`."""
+    var g = edge_grid_of(edges[0])
+    var values = g.values()
+    var cdfs = List[List[Float64]]()
+    for k in range(4):
+        var total = fsum(edges[k])
+        var c = List[Float64](capacity=len(edges[k]))
+        var acc = 0.0
+        for p in edges[k]:
+            acc += p / total
+            c.append(acc)
+        cdfs.append(c^)
+    var hits = 0
+    for ref pt in draws:
+        var e = List[Float64]()
+        for k in range(4):
+            ref c = cdfs[k]
+            var lo = 0
+            var hi = len(c)
+            while lo < hi:  # bisect_left
+                var mid = (lo + hi) // 2
+                if c[mid] < pt[k]:
+                    lo = mid + 1
+                else:
+                    hi = mid
+            e.append(values[min(g.size - 1, lo)])
+        if iou(rectangle(e, g), box) >= 0.5:
+            hits += 1
+    return Float64(hits) / Float64(DRAWS)
+
+
+def _write_rect(mut w: JsonWriter, r: Rect) raises:
+    w.begin_object()
+    w.member("top", r.top)
+    w.member("bottom", r.bottom)
+    w.member("left", r.left)
+    w.member("right", r.right)
+    w.end_object()
+
+
+def answer_box(mut w: JsonWriter, q: D1Question, slots: List[List[Float64]], cal: D1Calibration, edge_read: String) raises:
+    """`box.answer`: `{"type": "box", "box": {top, bottom, left, right} | null, "found", "confidence"}`."""
+    var found = cal.through("found:box", slots[0][0])
+    w.key(q.name)
+    w.begin_object()
+    w.member("type", String("box"))
+    if found < 0.5:
+        w.key("box")
+        w.null()
+        w.member("found", found)
+        w.member("confidence", 0.0)
+        w.end_object()
+        return
+    var edges = List[List[Float64]]()
+    for k in range(1, 5):
+        edges.append(slots[k].copy())
+    var box = medians(edges, edge_read)
+    w.key("box")
+    _write_rect(w, box)
+    w.member("found", found)
+    w.member("confidence", cal.through("box", confidence(edges, box, _halton())))
+    w.end_object()
+
+
+def answer_boxes(mut w: JsonWriter, q: D1Question, slots: List[List[Float64]], cal: D1Calibration, edge_read: String) raises:
+    """`box.answer_many`: blocks of presence and four edges; presence k =
+    P(count >= k) through `found:boxes`, kept non-increasing; the present
+    blocks' boxes in reading order (left, then top), each with its found and
+    its confidence through `boxes`; `count`, `at_least` (every block read is
+    present) and `presence`."""
+    var presence = List[Float64]()
+    var below = 1.0
+    var k = 0
+    while k < len(slots):
+        below = min(below, cal.through("found:boxes", slots[k][0]))
+        presence.append(below)
+        k += 5
+    var boxes = List[Rect]()
+    var founds = List[Float64]()
+    var confs = List[Float64]()
+    var draws = _halton()
+    for b in range(len(presence)):
+        if presence[b] < 0.5:
+            break
+        var edges = List[List[Float64]]()
+        for j in range(1, 5):
+            edges.append(slots[5 * b + j].copy())
+        var box = medians(edges, edge_read)
+        confs.append(cal.through("boxes", confidence(edges, box, draws)))
+        founds.append(presence[b])
+        boxes.append(box^)
+    var order = List[Int]()  # a stable sort on (left, top)
+    for i in range(len(boxes)):
+        var j = len(order)
+        while j > 0:
+            ref p = boxes[order[j - 1]]
+            if p.left > boxes[i].left or (p.left == boxes[i].left and p.top > boxes[i].top):
+                j -= 1
+            else:
+                break
+        order.insert(j, i)
+    w.key(q.name)
+    w.begin_object()
+    w.member("type", String("boxes"))
+    w.key("boxes")
+    w.begin_array()
+    for i in order:
+        w.begin_object()
+        w.key("box")
+        _write_rect(w, boxes[i])
+        w.member("found", founds[i])
+        w.member("confidence", confs[i])
+        w.end_object()
+    w.end_array()
+    w.member("count", len(boxes))
+    w.key("at_least")
+    w.boolean(len(boxes) > 0 and len(boxes) == len(presence))
+    w.key("presence")
+    w.begin_array()
+    for p in presence:
+        w.number(p)
+    w.end_array()
     w.end_object()

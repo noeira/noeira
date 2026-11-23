@@ -22,8 +22,11 @@ choice each option's P(yes) through the `multiple` table and the options at
 the `estimate` table's levels (`answers.mojo`); a `text` read the span its
 `start` and `end` slots point at in the state (`pointer.mojo`: the slots'
 hidden states against the state positions', on the host), its found through
-`found:text` (docs/NN_MODEL_PORTS_PLAN.md §12.9). `number` and `date` reads
-wait for d1's parser (T6) and boxes for T5: refused.
+`found:text`; a `box` / `boxes` question (exactly one picture) its presence
+and edges (`answers.mojo`: medians, Halton confidence, the box tables)
+(docs/NN_MODEL_PORTS_PLAN.md §12.9). `number` and `date` reads wait for d1's
+parser (T6): refused. Only the vocabulary columns a row's slots read leave the
+device (`Lfm3Text.slot_logz_cols`).
 
 Pictures (d1's `media`, LFM3-VL's tower: `noeira.llm.lfm3.vision`): their
 markup heads the user turn, before the state (`<|vision_start|>`, one
@@ -61,7 +64,7 @@ from .prompt import (
     py_json_dumps, prefix_text, suffix_layout, pack_rows, question_slots, typed,
 )
 from .calibration import D1Calibration
-from .answers import answer_estimate, answer_read
+from .answers import answer_estimate, answer_read, answer_box, answer_boxes
 from .positions import state_positions
 from .pointer import D1Read, position_logits, spans, read as read_span, SPAN_TEXT, SPAN_NUMBER
 
@@ -163,9 +166,9 @@ struct D1(Movable):
         if len(qs) == 0:
             raise Error("d1: no questions")
         for ref q in qs:
-            if q.kind == Q_BOX or q.kind == Q_BOXES:
-                raise Error("d1: '" + q.name + "': box and boxes answers are laid out but not yet read "
-                            + "(docs/NN_MODEL_PORTS_PLAN.md §12.9, T5)")
+            if (q.kind == Q_BOX or q.kind == Q_BOXES) and len(pictures) != 1:
+                raise Error("d1: '" + q.name + "': a box or boxes question reads exactly one picture; this request has "
+                            + String(len(pictures)))
             if q.kind == Q_READ and q.read_type != "text" and not self.unparsed_reads:
                 raise Error("d1: '" + q.name + "': a " + q.read_type + " read is not yet read: its value needs "
                             + "d1's parser (docs/NN_MODEL_PORTS_PLAN.md §12.9, T6)")
@@ -210,7 +213,6 @@ struct D1(Movable):
         var t1 = perf_counter_ns()
         var t_ptr = 0
         var read = 0
-        var v = self.lm.cfg.vocab
         for row in rows:
             read += len(row.ids)
             var taps = List[DeviceBuffer[DT]]()
@@ -218,7 +220,25 @@ struct D1(Movable):
                 row.ids, row.groups, row.state_len, taps, image_feats=feats.copy(), image_token=image_token,
                 audio_feats=afeats.copy(), audio_token=audio_token,
             )
-            var logz = self.lm.slot_logz(h, len(row.ids), row.slots)
+            var slot_k = List[Int]()  # each slot's index within its question's slots
+            var seen_k = List[Int]()
+            for _ in range(len(qs)):
+                seen_k.append(0)
+            var cols = List[Int]()  # the vocabulary columns the row's code slots read, once each
+            var col_of = Dict[Int, Int]()
+            for s in range(len(row.slots)):
+                var qi = row.slot_q[s]
+                slot_k.append(seen_k[qi])
+                ref sl = slots_of[qi][seen_k[qi]]
+                seen_k[qi] += 1
+                if sl.kind == SLOT_CODES:
+                    for ref g in sl.groups:
+                        for id in g:
+                            if id not in col_of:
+                                col_of[id] = len(cols)
+                                cols.append(id)
+            var logz = self.lm.slot_logz_cols(h, len(row.ids), row.slots, cols)
+            var nc = len(cols)
             var starts = List[Int]()  # per question of the request: its read's start / end slot, -1 for none
             var ends = List[Int]()
             for _ in range(len(qs)):
@@ -246,7 +266,7 @@ struct D1(Movable):
                 for ref g in slot.groups:
                     var best = Float64(-1e300)
                     for id in g:
-                        best = max(best, Float64(logz[s * v + id]))
+                        best = max(best, Float64(logz[s * nc + col_of[id]]))
                     scores.append(best / t)
                 probs[qi].append(_softmax(scores))
             if last_pos >= 0:  # the row's reads: the pointer over its state positions (`pointer.py`)
@@ -279,6 +299,10 @@ struct D1(Movable):
                 answer_estimate(w, qs[i], probs[i], self.calibration)
             elif qs[i].kind == Q_READ:
                 answer_read(w, qs[i], reads[i], self.calibration)
+            elif qs[i].kind == Q_BOX:
+                answer_box(w, qs[i], probs[i], self.calibration, self.record.box_edges)
+            elif qs[i].kind == Q_BOXES:
+                answer_boxes(w, qs[i], probs[i], self.calibration, self.record.box_edges)
             else:
                 _answer(w, qs[i], probs[i][0])
         w.end_object()

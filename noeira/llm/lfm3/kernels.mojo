@@ -372,6 +372,16 @@ def gather_rows_kernel(x: Ptr, rows: IPtr, dst: Ptr, d_n: Int64):
         dst[unsafe_offset=s * dim + d] = x[unsafe_offset=Int(rows[unsafe_offset=s]) * dim + d]
 
 
+def gather_cols_kernel(x: Ptr, cols: IPtr, dst: Ptr, v_n: Int64, c_n: Int64):
+    """`dst[s, c] = x[s, cols[c]]` for `x` `[S, V]`: the vocabulary columns a
+    read-out needs, so only those leave the device. Grid `(ceil(C / TPB), S)`."""
+    var c = Int(block_idx.x) * TPB + Int(thread_idx.x)
+    var s = Int(block_idx.y)
+    var nc = Int(c_n)
+    if c < nc:
+        dst[unsafe_offset=s * nc + c] = x[unsafe_offset=s * Int(v_n) + Int(cols[unsafe_offset=c])]
+
+
 comptime LM_SLOTS: Int = 16
 """Most slots one pass over the vocabulary serves: the table (0.5 GB for d1)
 is read once per LM_SLOTS slots, not once per slot. A caller pads its rows to

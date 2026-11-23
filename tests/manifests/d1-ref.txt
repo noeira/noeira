@@ -100,7 +100,11 @@ tests/llm/test_d1_finetune_smoke_gpu.mojo
 # (measured 0.06-0.13). T4, 18 text / number / date reads over text and JSON
 # states (16 find something): raw found within 1e-4 (measured <= 3.6e-6),
 # text, span and JSON path exactly d1's — W8A8 too; number / date VALUES wait
-# for T6 (`D1.unparsed_reads`). Five pointer mutants caught. ⚠ GPU: the Orin.
+# for T6 (`D1.unparsed_reads`). Five pointer mutants caught. T5, a box and
+# five boxes questions over an NYU picture (the reference's own pixels), 12
+# boxes drawn: raw within 1e-4, every edge and confidence exactly d1's; W8A8
+# edges within 0.05 of the picture (measured 0.033, a sliver book; the rest
+# 0.001), confidence within 0.2 (0.096). Five box mutants caught. ⚠ GPU: the Orin.
 tests/llm/test_d1_typed_answers_gpu.mojo
 
 # D1Service (noeira/llm/d1/service.mojo): d1 on its own thread behind the

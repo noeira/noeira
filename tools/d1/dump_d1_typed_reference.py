@@ -28,7 +28,8 @@ Writes `<out>/cases.json`:
     grids         `grid.Grid(low, high, size).values` for ten grids, some where `low + (size - 1) * step`
                   is not `high` (the grid ends on `high` itself)
 
-and copies `calibration.json` and `config.json` beside it.
+and copies `calibration.json` and `config.json` beside it, and each picture
+case's pixels as `<case>_image<k>.npy` ([H, W, 3] uint8).
 
 `--forward` (fp32, a few minutes a case on the Orin's CPU): each case also gets
 `forward` = `raw`, each question's probabilities as d1's `run` returns them
@@ -44,6 +45,7 @@ import json
 import os
 import shutil
 
+import numpy as np
 import torch
 from PIL import Image
 from transformers import AutoModel
@@ -142,6 +144,8 @@ def cases(images):
             "chairs": {"type": "boxes", "instructions": "Every chair."},
             "lamps": {"type": "boxes", "instructions": "Every lamp.", "max": 4},
             "one": {"type": "boxes", "instructions": "Every window.", "max": 1},
+            "pictures": {"type": "boxes", "instructions": "Every picture on the wall."},
+            "books": {"type": "boxes", "instructions": "Every book.", "max": 6},
         }),
         "mixed_rows": (ROOM, [], {
             **{f"n{i:02d}": {"type": "noul", "instructions": text} for i, text in enumerate([
@@ -208,6 +212,8 @@ def main():
         if wanted and name not in wanted:
             continue
         qs = [eng.ask(q) for q in questions.values()]
+        for k, im in enumerate(media):  # the pixels the Mojo gate hands its tower: [H, W, 3] uint8
+            np.save(os.path.join(args.out, f"{name}_image{k}.npy"), np.asarray(im.convert("RGB"), dtype=np.uint8))
         media = media_list(media)
         prefix, _ = eng._prefix(state, media)
         suffixes, offsets, _ = eng._suffixes(qs)
