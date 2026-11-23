@@ -12,7 +12,9 @@ packing gate d1's reference rows (`tools/d1/dump_d1_reference.py`, copied to
    branch of the split regex, non-ASCII text, added tokens inside text, and d1's
    own prompt texts).
 2. Every id list -> EXACTLY `tokenizers`' decoded text.
-3. d1's packed rows rebuilt from its prompt texts — the first question with the
+3. Every reference string -> EXACTLY `tokenizers`' offsets (`encode_offsets`,
+   code points; a token that cuts a character covers all of it).
+4. d1's packed rows rebuilt from its prompt texts — the first question with the
    state, then "QUESTION:\\n" + each further one, 16 to a row — equal the rows
    d1 itself built, id for id.
 """
@@ -89,7 +91,32 @@ def main() raises:
           + String(n_ids) + " ids, " + String(ms) + " ms)")
     check(fails, dec_ok == n, String(dec_ok) + " / " + String(n) + " id lists decode to tokenizers' text exactly")
 
-    # 3. d1's packed rows
+    # 3. offsets
+    var off_ok = 0
+    var off_n = 0
+    for i in range(n):
+        var c = doc.at(cases, i)
+        var on = doc.field(c, "offsets")
+        if on < 0:
+            continue
+        off_n += 1
+        var got = tok.encode_offsets(doc.string(doc.field(c, "text")))
+        var same = doc.size(on) == len(got[0])
+        var bad = -1
+        if same:
+            for k in range(len(got[0])):
+                var o = doc.at(on, k)
+                if doc.integer(doc.at(o, 0)) != got[1][k] or doc.integer(doc.at(o, 1)) != got[2][k]:
+                    same = False
+                    bad = k
+                    break
+        if same:
+            off_ok += 1
+        else:
+            print("    offsets case", i, "token", bad)
+    check(fails, off_n == n and off_ok == n, String(off_ok) + " / " + String(n) + " strings give tokenizers' offsets exactly")
+
+    # 4. d1's packed rows
     var names: List[String] = ["room_en", "single_fr", "many_noul"]
     var rows_ok = 0
     var rows = 0

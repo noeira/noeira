@@ -48,9 +48,10 @@ from noeira.nn.constants import DT
 from noeira.llm.lfm3 import Lfm3Text, Lfm3Vision, Lfm3Audio, Picture
 from noeira.text.bpe import ByteLevelBPE
 from .prompt import (
-    D1Question, D1Row, Q_NOUL, Q_CHOICE, Q_SCORE, parse_questions, py_json_dumps, prefix_text, suffix_text,
-    pack_rows, readout_ids,
+    D1Question, D1Record, D1Row, Q_NOUL, Q_CHOICE, Q_SCORE, parse_questions, py_json_dumps, prefix_text,
+    suffix_layout, pack_rows, readout_ids,
 )
+from .calibration import D1Calibration
 
 
 struct D1(Movable):
@@ -58,6 +59,10 @@ struct D1(Movable):
     var tok: ByteLevelBPE
     var temperature: Float64
     """`calibration.json`'s default temperature (per-bucket ones are refused: d1-2B has none)."""
+    var calibration: D1Calibration
+    """`calibration.json`: the temperature and the typed answers' tables."""
+    var record: D1Record
+    """What the checkpoint's `config.json` records (`d1_codes`, `d1_numbers`, ...); d1-2B's by default."""
     var set_size: Int
     var last_rows: List[D1Row]
     """The rows of the last call (the gate compares them with d1's)."""
@@ -78,7 +83,10 @@ struct D1(Movable):
         self.lm = lm^
         self.tok = tok^
         self.temperature = temperature
-        self.set_size = 16
+        self.calibration = D1Calibration()
+        self.calibration.default = temperature
+        self.record = D1Record.d1_2b()
+        self.set_size = self.record.set_size
         self.last_rows = List[D1Row]()
         self.trace = getenv("NOEIRA_D1_TRACE")
         self.traced = 0
@@ -102,12 +110,12 @@ struct D1(Movable):
         var lm = Lfm3Text.load(ctx^, dir, int8=w8a8, int8_table=False, int8_operator_out=False)
         lm.w8a8 = w8a8
         var tok = ByteLevelBPE.load(dir + "/tokenizer.json")
-        var cal = load_json(dir + "/calibration.json")
-        var t = cal.number(cal.field(cal.root(), "default"))
-        var per = cal.field(cal.root(), "temperatures")
-        if per >= 0 and cal.size(per) > 0:
-            raise Error("d1: per-bucket temperatures are not implemented")
-        return D1(lm^, tok^, t, vis^, aud^)
+        var cal = D1Calibration.load(dir + "/calibration.json")
+        var d1 = D1(lm^, tok^, cal.default, vis^, aud^)
+        d1.calibration = cal^
+        d1.record = D1Record.load(dir + "/config.json")
+        d1.set_size = d1.record.set_size
+        return d1^
 
     def system_one(
         mut self, state: String, state_is_json: Bool, questions_json: String,
@@ -128,9 +136,13 @@ struct D1(Movable):
         else:
             block = state
         var qd = parse_json(_bytes(questions_json))
-        var qs = parse_questions(qd, qd.root())
+        var qs = parse_questions(qd, qd.root(), self.record)
         if len(qs) == 0:
             raise Error("d1: no questions")
+        for ref q in qs:
+            if q.kind != Q_NOUL and q.kind != Q_CHOICE and q.kind != Q_SCORE:
+                raise Error("d1: '" + q.name + "': typed answers (multiple, text, number, date, box, boxes) are "
+                            + "laid out but not yet read (docs/NN_MODEL_PORTS_PLAN.md §12.9, T2-T5)")
         var media = String("")
         var feats = Optional[DeviceBuffer[DT]](None)
         var image_token = -1
@@ -154,9 +166,12 @@ struct D1(Movable):
             audio_token = aud.cfg.audio_token
         var prefix = prefix_text(self.tok, block, media)
         var suffixes = List[String]()
+        var offsets = List[List[Int]]()
         for q in qs:
-            suffixes.append(suffix_text(self.tok, q))
-        var rows = pack_rows(self.tok, prefix, suffixes, self.set_size)
+            var lay = suffix_layout(self.tok, q, self.record)
+            suffixes.append(lay[0].copy())
+            offsets.append(lay[1].copy())
+        var rows = pack_rows(self.tok, prefix, suffixes, self.set_size, offsets)
         var t1 = perf_counter_ns()
         var probs = List[List[Float64]]()
         var read = 0
@@ -170,9 +185,9 @@ struct D1(Movable):
             )
             var logz = self.lm.slot_logz(h, len(row.ids), row.slots)
             for s in range(len(row.slots)):
-                ref q = qs[row.first + s]
+                ref q = qs[row.slot_q[s]]
                 var scores = List[Float64]()
-                for g in readout_ids(self.tok, q):
+                for g in readout_ids(self.tok, q, self.record):
                     var best = Float64(-1e300)
                     for id in g:
                         best = max(best, Float64(logz[s * v + id]))

@@ -10,8 +10,9 @@ The strings exercise every branch of LFM3's split regex (contractions in any cas
 an optional leading character before letters, 1-3 digit runs, punctuation with a
 leading space and trailing newlines, whitespace runs with and without newlines,
 at the end and in the middle), non-ASCII letters and numbers, combining marks,
-U+200B (which d1 inserts into special strings), emoji (4-byte UTF-8), added
-tokens inside text — and d1's own prompt texts from its reference dumps.
+U+200B (which d1 inserts into special strings), emoji (4-byte UTF-8, and cut
+between tokens), added tokens inside text — and d1's own prompt texts from its
+reference dumps. Each case also holds `tokenizers`' offsets (code points).
 """
 
 import argparse
@@ -49,6 +50,8 @@ STRESS = [
     " ",
     "",
     "\r\n\r\n",
+    " 🤖🤖 x🤖y 🏳️‍🌈 𝔘𝔫𝔦 ̀a 你好 世界 ﷽ 𓀀",
+    "Émile a vu 3 🤖 et 你好世界 — à 14 h 30.",
     "x y z　w",
 ]
 
@@ -70,8 +73,10 @@ def main():
         texts.extend("QUESTION:\n" + s for s in pr["suffixes"][1:])
     cases = []
     for t in texts:
-        ids = tok.encode(t, add_special_tokens=False).ids
-        cases.append({"text": t, "ids": ids, "decoded": tok.decode(ids, skip_special_tokens=False)})
+        enc = tok.encode(t, add_special_tokens=False)
+        ids = enc.ids
+        cases.append({"text": t, "ids": ids, "decoded": tok.decode(ids, skip_special_tokens=False),
+                      "offsets": [list(o) for o in enc.offsets]})
     json.dump({"tokenizers": __import__("tokenizers").__version__, "cases": cases},
               open(args.out, "w"), ensure_ascii=False, indent=1)
     print(f"{len(cases)} cases -> {args.out} (tokenizers {__import__('tokenizers').__version__}); "

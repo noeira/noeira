@@ -11,12 +11,25 @@
 #   pixi run -e detect python tools/perception/detector_latency.py --export-nyu 4 \
 #       --mat ~/.cache/noeira/datasets/nyu_depth_v2/nyu_depth_v2_labeled.mat --images ~/.cache/noeira/d1/nyu
 #   python tools/d1/dump_d1_vl_reference.py --images ~/.cache/noeira/d1/nyu --out ~/.cache/noeira/d1/ref_vl
+#   # typed questions' layouts (no forward; §12.9 T1), then copy ~/.cache/noeira/d1/typed_ref here:
+#   python tools/d1/dump_d1_typed_reference.py --images ~/.cache/noeira/d1/nyu --out ~/.cache/noeira/d1/typed_ref
 
 # LFM3's byte-level BPE in Mojo (noeira/text/bpe.mojo) against Hugging Face
-# `tokenizers`: 75 strings exact (each branch of the split regex, non-ASCII,
-# added tokens inside text, d1's prompts), 75 decodes exact, and d1's packed
-# rows rebuilt id for id from its prompt texts.
+# `tokenizers`: 77 strings exact (each branch of the split regex, non-ASCII,
+# emoji cut between tokens, added tokens inside text, d1's prompts), 77 decodes
+# exact, 77 offset mappings exact (`encode_offsets`, code points), and d1's
+# packed rows rebuilt id for id from its prompt texts.
 tests/text/test_bpe_reference.mojo
+
+# d1's TYPED questions laid out as d1-2B's own code lays them out
+# (docs/NN_MODEL_PORTS_PLAN.md §12.9, T1; host only, no model): the record
+# from config.json, 8 cases' prefixes, 44 questions' suffixes and slot offsets
+# (multiple choices, text / number / date reads, estimates on number and code
+# grids, box, boxes of 16 / 4 / 1 blocks), every slot's readout tokens, 9 packed
+# rows, their state positions (per token span, JSON string paths, pointer
+# width), 88 offset mappings, and calibration.json's tables over a sweep — all
+# exact. Ten mutants caught (listed in the test's header).
+tests/llm/test_d1_typed_prompt_reference.mojo
 
 # The LFM3 text backbone on the device (noeira/llm/lfm3) against d1's own code,
 # layer by layer, on the dumped rows (state + questions under the `set` mask):

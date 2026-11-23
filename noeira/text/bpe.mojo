@@ -243,6 +243,44 @@ struct ByteLevelBPE(Movable):
             self._ordinary(String(text[byte=start:n]), out)
         return out^
 
+    def encode_offsets(mut self, text: String) raises -> Tuple[List[Int], List[Int], List[Int]]:
+        """`encode` and each token's `[start, end)` in CODE POINTS of `text`
+        (`tokenizers`' `offset_mapping` for a Python `str`): a token that cuts
+        a multi-byte character spans that whole character, so two tokens of
+        one emoji both cover it. The tokens' bytes are the text's bytes in
+        order (byte-level BPE, no normalizer), so the offsets follow from the
+        ids alone."""
+        var ids = self.encode(text)
+        var b = text.as_bytes()
+        var n = len(b)
+        var cp_of = List[Int](capacity=n + 1)  # byte -> index of the character holding it
+        var k = 0
+        var i = 0
+        while i < n:
+            var x = Int(b[i])
+            var w = 1 if x < 0x80 else (2 if x < 0xE0 else (3 if x < 0xF0 else 4))
+            for _ in range(w):
+                cp_of.append(k)
+            i += w
+            k += 1
+        var starts = List[Int](capacity=len(ids))
+        var ends = List[Int](capacity=len(ids))
+        var at = 0
+        for id in ids:
+            var w: Int
+            if self.is_added[id]:
+                w = self.pieces[id].byte_length()
+            else:
+                w = self.pieces[id].count_codepoints()  # one byte-level character per byte
+            if w == 0 or at + w > n:
+                raise Error("bpe: encode_offsets: token bytes do not cover the text")
+            starts.append(cp_of[at])
+            ends.append(cp_of[at + w - 1] + 1)
+            at += w
+        if at != n:
+            raise Error("bpe: encode_offsets: token bytes do not cover the text")
+        return (ids^, starts^, ends^)
+
     def _added_at(self, b: Span[UInt8, _], i: Int) -> Int:
         for k in range(len(self.added)):
             var a = self.added[k].as_bytes()
