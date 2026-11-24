@@ -43,6 +43,7 @@ from .expert import SmolVLAExpert, EXPERT_FF
 from .kv_cache import SmolVLAKVCache
 from .fused import SmolVLADenoise, SmolVLAPrefill
 from .flow import EulerSchedule, token_concat
+from .rtc import RtcGuide
 from .embed import sinusoidal_time_embedding, embed_language_tokens
 from .heads import SMOLVLA_STATE_DIM, SmolVLATokenEmbed
 from .attn_mask import att_2d_mask, att_2d_mask_square, smolvla_ar
@@ -208,6 +209,12 @@ struct SmolVLAActionSampler[
 
     var act: Self.Act
     var pool: TensorPack[Self.N_SLOTS]
+    var rtc: RtcGuide[Self.CHUNK, Self.ADIM, Self.B]
+    """Real-Time Chunking (`rtc.mojo`). Disarmed by default, and then the
+    loop below is the plain Euler sampler exactly; armed, each step's
+    velocity is guided toward the committed prefix before the Euler update.
+    ⚠ Armed state PERSISTS across `sample` calls: the caller re-arms (or
+    disarms) before every query."""
     var temb: Tensor
     """All `STEPS` time embeddings, `[STEPS, EW]`, computed ONCE.
 
@@ -221,11 +228,13 @@ struct SmolVLAActionSampler[
     def __init__(out self):
         self.act = Self.Act()
         self.pool = TensorPack[Self.N_SLOTS]()
+        self.rtc = RtcGuide[Self.CHUNK, Self.ADIM, Self.B]()
         self.temb = Tensor()
 
     def __init__(out self, *, deinit move: Self):
         self.act = move.act^
         self.pool = move.pool^
+        self.rtc = move.rtc^
         self.temb = move.temb^
 
     @staticmethod
@@ -341,6 +350,13 @@ struct SmolVLAActionSampler[
             action_out.forward[target, TOK](
                 TensorRefs[1](self.pool[Self.SUF]), self.pool[Self.V], ctx
             )
+
+            # ── RTC: pull the predicted clean chunk toward the committed one
+            if self.rtc.active:
+                self.rtc.apply[target](
+                    self.pool[Self.XT], self.pool[Self.V],
+                    Self.Sched.time_at(step), ctx,
+                )
 
             # ── one negative Euler step ──────────────────────────────────
             Self.Sched.advance[target, Self.XN](
@@ -1281,3 +1297,34 @@ struct SmolVLAPolicy[
         for i in range(Self.B * Self.CHUNK * Self.ADIM):
             flat.append(Float32(self.chunk_buf.data[i]))
         unnormalize_action(self.stats, flat, Self.CHUNK, actions, Self.ADIM)
+
+    def rtc_arm[
+        target: StaticString
+    ](
+        mut self,
+        k: Int,
+        d: Int,
+        horizon: Int,
+        schedule: Int,
+        beta: Float64,
+        ctx: Optional[DeviceContext] = None,
+    ) raises:
+        """Guide the NEXT query toward the chunk this policy returned last
+        (Real-Time Chunking, `rtc.mojo`).
+
+        `k` = the index of that chunk about to execute when the next
+        observation is taken; `d` = the steps expected to execute during the
+        query; `horizon` = the overlap's end in the new chunk (clipped to
+        `CHUNK - k`). The prefix comes from `chunk_buf`, which is the model's
+        own normalised 32-wide output — the space RTC compares in.
+
+        ⚠ ARM AFTER `finish_action` OF THE CHUNK BEING EXECUTED, before the
+        next `start_action`. Armed from any other chunk, the new one is
+        inpainted onto actions the robot never ran."""
+        self.sampler.rtc.arm[target](
+            self.chunk_buf, k, d, horizon, schedule, beta, ctx
+        )
+
+    def rtc_disarm(mut self):
+        """The next query is a plain sample again."""
+        self.sampler.rtc.disarm()

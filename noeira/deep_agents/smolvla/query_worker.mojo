@@ -39,7 +39,15 @@ units), and cells for state and timings. Exactly one producer and one consumer
 per ring, which is what `SpscRing` requires:
 
     control -> `req`: [pose: RDIM float32][images: N_CAM*3*IMG*IMG float32]
+                      [rtc: k, d, chunk id — 3 float32]
     worker  -> `rsp`: [chunk: CHUNK*RDIM float32]
+
+⚠ THE RTC TAIL (`rtc.mojo`, `--rtc`). `k` = the index of the chunk being
+executed when the observation was taken, `d` = the steps expected to execute
+during the query, `chunk id` = how many chunks the control thread has taken.
+The worker arms ONLY when that id equals its own `served` count: then the
+chunk in `chunk_buf` is the one the arm is executing. Any other case (the
+first query, `k < 0`, RTC off) is a plain sample.
 
 ⚠ THE WORKER OWNS ITS OWN `images`/`noise` TENSORS. The request's bytes are
 copied into them before the query starts, so the control thread may refill its
@@ -111,7 +119,11 @@ the drive loop; this one is written by the worker body. If the drive loop's
 count climbs while this one does not, the worker is wedged before its first
 statement; if both climb while no chunk appears, the two threads are holding
 DIFFERENT rings."""
-comptime QW_N_CELLS: Int = 48
+comptime QW_RTC_ARMED: Int = 48
+"""Queries guided by RTC. Under `--rtc` it should be `served - 1`; less means
+requests arrived for a chunk the worker did not serve last (a dropped chunk)
+or with no chunk executing."""
+comptime QW_N_CELLS: Int = 56
 
 comptime QW_STARTING: Int64 = 0
 comptime QW_READY: Int64 = 1
@@ -139,7 +151,8 @@ struct SmolVLAQueryWorker[
         Self.N_CAM, Self.N_LANG, Self.CHUNK, Self.STEPS, 1
     ]
     comptime IMG_ELEMS: Int = Self.N_CAM * 3 * Self.IMG * Self.IMG
-    comptime REQ_BYTES: Int = (Self.RDIM + Self.IMG_ELEMS) * 4
+    comptime RTC_TAIL: Int = 3
+    comptime REQ_BYTES: Int = (Self.RDIM + Self.IMG_ELEMS + Self.RTC_TAIL) * 4
     comptime RSP_BYTES: Int = Self.CHUNK * Self.RDIM * 4
     comptime XN: Int = Self.CHUNK * SMOLVLA_ACTION_DIM
 
@@ -155,6 +168,11 @@ struct SmolVLAQueryWorker[
     var fused_vision: Bool
     """Route the SigLIP towers through the fused attention kernel (the
     deploy's default; `--no-fused-vision` turns it off for an A/B)."""
+    var rtc: Bool
+    var rtc_horizon: Int
+    var rtc_schedule: Int
+    var rtc_beta: Float64
+    var rtc_armed: Int
 
     var pol: Optional[Self.Pol]
     var ctx: Optional[DeviceContext]
@@ -177,6 +195,10 @@ struct SmolVLAQueryWorker[
         task_index: Int,
         warmups: Int,
         fused_vision: Bool = True,
+        rtc: Bool = False,
+        rtc_horizon: Int = 0,
+        rtc_schedule: Int = 0,
+        rtc_beta: Float64 = 0.0,
     ):
         self.req = req
         self.rsp = rsp
@@ -188,6 +210,11 @@ struct SmolVLAQueryWorker[
         self.task_index = task_index
         self.warmups = warmups
         self.fused_vision = fused_vision
+        self.rtc = rtc
+        self.rtc_horizon = rtc_horizon
+        self.rtc_schedule = rtc_schedule
+        self.rtc_beta = rtc_beta
+        self.rtc_armed = 0
         self.pol = None
         self.ctx = None
         self.ids = List[Int]()
@@ -208,6 +235,11 @@ struct SmolVLAQueryWorker[
         self.task_index = move.task_index
         self.warmups = move.warmups
         self.fused_vision = move.fused_vision
+        self.rtc = move.rtc
+        self.rtc_horizon = move.rtc_horizon
+        self.rtc_schedule = move.rtc_schedule
+        self.rtc_beta = move.rtc_beta
+        self.rtc_armed = move.rtc_armed
         self.pol = move.pol^
         self.ctx = move.ctx^
         self.ids = move.ids^
@@ -327,7 +359,25 @@ struct SmolVLAQueryWorker[
                 self.images.data[i] = Scalar[DT](
                     src[unsafe_offset = Self.RDIM + i]
                 )
+            comptime TAIL = Self.RDIM + Self.IMG_ELEMS
+            var rtc_k = Int(src[unsafe_offset=TAIL])
+            var rtc_d = Int(src[unsafe_offset = TAIL + 1])
+            var rtc_cid = Int(src[unsafe_offset = TAIL + 2])
             self.req.end_pop()
+
+            # ⚠ ARM FROM `chunk_buf` ONLY IF IT IS THE CHUNK BEING EXECUTED.
+            if (
+                self.rtc and self.served > 0 and rtc_cid == self.served
+                and rtc_k >= 0 and rtc_k < Self.CHUNK and rtc_d >= 0
+            ):
+                self.pol.value().rtc_arm[Self.target](
+                    rtc_k, rtc_d, self.rtc_horizon, self.rtc_schedule,
+                    self.rtc_beta, self.ctx,
+                )
+                self.rtc_armed += 1
+                self.cells.relaxed_store(QW_RTC_ARMED, Int64(self.rtc_armed))
+            else:
+                self.pol.value().rtc_disarm()
 
             comptime if Self.target != "cpu":
                 self.images.upload(self.ctx.value())

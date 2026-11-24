@@ -18,6 +18,11 @@
     # --arm is what actually moves the robot. Be at the desk, hand on the power.
     ... --arm --seconds 30
 
+    # Real-Time Chunking: pipelined, no hold at the handover, the next chunk
+    # inpainted onto what the arm executes during the query (`rtc.mojo`;
+    # offline evidence: `smolvla_so101_rtc_replay.mojo`)
+    ... --threaded --rtc --exec-steps 25
+
 ⚠⚠ **`--arm` MOVES THE FOLLOWER, AND NOTHING ELSE DOES.** The opt-in is a scar
 `record.mojo` earned on 2026-08-31; `docs/SO101_SERIAL_LAYER.md` §safety.
 
@@ -103,6 +108,9 @@ from noeira.deep_agents.smolvla.observation import (
     fill_camera_images, fill_siglip_frames, siglip_frames_into_slot,
 )
 from noeira.deep_agents.smolvla.policy import SmolVLAPolicy
+from noeira.deep_agents.smolvla.rtc import (
+    RTC_BETA_DEFAULT, rtc_schedule_from_name,
+)
 from noeira.deep_agents.smolvla.query_worker import (
     QW_DROPPED,
     QW_FAILED,
@@ -110,6 +118,7 @@ from noeira.deep_agents.smolvla.query_worker import (
     QW_POLLS,
     QW_QUERY_US,
     QW_READY,
+    QW_RTC_ARMED,
     QW_SERVED,
     QW_STATE,
     QW_SUBMIT_US,
@@ -332,6 +341,24 @@ def main() raises:
     ignored with a note. `--exec-steps` still applies: fewer steps per
     chunk means fresher pixels per pause."""
 
+    var rtc = False
+    """⚠⚠ REAL-TIME CHUNKING (`noeira/deep_agents/smolvla/rtc.mojo`), off by
+    default. The pipelined loop's fix for the 20 Sep oscillation, where
+    `--sync` was the workaround: the next chunk is sampled GUIDED toward the
+    leftover of the chunk being executed, frozen on the `d` steps that run
+    during the query, so the chunk that lands already agrees with what the arm
+    did meanwhile. No hold, no jump. LeRobot's form (identity Jacobian), so
+    the query costs what it did.
+
+    Needs the pipelined loop: refused with `--sync` (nothing overlaps) and
+    `--ensemble` (two ways of joining the same chunks). `--exec-steps 25`
+    leaves a soft overlap after the frozen steps; at 50 the leftover is only
+    the frozen part. `d` is the max of the last 10 MEASURED delays (the
+    paper's rule), seeded from the warm query."""
+    var rtc_beta = RTC_BETA_DEFAULT
+    var rtc_schedule_name = String("exp")
+    var rtc_horizon = CHUNK
+
     var args = argv()
     for i in range(len(args)):
         var a = String(args[i])
@@ -347,6 +374,14 @@ def main() raises:
             ensemble = True
         elif a == "--sync":
             sync = True
+        elif a == "--rtc":
+            rtc = True
+        elif a == "--rtc-beta" and i + 1 < len(args):
+            rtc_beta = Float64(String(args[i + 1]))
+        elif a == "--rtc-schedule" and i + 1 < len(args):
+            rtc_schedule_name = String(args[i + 1])
+        elif a == "--rtc-horizon" and i + 1 < len(args):
+            rtc_horizon = Int(String(args[i + 1]))
         elif a == "--no-fused-vision":
             fused_vision = False
         elif a == "--project" and i + 1 < len(args):
@@ -387,6 +422,17 @@ def main() raises:
             "smolvla deploy: --exec-steps must be 1.." + String(CHUNK)
             + " (the chunk is " + String(CHUNK) + " steps = "
             + fixed(Float64(CHUNK) / Float64(SO101_FPS), 2) + " s of motion)"
+        )
+    var rtc_schedule = rtc_schedule_from_name(rtc_schedule_name)
+    if rtc and sync:
+        raise Error(
+            "smolvla deploy: --rtc joins OVERLAPPING chunks and --sync never"
+            " overlaps them — pick one"
+        )
+    if rtc and ensemble:
+        raise Error(
+            "smolvla deploy: --rtc and --ensemble both join consecutive chunks;"
+            " blending a guided chunk with its predecessor double-counts it"
         )
     if sync and ensemble:
         # No two chunks ever cover the same instant under --sync, so the
@@ -465,6 +511,13 @@ def main() raises:
     if sync:
         print("loop         --sync: hold during the query, execute each chunk"
               " from step 0 (the reference's evaluation loop)")
+    if rtc:
+        print(
+            "loop         --rtc: pipelined, each chunk guided onto the"
+            " executing one's leftover (schedule " + rtc_schedule_name
+            + ", beta " + fixed(rtc_beta, 1) + ", horizon "
+            + String(rtc_horizon) + ")"
+        )
     print(
         "vision       SigLIP attention "
         + ("FUSED (MAX FA2, TF32 matmuls, on NVIDIA at this shape; no cache)"
@@ -476,7 +529,7 @@ def main() raises:
             QWorker(
                 req_ring, rsp_ring, qcells, String(BASE_REPO), ckpt,
                 stats_path, tasks_path, task_index, WARMUP_QUERIES,
-                fused_vision,
+                fused_vision, rtc, rtc_horizon, rtc_schedule, rtc_beta,
             )
         )
         # ⚠ WAIT FOR IT, AND FOR ITS WARM-UP. The worker downloads, builds
@@ -797,6 +850,14 @@ def main() raises:
     # at 0 — the first query has no measurement, and a lead that is too small
     # costs one handover while a lead that is too large costs every one.
     var lead = 0
+    # RTC: the last measured delays (grid steps from the observation to the
+    # chunk taking over), the paper's `Q` with b = 10; `d` = their max.
+    var rtc_delays = List[Int]()
+    var rtc_seed_d = Int(warm_ms * Float64(SO101_FPS) / 1000.0) + 1
+    var rtc_armed_inline = 0
+    var rtc_sum_k = 0
+    var rtc_sum_d = 0
+    var rtc_n = 0
     var sum_wait = 0.0
     var worst_wait = 0.0
     var iterations = 0
@@ -1042,6 +1103,10 @@ def main() raises:
                     t_obs = t_now
                 else:
                     skipped_at_handover += t_now - t_obs
+                    if rtc:
+                        rtc_delays.append(t_now - t_obs)
+                        if len(rtc_delays) > 10:
+                            _ = rtc_delays.pop(0)
                 swapped = True
                 if ensemble:
                     # ⚠ PUSHED AT `t_obs`, NOT AT ARRIVAL. The ensemble indexes
@@ -1123,6 +1188,26 @@ def main() raises:
                 t_obs_pending = Int(
                     Float64(q_t0 - loop_t0) * Float64(SO101_FPS) / 1e9
                 )
+                # ⚠ RTC: `k` = the executing chunk's index at THIS
+                # observation, `d` = the steps it will keep executing while the
+                # query runs. Nothing to guide toward before the first chunk,
+                # or once the chunk has run out (a stalled handover).
+                var rtc_k = -1
+                var rtc_d = 0
+                if rtc and t_obs >= 0 and queries > 0:
+                    rtc_k = t_obs_pending - t_obs
+                    rtc_d = rtc_seed_d
+                    if len(rtc_delays) > 0:
+                        rtc_d = 0
+                        for x in rtc_delays:
+                            if x > rtc_d:
+                                rtc_d = x
+                    if rtc_k < 0 or rtc_k >= CHUNK:
+                        rtc_k = -1
+                    else:
+                        rtc_sum_k += rtc_k
+                        rtc_sum_d += rtc_d
+                        rtc_n += 1
                 # ⚠⚠ TIMED BECAUSE "ENQUEUE AND RETURN" IS AN ASSUMPTION. A
                 # query is ~6970 kernel launches; once the driver's pending-
                 # launch queue fills, `cuLaunchKernel` STOPS being asynchronous
@@ -1148,9 +1233,24 @@ def main() raises:
                     siglip_frames_into_slot[N_CAM, SIGLIP_INPUT](
                         frames, claim.data(), RDIM * 4
                     )
+                    # the RTC tail: k, d, and which chunk is executing
+                    comptime TAIL = RDIM + QWorker.IMG_ELEMS
+                    cp[unsafe_offset=TAIL] = Float32(rtc_k)
+                    cp[unsafe_offset = TAIL + 1] = Float32(rtc_d)
+                    cp[unsafe_offset = TAIL + 2] = Float32(queries)
                     req_ring.end_push(QWorker.REQ_BYTES)
                 else:
                     _fill_noise(noise, XN, queries * 7919 + 13, dev_ctx)
+                    # `chunk_buf` holds the chunk collected last — the one
+                    # executing — so the inline path arms from it directly.
+                    if rtc_k >= 0:
+                        pol_opt.value().rtc_arm[TARGET](
+                            rtc_k, rtc_d, rtc_horizon, rtc_schedule, rtc_beta,
+                            dev_ctx,
+                        )
+                        rtc_armed_inline += 1
+                    else:
+                        pol_opt.value().rtc_disarm()
                     pol_opt.value().start_action[TARGET](
                         images, ids, pose, noise, dev_ctx
                     )
@@ -1508,6 +1608,29 @@ def main() raises:
         + String(n_step_ho) + " commands)"
         + "   <- the jump the servo chases at its clamp"
     )
+    if rtc:
+        var armed = (
+            Int(qcells.acquire_load(QW_RTC_ARMED)) if threaded
+            else rtc_armed_inline
+        )
+        var dmax = 0
+        var dsum = 0
+        for x in rtc_delays:
+            dsum += x
+            if x > dmax:
+                dmax = x
+        print(
+            "  rtc               = " + String(armed) + " of " + String(queries)
+            + " queries guided; k "
+            + fixed(Float64(rtc_sum_k) / Float64(rtc_n) if rtc_n > 0 else 0.0, 1)
+            + ", d " + fixed(
+                Float64(rtc_sum_d) / Float64(rtc_n) if rtc_n > 0 else 0.0, 1
+            ) + " mean; measured delay (last " + String(len(rtc_delays))
+            + ") " + fixed(
+                Float64(dsum) / Float64(len(rtc_delays))
+                if len(rtc_delays) > 0 else 0.0, 1
+            ) + " mean, " + String(dmax) + " max steps"
+        )
     print("  bus-skipped ticks = " + String(bus_skipped))
     print(
         "  action clamped    = " + String(clamped) + " of "

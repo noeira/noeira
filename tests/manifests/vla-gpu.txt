@@ -62,6 +62,12 @@ tests/deep_agents/smolvla/test_flow.mojo
 # from one, and that a rerun reproduces exactly (no state mutated between calls).
 tests/deep_agents/smolvla/test_sample_actions.mojo
 
+# Real-Time Chunking (`rtc.mojo`): LeRobot's prefix weights and guidance
+# weight; disarmed and zero-weight arms are BIT-identical to the plain
+# sampler; the frozen prefix lands on the committed chunk at the k shift
+# (mutant-checked: dropping k fails); CPU apply == GPU kernel.
+tests/deep_agents/smolvla/test_rtc.mojo
+
 # Step 7 — prefix assembly: the segments land where the mask expects, and only
 # image+language carry the sqrt(960) scale (the state must not).
 tests/deep_agents/smolvla/test_prefix_embed.mojo
