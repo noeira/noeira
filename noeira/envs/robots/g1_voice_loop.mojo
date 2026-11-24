@@ -89,7 +89,7 @@ from noeira.io.wav import WavAudio
 from noeira.text.spoken import spoken_cap_end, spoken_clause_end, spoken_sentence_end, spoken_text
 from noeira.envs.robots.g1_command_bank import G1CommandBank
 from noeira.envs.robots.g1_command_language import (
-    g1_command_questions, g1_decide, g1_decide_chain, g1_command_state,
+    g1_command_questions, g1_decide, g1_decide_chain, g1_command_state, g1_strip_amount,
     g1_since_word, G1Context, G1LangPick, G1_Q_EXTENT,
     g1_destination_questions, g1_route_destination,
     g1_add_two_places_gate, g1_two_places_questions, g1_two_places_state, g1_route_two_places,
@@ -378,6 +378,13 @@ struct G1VoiceConfig(Copyable, Movable):
     """Each option's description starts with its name, in the command
     request and the triage (d1 reads an option by its description alone:
     RB-1's d1 arm). OFF by default: Jev was measured without."""
+    var strip_amount: Bool
+    """The command request is asked on the sentence WITHOUT its amount
+    (`g1_strip_amount`: "Avance de 3 mètres." -> "Avance."); the destination,
+    trail and two-place requests still read the whole sentence. An amount
+    made d1 refuse the command: 13 / 40 held-out commands with an amount
+    accepted, 21 / 40 with it cut out (docs/NN_MODEL_PORTS_PLAN.md §12.9.5).
+    OFF by default until RB-1 / RB-2 have measured it."""
     var see: Bool
     """Decisions see the caller's latest frame (`see`, `wants_view`; the
     module note). Needs a backend that can see (`D1Service`). OFF by
@@ -439,6 +446,7 @@ struct G1VoiceConfig(Copyable, Movable):
         self.dest_chain = False
         self.miss_kind = False
         self.name_desc = False
+        self.strip_amount = False
         self.see = False
         self.see_max_age_s = 2.0
         self.mic_input = String("")
@@ -559,6 +567,12 @@ struct G1VoiceLoopOf[
     var asked: String
     """The state the current decision was asked with, for its second
     request."""
+    var asked_cmd: String
+    """The state the command request is asked with: `asked`, or with
+    `strip_amount` the state of the sentence without its amount."""
+    var asked_cut: String
+    """With `strip_amount`, the sentence the command was chosen on when an
+    amount was cut out of it ("" otherwise): the decision's note shows it."""
     var dest_ms: Float64
     """`request_wording`: how long the first request of the current decision
     took, 0 when it was the only one. Shown in the decision's note."""
@@ -751,6 +765,8 @@ struct G1VoiceLoopOf[
                 self.cfg.chain,
             )
         self.asked = String("")
+        self.asked_cmd = String("")
+        self.asked_cut = String("")
         self.dest_ms = 0.0
         self.dest_tok = 0
         self.then_decide = False
@@ -854,6 +870,8 @@ struct G1VoiceLoopOf[
         self.chain_q = move.chain_q^
         self.chain_dest = move.chain_dest^
         self.asked = move.asked^
+        self.asked_cmd = move.asked_cmd^
+        self.asked_cut = move.asked_cut^
         self.dest_ms = move.dest_ms
         self.dest_tok = move.dest_tok
         self.then_decide = move.then_decide
@@ -1788,9 +1806,9 @@ struct G1VoiceLoopOf[
                 elif which == _VL_Q_TRAIL:
                     self.jev.start_seeing(self.asked, True, self.trail_q, self.asked_view)
                 elif which == _VL_Q_MEM:
-                    self.jev.start_seeing(self.asked, True, self.quest_mem, self.asked_view)
+                    self.jev.start_seeing(self.asked_cmd, True, self.quest_mem, self.asked_view)
                 else:
-                    self.jev.start_seeing(self.asked, True, self.quest, self.asked_view)
+                    self.jev.start_seeing(self.asked_cmd, True, self.quest, self.asked_view)
                 return
             except e:
                 self._add_note(String("[see] the decision backend cannot see (") + String(e) + String(") — blind from now on"))
@@ -1801,9 +1819,9 @@ struct G1VoiceLoopOf[
         elif which == _VL_Q_TRAIL:
             self.jev.start(self.asked, self.trail_q)
         elif which == _VL_Q_MEM:
-            self.jev.start(self.asked, self.quest_mem)
+            self.jev.start(self.asked_cmd, self.quest_mem)
         else:
-            self.jev.start(self.asked, self.quest)
+            self.jev.start(self.asked_cmd, self.quest)
 
     def _two_requests(self) -> Bool:
         return self.cfg.request_wording and len(self.cfg.destinations) > 0
@@ -1960,6 +1978,13 @@ struct G1VoiceLoopOf[
         destination one when there are two: True). The turn's end, the early
         start and its re-ask all start a decision HERE."""
         self.asked = g1_command_state(text, ctx)
+        self.asked_cmd = self.asked
+        self.asked_cut = String("")
+        if self.cfg.strip_amount:
+            var cut = g1_strip_amount(text)
+            if cut != text:
+                self.asked_cmd = g1_command_state(cut, ctx)
+                self.asked_cut = cut^
         self._snapshot_view()
         self.mem_asked = False
         self.tri = G1Triage()
@@ -2328,6 +2353,7 @@ struct G1VoiceLoopOf[
                              + _vl_f2(self.pick.conf) + String("  P(none) ")
                              + _vl_f2(self.pick.p_none) + String("  world ")
                              + _vl_f2(self.pick.needs_world)
+                             + (String("  on '") + self.asked_cut + String("'") if self.asked_cut != "" else String(""))
                              + self._jev_ms(ans.latency_ms, ans.input_tokens))
             elif self.pick.talk and self.replied:
                 # `talk_first`: the reply is out already, and one is enough

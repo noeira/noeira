@@ -58,6 +58,11 @@ tests/robots/test_g1_command_channel.mojo
 # duration bucketing that keeps a float off the wire.
 tests/robots/test_g1_command_state.mojo
 
+# the amount cut out before the command request ("Avance de 3 mètres." ->
+# "Avance.", which d1 otherwise refuses): the Mojo port against the bench's
+# Python on 35 sentences, span and tidied text.
+tests/robots/test_g1_strip_amount.mojo
+
 # the cache-miss path's pure parts: the pool sidecar's own round trip (the
 # first loader refused its own space-padded header), the goal key that is the
 # duplicate test after two angle criteria were measured failing at it, and

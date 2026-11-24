@@ -48,6 +48,9 @@ False, `noeira.brain.answers.can_turn`, live room 2026-11-18):
     carrying the answer it was said with; d1 dropped the same way.
 16. (`reply_refused`) an addressed sentence d1 refuses (« no clear pick »)
     gets a reply from the model; off, it stays silent as before.
+17. (`strip_amount`, docs/NN_MODEL_PORTS_PLAN.md §12.9.5) "Avance de 3
+    mètres.": the destination request reads the whole sentence, the command
+    request "Avance.", and the pick's note names it; off, one state for both.
 
 The loop is the real `G1VoiceLoopOf`, its microphone closed, a stand-in
 recogniser handing it the sentence, a stand-in decision answering from a
@@ -603,6 +606,35 @@ def main() raises:
             check(fails, refused_note and talked == 1 and rf.llm.asked == 1, "on: refused, then the model's reply, once")
         else:
             check(fails, refused_note and talked == 0 and rf.llm.asked == 0, "off: refused and silent, as before")
+
+    print("17. `strip_amount`: the command request reads the sentence without its amount")
+    for on in range(2):
+        var sa = make_loop(0.0, bank)
+        sa.cfg.strip_amount = on == 1
+        sa.stt.text = String("Avance de 3 mètres.")
+        sa.jev.script.append(first_answer(0.1))
+        sa.jev.script.append(command_answer(String("walk")))
+        sa.state = VL_ST_STT
+        var sctx = G1Context()
+        var sorder = String("")
+        var picked_on = False
+        for _ in range(40):
+            var sev = sa.poll(sctx, bank)
+            if sev.kind == VL_COMMAND:
+                sorder += String("C") + sev.name
+            var sn = sa.take_note()
+            if sn.startswith("[pick]") and sn.find("on 'Avance.'") >= 0:
+                picked_on = True
+        ref st = sa.jev.states
+        var two = len(st) == 2 and sa.jev.asked == "DC" and sorder == "Cwalk"
+        var dest_whole = two and st[0].find("Avance de 3 mètres.") >= 0
+        if on == 1:
+            check(fails, dest_whole and st[1].find('"Avance."') >= 0 and st[1].find("mètres") < 0 and picked_on,
+                  "on: the destination request reads it whole, the command request 'Avance.', the note says so: "
+                  + sa.jev.asked + " " + sorder)
+        else:
+            check(fails, dest_whole and st[0] == st[1] and not picked_on,
+                  "off: both requests read the same state, as before: " + sa.jev.asked + " " + sorder)
 
     print("ALL PASS" if fails == 0 else String(fails) + " FAILED")
     if fails != 0:

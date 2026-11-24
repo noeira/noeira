@@ -486,6 +486,10 @@ def main() raises:
     vcfg.cand_path = cand_path
     vcfg.mic_dev = mic_dev
     vcfg.llm_spec = llm_spec
+    # `--strip-amount`: the command is chosen on the sentence without its
+    # amount ("Avance de 3 mètres." -> "Avance."), which d1 otherwise refuses
+    # (G1VoiceConfig.strip_amount, docs/NN_MODEL_PORTS_PLAN.md §12.9.5)
+    vcfg.strip_amount = _has(String("--strip-amount"))
     # ⚠ THE VOCABULARY IS SENT ONLY TO A BACKEND THAT TAKES ONE, and the loop
     # decides — HF's Whisper accepts a prompt as token ids, never text, and
     # the client RAISES on one. Passing it unconditionally is what made this

@@ -61,6 +61,7 @@ almost nothing — that is the shape of its cost model.
 from noeira.ai.jev import JevQuestions, JevAnswers
 from noeira.envs.robots.g1_command_bank import G1CommandBank
 from noeira.io.json import JsonWriter
+from noeira.text.pyre import PyRe
 
 comptime G1_Q_COMMAND: String = "command"
 # ⚠ THREE COMMANDS IN ONE CALL. Jev answers every question against the same
@@ -1403,6 +1404,132 @@ def g1_extent_seconds(level: Float64) -> Float64:
     if i >= 4:
         return a[4]
     return a[i] + (a[i + 1] - a[i]) * (t - Float64(i))
+
+
+# ── the amount, cut out before the command request ─────────────────────────
+#
+# ⚠ AN AMOUNT MAKES d1 REFUSE THE COMMAND. "Avance de 3 mètres." came back
+# `none` (P 0.63) where "Avance." is a walk: the command request accepted 13 of
+# 40 held-out commands that carry an amount, and 21 of 40 once the amount was
+# cut out by this pattern (docs/NN_MODEL_PORTS_PLAN.md §12.9.5). The command
+# is chosen on the sentence WITHOUT its amount; how far or how long is a
+# separate answer.
+#
+# The pattern is the bench's (`extent_score.py`'s `AMOUNT_RE`, written as
+# Parakeet-TDT v3 transcribes: digits mostly, "1,50 m", some number words),
+# kept verbatim and run by `pyre` with Python's `re` semantics: a preposition
+# ("de", "d'", "sur", "pendant", "for", "of", "by"), a number in digits or
+# words, an optional "and a half" / "et demi", a unit of distance, time or
+# angle, and an optional tail ("et demie", "50"). Case-insensitive.
+comptime G1_AMOUNT_PATTERN: String = (
+    "(?:\\b(?:de|d'|sur|pendant|durant|for|of|by)\\s*)?(\\d+(?:[.,]\\d+)?|one\\ hundred\\ and\\ eigh"
+    "ty|a\\ hundred\\ and\\ eighty|cent\\-quatre\\-vingts|cent\\ quatre\\-vingts|one\\ hundred\\ eight"
+    "y|quatre\\-vingt\\-dix|quatre\\-vingts|quarante\\-cinq|quatre\\-vingt|forty\\-five|cinquante|t"
+    "hirteen|quatorze|fourteen|quarante|soixante|fifteen|sixteen|hundred|quatre|eleven|twelve"
+    "|treize|quinze|twenty|trente|thirty|ninety|eighty|trois|three|seven|eight|douze|seize|vi"
+    "ngt|forty|fifty|sixty|zéro|zero|deux|four|cinq|five|sept|huit|neuf|nine|onze|cent|one|tw"
+    "o|six|dix|ten|une?|an?|half an?|une demi-?)(?:\\s+(?:and a half|et demi))?\\s+(?:(?:m[eè]t"
+    "res?|metres?|meters?|m|centim[eè]tres?|centimeters?|cm|secondes?|seconds?|minutes?|degr["
+    "eé]s?|degrees?)\\b(?:\\s*(?:et demie?|and a half|\\d{2}\\b|cinquante|fifty))?)"
+)
+
+
+def _g1_cps(s: String) -> List[UInt32]:
+    var out = List[UInt32](capacity=s.byte_length())
+    for c in s.codepoints():
+        out.append(c.to_u32())
+    return out^
+
+
+def _g1_is_space(c: UInt32) -> Bool:
+    """`str.isspace()` for one character."""
+    if c == 0x20 or (c >= 0x09 and c <= 0x0D) or (c >= 0x1C and c <= 0x1F):
+        return True
+    if c < 0x85:
+        return False
+    return (c == 0x85 or c == 0xA0 or c == 0x1680 or (c >= 0x2000 and c <= 0x200A) or c == 0x2028
+            or c == 0x2029 or c == 0x202F or c == 0x205F or c == 0x3000)
+
+
+def g1_find_amount(said: String) raises -> Tuple[Int, Int]:
+    """The first amount written in `said` (`G1_AMOUNT_PATTERN`), as
+    `[start, end)` in code points; (-1, -1) when there is none."""
+    var re = PyRe.compile(String(G1_AMOUNT_PATTERN), ignorecase=True)
+    var m = re.search(_g1_cps(said))
+    if not m:
+        return (-1, -1)
+    return (m.value().start(), m.value().end())
+
+
+def g1_strip_amount(said: String) raises -> String:
+    """`said` without its first amount (and the preposition before it), tidied
+    as the bench's `strip_amount`: runs of 2+ spaces become one, no space
+    before "," or ".", stripped, no leading ",", the first letter upper-cased.
+    `said` itself when it has no amount — or when nothing would be left.
+
+        "Avance de 3 mètres." -> "Avance."
+        "Lève le bras, puis avance de 4 mètres." -> "Lève le bras, puis avance."
+    """
+    var at = g1_find_amount(said)
+    if at[0] < 0:
+        return said
+    var t = _g1_cps(said)
+    var cut = List[UInt32]()
+    for i in range(len(t)):
+        if i < at[0] or i >= at[1]:
+            cut.append(t[i])
+    # re.sub(r"\s{2,}", " ", ...)
+    var a = List[UInt32]()
+    var i = 0
+    while i < len(cut):
+        if _g1_is_space(cut[i]) and i + 1 < len(cut) and _g1_is_space(cut[i + 1]):
+            while i < len(cut) and _g1_is_space(cut[i]):
+                i += 1
+            a.append(32)
+        else:
+            a.append(cut[i])
+            i += 1
+    # re.sub(r"\s+([,.])", r"\1", ...)
+    var b = List[UInt32]()
+    i = 0
+    while i < len(a):
+        if _g1_is_space(a[i]):
+            var j = i
+            while j < len(a) and _g1_is_space(a[j]):
+                j += 1
+            if j < len(a) and (a[j] == 44 or a[j] == 46):
+                i = j
+                continue
+            for k in range(i, j):
+                b.append(a[k])
+            i = j
+        else:
+            b.append(a[i])
+            i += 1
+    # .strip(), then re.sub(r"^,\s*", "", ...)
+    var s = 0
+    var e = len(b)
+    while s < e and _g1_is_space(b[s]):
+        s += 1
+    while e > s and _g1_is_space(b[e - 1]):
+        e -= 1
+    if s < e and b[s] == 44:
+        s += 1
+        while s < e and _g1_is_space(b[s]):
+            s += 1
+    if s >= e:
+        return said
+    var out = String("")
+    for k in range(s, e):
+        var c = b[k]
+        if k == s:
+            # `str.upper()` of the first character: ASCII and Latin-1
+            if (c >= 97 and c <= 122) or (c >= 0xE0 and c <= 0xFE and c != 0xF7):
+                c -= 32
+            elif c == 0xFF:
+                c = 0x178
+        out += String(Codepoint(unsafe_unchecked_codepoint=c))
+    return out^
 
 
 def g1_decide_chain(
