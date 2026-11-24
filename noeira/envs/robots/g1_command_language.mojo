@@ -1835,6 +1835,17 @@ def g1_step_end(locomotion: Bool, extent: Float64, ref amount: G1Amount) -> Tupl
     return (0.0, g1_extent_seconds(extent))
 
 
+def g1_step_done(step_dist: Float64, end_dist: Float64, now_ns: Int, end_at_ns: Int) -> Bool:
+    """Whether the current step is over: its distance covered (`end_dist` > 0) OR its clock run out.
+
+    ⚠ THE CLOCK ENDS A DISTANCE STEP TOO. A robot that is blocked, or walking on the spot, never covers
+    its distance; the demo read the distance alone when there was one, so the clock `g1_step_end` sets
+    beside it was never read and the chain behind such a step waited for ever."""
+    if now_ns >= end_at_ns:
+        return True
+    return end_dist > 0.0 and step_dist >= end_dist
+
+
 def g1_decide_chain(
     ref ans: JevAnswers,
     ref bank: G1CommandBank,

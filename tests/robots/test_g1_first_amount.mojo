@@ -1,5 +1,5 @@
 """A command's amount, by code (`g1_parse_amount`, `g1_first_amount`,
-`g1_step_end`; docs/NN_MODEL_PORTS_PLAN.md §12.9.7).
+`g1_step_end`, `g1_step_done`; docs/NN_MODEL_PORTS_PLAN.md §12.9.7).
 
     pixi run mojo run -I . tests/robots/test_g1_first_amount.mojo
 
@@ -15,11 +15,12 @@ read on purpose: a unit the transcript dropped ("90" in "Tourne de 90 à
 gauche."), kilometres, "Go 12m forward." (a glued unit), and "a few" steps
 read as 1 step. An amount after "puis" / "then" is a later action's and
 gives none. `_step` checks how an amount becomes the step's distance and
-clock, with the clamps.
+clock, with the clamps; `_done` that a step with a distance still ends on its
+clock (a blocked robot used to hold its chain for ever).
 """
 
 from noeira.envs.robots.g1_command_language import (
-    G1Amount, g1_parse_amount, g1_first_amount, g1_step_end,
+    G1Amount, g1_parse_amount, g1_first_amount, g1_step_end, g1_step_done,
 )
 
 
@@ -46,6 +47,12 @@ def _step(mut fails: Int, loco: Bool, extent: Float64, value: Float64, unit: Str
     var got = g1_step_end(loco, extent, G1Amount(value, unit, -1, -1))
     if not _close(got[0], d) or not _close(got[1], s):
         print("  FAIL step", loco, extent, value, unit, "->", got[0], got[1], "| want", d, s)
+        fails += 1
+
+
+def _done(mut fails: Int, dist: Float64, end_dist: Float64, now: Int, end_at: Int, want: Bool):
+    if g1_step_done(dist, end_dist, now, end_at) != want:
+        print("  FAIL done", dist, end_dist, now, end_at, "| want", want)
         fails += 1
 
 
@@ -115,6 +122,13 @@ def main() raises:
     _step(fails, False, 2.0, 2.0, "m", 0.0, 3.0)       # metres for a posture: the extent's seconds
     _step(fails, False, 0.0, 0.0, "", 0.0, 1.0)
     _step(fails, True, 2.0, 4.0, "steps", 2.0, 13.0)   # steps unused
+    # when the step is over: the distance OR the clock (step_dist, end_dist, now, end_at)
+    _done(fails, 1.0, 3.0, 5, 10, False)    # walking, neither yet
+    _done(fails, 3.0, 3.0, 5, 10, True)     # the distance covered
+    _done(fails, 0.2, 3.0, 10, 10, True)    # blocked: the clock ends it anyway
+    _done(fails, 0.0, 0.0, 5, 10, False)    # a clock step, not yet
+    _done(fails, 9.0, 0.0, 5, 10, False)    # a clock step: distance means nothing
+    _done(fails, 0.0, 0.0, 11, 10, True)
     if fails > 0:
         raise Error(String(fails) + " amount case(s) differ")
-    print("test_g1_first_amount: 34 first + 18 parse + 11 step cases PASS")
+    print("test_g1_first_amount: 34 first + 18 parse + 11 step + 6 done cases PASS")

@@ -117,7 +117,7 @@ from noeira.envs.robots.g1_spec import (
 from noeira.envs.robots.g1_reward_vocab import G1Term
 from noeira.envs.robots.g1_command_language import (
     g1_command_questions, g1_decide, G1LangPick, g1_command_phrase,
-    g1_decide_chain, G1_Q_EXTENT, g1_step_end,
+    g1_decide_chain, G1_Q_EXTENT, g1_step_end, g1_step_done,
     G1Context, g1_command_state, g1_since_word,
 )
 from noeira.ai.chat import ChatClient, ChatMessage, ToolSpec
@@ -787,8 +787,8 @@ def main() raises:
         prev_key = rec_key
 
         # ── the queue advances when the current step is done ──────────
-        var step_done = (step_dist >= step_end_dist) if step_end_dist > 0.0 \
-                        else (perf_counter_ns() >= step_end_at)
+        # the distance OR the clock: a blocked robot still ends its step
+        var step_done = g1_step_done(step_dist, step_end_dist, perf_counter_ns(), step_end_at)
         if step_done and len(q_name) > 0 and state == ST_IDLE:
             var nxt = q_name[0]
             var ncf = q_conf[0]
