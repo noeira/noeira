@@ -63,6 +63,11 @@ tests/robots/test_g1_command_state.mojo
 # Python on 35 sentences, span and tidied text.
 tests/robots/test_g1_strip_amount.mojo
 
+# the amount itself, by code ("Avance de 3 mètres" -> 3 m, the voice demo's
+# step): the Mojo port against the bench's Python, the clause split ("puis",
+# "then"), and how an amount becomes a step's distance and clock.
+tests/robots/test_g1_first_amount.mojo
+
 # the cache-miss path's pure parts: the pool sidecar's own round trip (the
 # first loader refused its own space-padded header), the goal key that is the
 # duplicate test after two angle criteria were measured failing at it, and

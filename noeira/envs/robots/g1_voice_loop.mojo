@@ -90,6 +90,7 @@ from noeira.text.spoken import spoken_cap_end, spoken_clause_end, spoken_sentenc
 from noeira.envs.robots.g1_command_bank import G1CommandBank
 from noeira.envs.robots.g1_command_language import (
     g1_command_questions, g1_decide, g1_decide_chain, g1_command_state, g1_strip_amount,
+    G1Amount, g1_first_amount,
     g1_since_word, G1Context, G1LangPick, G1_Q_EXTENT,
     g1_destination_questions, g1_route_destination,
     g1_add_two_places_gate, g1_two_places_questions, g1_two_places_state, g1_route_two_places,
@@ -189,6 +190,11 @@ struct G1VoiceEvent(Copyable, Movable):
     """The `extent` score, already a float between its levels. The CALLER
     turns it into metres or seconds, because only the caller knows whether the
     row it is about to run is locomotion."""
+    var amount: G1Amount
+    """With `strip_amount`, the amount the sentence gives for its first
+    action, read by code (`g1_first_amount`: "Avance de 3 mètres." -> 3 m);
+    `G1Amount.none()` otherwise. The caller prefers it to `extent`
+    (`g1_step_end`)."""
     var chain: List[String]
     """A `VL_COMMAND`'s further steps (bank rows). For a `VL_WORLD` with
     `cfg.dest_chain`: the place to go on to after `destination`, if any."""
@@ -202,7 +208,7 @@ struct G1VoiceEvent(Copyable, Movable):
     def none() -> G1VoiceEvent:
         return G1VoiceEvent(
             VL_NONE, String(""), String(""), String(""), List[Float64](),
-            0.0, 0.0, 0.0, 0.0, List[String](), List[Float64](), String(""),
+            0.0, 0.0, 0.0, 0.0, G1Amount.none(), List[String](), List[Float64](), String(""),
         )
 
 
@@ -379,12 +385,16 @@ struct G1VoiceConfig(Copyable, Movable):
     request and the triage (d1 reads an option by its description alone:
     RB-1's d1 arm). OFF by default: Jev was measured without."""
     var strip_amount: Bool
-    """The command request is asked on the sentence WITHOUT its amount
-    (`g1_strip_amount`: "Avance de 3 mètres." -> "Avance."); the destination,
-    trail and two-place requests still read the whole sentence. An amount
-    made d1 refuse the command: 13 / 40 held-out commands with an amount
-    accepted, 21 / 40 with it cut out (docs/NN_MODEL_PORTS_PLAN.md §12.9.5).
-    OFF by default until RB-1 / RB-2 have measured it."""
+    """The amount is taken out of the sentence by code. The command request
+    is asked on the sentence WITHOUT its amount (`g1_strip_amount`: "Avance
+    de 3 mètres." -> "Avance."); the destination, trail and two-place
+    requests still read the whole sentence; the first action's amount is read
+    from the whole sentence by `g1_first_amount` into `G1VoiceEvent.amount`.
+    An amount made d1 refuse the command. On 60 held-out commands with an
+    amount, the right command with the right amount went from 3 (the whole
+    sentence and `extent`) to 25 (docs/NN_MODEL_PORTS_PLAN.md §12.9.7).
+    OFF by default here: the room loop reads no amount and RB-1 / RB-2
+    measured no gain there (§12.9.6); `bfm_zero_voice_demo` turns it on."""
     var see: Bool
     """Decisions see the caller's latest frame (`see`, `wants_view`; the
     module note). Needs a backend that can see (`D1Service`). OFF by
@@ -573,6 +583,8 @@ struct G1VoiceLoopOf[
     var asked_cut: String
     """With `strip_amount`, the sentence the command was chosen on when an
     amount was cut out of it ("" otherwise): the decision's note shows it."""
+    var asked_amount: G1Amount
+    """With `strip_amount`, the first action's amount (`g1_first_amount`)."""
     var dest_ms: Float64
     """`request_wording`: how long the first request of the current decision
     took, 0 when it was the only one. Shown in the decision's note."""
@@ -767,6 +779,7 @@ struct G1VoiceLoopOf[
         self.asked = String("")
         self.asked_cmd = String("")
         self.asked_cut = String("")
+        self.asked_amount = G1Amount.none()
         self.dest_ms = 0.0
         self.dest_tok = 0
         self.then_decide = False
@@ -872,6 +885,7 @@ struct G1VoiceLoopOf[
         self.asked = move.asked^
         self.asked_cmd = move.asked_cmd^
         self.asked_cut = move.asked_cut^
+        self.asked_amount = move.asked_amount^
         self.dest_ms = move.dest_ms
         self.dest_tok = move.dest_tok
         self.then_decide = move.then_decide
@@ -1980,7 +1994,9 @@ struct G1VoiceLoopOf[
         self.asked = g1_command_state(text, ctx)
         self.asked_cmd = self.asked
         self.asked_cut = String("")
+        self.asked_amount = G1Amount.none()
         if self.cfg.strip_amount:
+            self.asked_amount = g1_first_amount(text)
             var cut = g1_strip_amount(text)
             if cut != text:
                 self.asked_cmd = g1_command_state(cut, ctx)
@@ -2344,6 +2360,7 @@ struct G1VoiceLoopOf[
                 ev.kind = VL_COMMAND
                 ev.name = self.pick.name
                 ev.extent = ans.score(String(G1_Q_EXTENT))
+                ev.amount = self.asked_amount.copy()
                 if self.cfg.chain:
                     var rest = g1_decide_chain(ans, bank)
                     for si in range(len(rest)):
@@ -2354,6 +2371,8 @@ struct G1VoiceLoopOf[
                              + _vl_f2(self.pick.p_none) + String("  world ")
                              + _vl_f2(self.pick.needs_world)
                              + (String("  on '") + self.asked_cut + String("'") if self.asked_cut != "" else String(""))
+                             + (String("  amount ") + _vl_f2(self.asked_amount.value) + String(" ")
+                                + self.asked_amount.unit if self.asked_amount.found() else String(""))
                              + self._jev_ms(ans.latency_ms, ans.input_tokens))
             elif self.pick.talk and self.replied:
                 # `talk_first`: the reply is out already, and one is enough

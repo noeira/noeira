@@ -61,7 +61,7 @@ almost nothing — that is the shape of its cost model.
 from noeira.ai.jev import JevQuestions, JevAnswers
 from noeira.envs.robots.g1_command_bank import G1CommandBank
 from noeira.io.json import JsonWriter
-from noeira.text.pyre import PyRe
+from noeira.text.pyre import PyRe, py_lower, py_isword, decimal_value
 
 comptime G1_Q_COMMAND: String = "command"
 # ⚠ THREE COMMANDS IN ONE CALL. Jev answers every question against the same
@@ -1530,6 +1530,309 @@ def g1_strip_amount(said: String) raises -> String:
                 c = 0x178
         out += String(Codepoint(unsafe_unchecked_codepoint=c))
     return out^
+
+
+# ── the amount itself: value and unit, by code ─────────────────────────────
+#
+# ⚠ THE AMOUNT COMES FROM CODE, NOT FROM d1. On 60 held-out commands with an
+# amount (docs/NN_MODEL_PORTS_PLAN.md §12.9.7), `g1_first_amount` read 58 right
+# (every metre and second; the 2 misses are angles whose unit the transcript
+# dropped), d1's text read alone also 58 but it invented one ("a few" steps),
+# and today's `extent` level 18 of 44. Together with the command chosen on the
+# cut sentence that took "the right command for the right amount" from 3 / 60
+# to 25 / 60.
+#
+# `g1_parse_amount` is the bench's `parse_amount` (`extent_score.py`)
+# transcribed, its patterns verbatim; `g1_first_amount` its `find_amount` plus
+# the clause split (an amount after "puis" / "then" belongs to a later action:
+# without the split, all 8 such sentences had their later amount given to the
+# first action).
+
+comptime _G1_NUM_WORDS: List[String] = [
+    "one hundred and eighty", "a hundred and eighty", "cent-quatre-vingts", "cent quatre-vingts",
+    "one hundred eighty", "quatre-vingt-dix", "quatre-vingts", "quarante-cinq", "quatre-vingt", "forty-five",
+    "cinquante", "thirteen", "quatorze", "fourteen", "quarante", "soixante", "fifteen", "sixteen", "hundred",
+    "quatre", "eleven", "twelve", "treize", "quinze", "twenty", "trente", "thirty", "ninety", "eighty", "trois",
+    "three", "seven", "eight", "douze", "seize", "vingt", "forty", "fifty", "sixty", "zéro", "zero", "deux",
+    "four", "cinq", "five", "sept", "huit", "neuf", "nine", "onze", "cent", "une", "one", "two", "six", "dix",
+    "ten", "un", "an", "a",
+]
+"""The bench's `WORDS`, in the order it tries them (`sorted(WORDS, key=len, reverse=True)`)."""
+comptime _G1_NUM_VALUES: List[Int] = [
+    180, 180, 180, 180, 180, 90, 80, 45, 80, 45, 50, 13, 14, 14, 40, 60, 15, 16, 100, 4, 11, 12, 13, 15, 20,
+    30, 30, 90, 80, 3, 3, 7, 8, 12, 16, 20, 40, 50, 60, 0, 0, 2, 4, 5, 5, 7, 8, 9, 9, 11, 100, 1, 1, 2, 6,
+    10, 10, 1, 1, 1,
+]
+comptime _G1_UNIT_PATTERNS: List[String] = [
+    "centim[eè]tres?|centimeters?|cm", "m[eè]tres?|metres?|meters?|m", "secondes?|seconds?|secs?|s",
+    "minutes?|mins?", "degr[eé]s?|degrees?|°", "heures?|hours?|h", "pas|steps?",
+]
+comptime _G1_UNIT_NAMES: List[String] = ["m", "m", "s", "s", "deg", "s", "steps"]
+comptime _G1_UNIT_FACTORS: List[Float64] = [0.01, 1.0, 1.0, 60.0, 1.0, 3600.0, 1.0]
+
+comptime G1_AMOUNT_MAX_M: Float64 = 10.0
+"""The longest distance an amount may ask for: `extent`'s own top level (ten metres); a longer one is cut
+to it. The robot integrates its distance from its commanded speed, with no odometry."""
+comptime G1_AMOUNT_MIN_M: Float64 = 0.1
+comptime G1_AMOUNT_MAX_S: Float64 = 12.0
+"""The longest duration: `extent`'s top level (twelve seconds)."""
+comptime G1_AMOUNT_MIN_S: Float64 = 0.5
+
+
+struct G1Amount(Copyable, Movable):
+    """An amount: `value` in `unit` ("m", "s", "deg" or "steps"; "" = none), and where it was found in the
+    sentence (`start`, `end` in code points; -1 when it came from a span alone)."""
+
+    var value: Float64
+    var unit: String
+    var start: Int
+    var end: Int
+
+    def __init__(out self, value: Float64, var unit: String, start: Int, end: Int):
+        self.value = value
+        self.unit = unit^
+        self.start = start
+        self.end = end
+
+    @staticmethod
+    def none() -> G1Amount:
+        return G1Amount(0.0, String(""), -1, -1)
+
+    def found(self) -> Bool:
+        return self.unit != ""
+
+
+def _g1_lower_cps(s: String) -> List[UInt32]:
+    """`s.lower()`, one character to one (`py_lower`)."""
+    var out = List[UInt32](capacity=s.byte_length())
+    for c in s.codepoints():
+        out.append(py_lower(c.to_u32()))
+    return out^
+
+
+def _g1_sub(t: List[UInt32], a: Int, b: Int) -> List[UInt32]:
+    var out = List[UInt32](capacity=max(0, b - a))
+    for i in range(max(a, 0), min(b, len(t))):
+        out.append(t[i])
+    return out^
+
+
+def _g1_text(t: List[UInt32]) -> String:
+    var out = String("")
+    for c in t:
+        out += String(Codepoint(unsafe_unchecked_codepoint=c))
+    return out^
+
+
+def _g1_eq_at(t: List[UInt32], i: Int, w: List[UInt32]) -> Bool:
+    if i < 0 or i + len(w) > len(t):
+        return False
+    for k in range(len(w)):
+        if t[i + k] != w[k]:
+            return False
+    return True
+
+
+def _g1_word_edge(t: List[UInt32], i: Int) -> Bool:
+    """A word character or "-" at `i` (the bench's word guard); False outside the text."""
+    if i < 0 or i >= len(t):
+        return False
+    return py_isword(t[i]) or t[i] == 45
+
+
+def _g1_decimal(t: List[UInt32], a: Int, b: Int) -> Float64:
+    """`float(text.replace(",", "."))` of a run of digits with an optional decimal point or comma."""
+    var whole = 0.0
+    var frac = 0.0
+    var scale = 1.0
+    var after = False
+    for i in range(a, b):
+        var c = t[i]
+        if c == 44 or c == 46:
+            after = True
+        elif after:
+            scale /= 10.0
+            frac += Float64(decimal_value(c)) * scale
+        else:
+            whole = whole * 10.0 + Float64(decimal_value(c))
+    return whole + frac
+
+
+def _g1_number(t: List[UInt32]) raises -> Tuple[Float64, Int, Int]:
+    """The bench's `_number` on lower-cased text: the first number written in digits or as a word
+    (the earliest start; digits first, then the longer word), (0, -1, -1) when there is none."""
+    var best_v = 0.0
+    var best_s = -1
+    var best_e = -1
+    var m = PyRe.compile(String("\\d+(?:[.,]\\d+)?")).search(t)
+    if m:
+        best_v = _g1_decimal(t, m.value().start(), m.value().end())
+        best_s = m.value().start()
+        best_e = m.value().end()
+    var words = materialize[_G1_NUM_WORDS]()
+    var values = materialize[_G1_NUM_VALUES]()
+    for wi in range(len(words)):
+        var w = List[UInt32]()
+        for c in words[wi].codepoints():
+            w.append(c.to_u32())
+        # the bench's re.finditer over the word guarded on both sides: its first match only
+        for i in range(len(t) - len(w) + 1):
+            if _g1_eq_at(t, i, w) and not _g1_word_edge(t, i - 1) and not _g1_word_edge(t, i + len(w)):
+                if best_s < 0 or i < best_s:
+                    best_v = Float64(values[wi])
+                    best_s = i
+                    best_e = i + len(w)
+                break
+    return (best_v, best_s, best_e)
+
+
+def _g1_unit_re() raises -> PyRe:
+    var alts = String("")
+    var pats = materialize[_G1_UNIT_PATTERNS]()
+    for i in range(len(pats)):
+        alts += ("|" if i > 0 else "") + pats[i]
+    return PyRe.compile(String("(?<![\\w])(") + alts + String(")(?![\\w])"), ignorecase=True)
+
+
+def _g1_strip_set(t: List[UInt32]) -> List[UInt32]:
+    """`.strip(" ,.")`."""
+    var a = 0
+    var b = len(t)
+    while a < b and (t[a] == 32 or t[a] == 44 or t[a] == 46):
+        a += 1
+    while b > a and (t[b - 1] == 32 or t[b - 1] == 44 or t[b - 1] == 46):
+        b -= 1
+    return _g1_sub(t, a, b)
+
+
+def g1_parse_amount(span: String, said: String) raises -> G1Amount:
+    """The value and unit of an amount's text (the bench's `parse_amount`): the first number (digits, a
+    decimal comma, a French or English number word, "half a" / "une demi-"), then the unit after it in
+    the span, or else in the words right after the span in `said`; "et demi" / "and a half" adds a half,
+    "1 mètre 50" / "un mètre cinquante" the centimetres; centimetres, minutes and hours converted.
+    `G1Amount.none()` when there is no number or no unit: "un peu", "3", "a few" are no amount."""
+    if span.byte_length() == 0:
+        return G1Amount.none()
+    var s = _g1_lower_cps(span)
+    var hb = PyRe.compile(String("\\b(half an?|une demi-|demi-)")).search(s)
+    # s.replace("demi-", "demi ")
+    var s2 = s.copy()
+    var demi: List[UInt32] = [100, 101, 109, 105, 45]
+    var i = 0
+    while i + 5 <= len(s2):
+        if _g1_eq_at(s2, i, demi):
+            s2[i + 4] = 32
+            i += 5
+        else:
+            i += 1
+    var n = _g1_number(s2)
+    var value = n[0]
+    var n_s = n[1]
+    var n_e = n[2]
+    if n_s < 0:
+        if not hb:
+            return G1Amount.none()
+        value = 0.5
+        n_s = hb.value().start()
+        n_e = hb.value().end()
+    if hb and value == 1.0:
+        var w = _g1_text(_g1_sub(s, n_s, n_e))
+        if w == "a" or w == "an" or w == "une":
+            value = 0.5
+    var rest = _g1_sub(s, n_e, len(s))
+    var unit_re = _g1_unit_re()
+    var um = unit_re.search(rest)
+    var word: List[UInt32]
+    var tail = List[UInt32]()
+    if um:
+        word = _g1_sub(rest, um.value().start(1), um.value().end(1))
+        tail = _g1_sub(rest, um.value().end(), len(rest))
+    else:
+        var low = _g1_lower_cps(said)
+        var at = -1
+        for k in range(len(low) - len(s) + 1):
+            if _g1_eq_at(low, k, s):
+                at = k
+                break
+        var after = _g1_strip_set(_g1_sub(low, at + len(s), len(low))) if at >= 0 else List[UInt32]()
+        var um2 = unit_re.match(after)
+        if not um2:
+            return G1Amount.none()
+        word = _g1_sub(after, um2.value().start(1), um2.value().end(1))
+    var unit = String("")
+    var factor = 1.0
+    var pats = materialize[_G1_UNIT_PATTERNS]()
+    var names = materialize[_G1_UNIT_NAMES]()
+    var factors = materialize[_G1_UNIT_FACTORS]()
+    for k in range(len(pats)):
+        if PyRe.compile(pats[k], ignorecase=True).fullmatch(word):
+            unit = names[k]
+            factor = factors[k]
+            break
+    if unit == "":
+        return G1Amount.none()
+    if PyRe.compile(String("\\b(et demie?|and a half)\\b")).search(s):
+        value += 0.5
+    elif unit == "m" and factor == 1.0:
+        var cm = PyRe.compile(String("\\s*(\\d{2})\\b")).match(tail)
+        if cm:
+            value += _g1_decimal(tail, cm.value().start(1), cm.value().end(1)) / 100.0
+        else:
+            var wm = PyRe.compile(String("\\s*(cinquante|fifty|vingt|twenty|trente|thirty)\\b")).match(tail)
+            if wm:
+                var tw = _g1_text(_g1_sub(tail, wm.value().start(1), wm.value().end(1)))
+                value += (50.0 if tw == "cinquante" or tw == "fifty" else 20.0 if tw == "vingt" or tw == "twenty"
+                          else 30.0) / 100.0
+    return G1Amount(value * factor, unit^, -1, -1)
+
+
+def g1_first_amount(said: String) raises -> G1Amount:
+    """The amount of the sentence's FIRST action, by code: the first amount `G1_AMOUNT_PATTERN` finds,
+    parsed by `g1_parse_amount`, unless it comes after the first "puis" / "ensuite" / "then" / "after that"
+    / "et après" (a later action's: "Tourne à gauche, puis avance de 3 mètres." gives none)."""
+    var t = _g1_cps(said)
+    var m = PyRe.compile(String(G1_AMOUNT_PATTERN), ignorecase=True).search(t)
+    if not m:
+        return G1Amount.none()
+    var a = g1_parse_amount(_g1_text(_g1_sub(t, m.value().start(), m.value().end())), said)
+    if not a.found():
+        return G1Amount.none()
+    var sep = PyRe.compile(String("\\b(puis|ensuite|then|after that|et après)\\b"), ignorecase=True).search(t)
+    if sep and m.value().start() >= sep.value().start():
+        return G1Amount.none()
+    a.start = m.value().start()
+    a.end = m.value().end()
+    return a^
+
+
+def _g1_level_of_metres(d: Float64) -> Float64:
+    """The `extent` level whose `g1_extent_metres` is `d` (the inverse of its table)."""
+    var a: List[Float64] = [0.5, 1.0, 2.0, 5.0, 10.0]
+    if d <= a[0]:
+        return 0.0
+    for i in range(4):
+        if d <= a[i + 1]:
+            return Float64(i) + (d - a[i]) / (a[i + 1] - a[i])
+    return 4.0
+
+
+def g1_step_end(locomotion: Bool, extent: Float64, ref amount: G1Amount) -> Tuple[Float64, Float64]:
+    """How a command's first step ends: (metres, 0 = not distance-terminated; seconds on the clock).
+
+    - locomotion, an amount in metres: that distance (clamped to `G1_AMOUNT_MIN_M`..`_MAX_M`), and the
+      clock `extent` would give that distance (its seconds x 3 + 4) so a blocked robot still ends;
+    - an amount in seconds: that duration on the clock alone, for any command ("Avance pendant 5
+      secondes.", "Lève le bras droit pendant 4 secondes."), clamped to `G1_AMOUNT_MIN_S`..`_MAX_S`;
+    - otherwise (no amount, degrees, steps, metres for a non-locomotion row): the `extent` level, as
+      before. ⚠ Degrees are not used: a spin has no rule from degrees to its time yet."""
+    if amount.unit == "s":
+        return (0.0, min(max(amount.value, G1_AMOUNT_MIN_S), G1_AMOUNT_MAX_S))
+    if locomotion:
+        if amount.unit == "m":
+            var d = min(max(amount.value, G1_AMOUNT_MIN_M), G1_AMOUNT_MAX_M)
+            return (d, g1_extent_seconds(_g1_level_of_metres(d)) * 3.0 + 4.0)
+        return (g1_extent_metres(extent), g1_extent_seconds(extent) * 3.0 + 4.0)
+    return (0.0, g1_extent_seconds(extent))
 
 
 def g1_decide_chain(

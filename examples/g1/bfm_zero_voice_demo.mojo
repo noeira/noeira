@@ -47,6 +47,17 @@ which is what "the robot stays in its pose" means for `squat` or `arms_wide`.
 But `walk` walks for ever. Commands in the `locomotion` group therefore
 return to `stand` after `--walk-seconds`. The bank carries a `group` per
 entry, which is what that field is for.
+
+## The amount said ("Avance de 3 mètres") is taken by code
+
+By default the command is chosen on the sentence without its amount
+("Avance."), and the first action's amount is read by code
+(`g1_first_amount`): a walk then ends after 3 m, "pendant 5 secondes" after
+5 s, clamped to 10 m / 12 s. Without an amount, or with degrees (a spin has no
+rule from degrees to its time yet), the `extent` level decides as before. On
+60 held-out commands with an amount this took the right command with the right
+amount from 3 to 25 (docs/NN_MODEL_PORTS_PLAN.md §12.9.7). `--whole-sentence`
+goes back to the whole sentence and `extent` alone.
 """
 
 from std.math import abs
@@ -106,7 +117,7 @@ from noeira.envs.robots.g1_spec import (
 from noeira.envs.robots.g1_reward_vocab import G1Term
 from noeira.envs.robots.g1_command_language import (
     g1_command_questions, g1_decide, G1LangPick, g1_command_phrase,
-    g1_decide_chain, g1_extent_metres, g1_extent_seconds, G1_Q_EXTENT,
+    g1_decide_chain, G1_Q_EXTENT, g1_step_end,
     G1Context, g1_command_state, g1_since_word,
 )
 from noeira.ai.chat import ChatClient, ChatMessage, ToolSpec
@@ -486,10 +497,12 @@ def main() raises:
     vcfg.cand_path = cand_path
     vcfg.mic_dev = mic_dev
     vcfg.llm_spec = llm_spec
-    # `--strip-amount`: the command is chosen on the sentence without its
-    # amount ("Avance de 3 mètres." -> "Avance."), which d1 otherwise refuses
-    # (G1VoiceConfig.strip_amount, docs/NN_MODEL_PORTS_PLAN.md §12.9.5)
-    vcfg.strip_amount = _has(String("--strip-amount"))
+    # ON BY DEFAULT: the command is chosen on the sentence without its amount
+    # ("Avance de 3 mètres." -> "Avance.", which d1 otherwise refuses) and the
+    # amount is read by code (G1VoiceConfig.strip_amount; 3 -> 25 of 60 held-out
+    # commands with an amount run right, docs/NN_MODEL_PORTS_PLAN.md §12.9.7).
+    # `--whole-sentence`: the whole sentence and `extent`, as before.
+    vcfg.strip_amount = not _has(String("--whole-sentence"))
     # ⚠ THE VOCABULARY IS SENT ONLY TO A BACKEND THAT TAKES ONE, and the loop
     # decides — HF's Whisper accepts a prompt as token ids, never text, and
     # the client RAISES on one. Passing it unconditionally is what made this
@@ -651,18 +664,19 @@ def main() raises:
                 pending_blend = 25
                 last_event = String("voice: ") + ev.name
                 t_cmd = perf_counter_ns()
-                # the first step's extent comes from the utterance
+                # the first step's end comes from the utterance: the amount
+                # said (by code) when there is one, else the `extent` level.
+                # ⚠ For locomotion, a CLOCK AS WELL as the distance: a robot
+                # that is blocked, or walking on the spot, would never reach
+                # its distance and the chain would hang for ever.
                 extent = ev.extent
                 step_dist = 0.0
-                if bank.group_at(idx2) == "locomotion":
-                    step_end_dist = g1_extent_metres(extent)
-                    # ⚠ AND A CLOCK AS WELL. A robot that is blocked, or
-                    # walking on the spot, would never reach its distance and
-                    # the chain would hang for ever.
-                    step_end_at = perf_counter_ns() + _ns(g1_extent_seconds(extent) * 3.0 + 4.0)
-                else:
-                    step_end_dist = 0.0
-                    step_end_at = perf_counter_ns() + _ns(g1_extent_seconds(extent))
+                var se = g1_step_end(bank.group_at(idx2) == "locomotion", extent, ev.amount)
+                step_end_dist = se[0]
+                step_end_at = perf_counter_ns() + _ns(se[1])
+                if ev.amount.found():
+                    print("  [amount]", _f2(ev.amount.value), ev.amount.unit, "->",
+                          (_f2(se[0]) + " m") if se[0] > 0.0 else (_f2(se[1]) + " s"))
                 q_name = List[String]()
                 q_conf = List[Float64]()
                 for si in range(len(ev.chain)):
