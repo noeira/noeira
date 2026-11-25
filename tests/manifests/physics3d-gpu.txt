@@ -57,6 +57,5 @@ tests/physics3d/test_lane_dr_gpu.mojo
 # bit for bit, and a batched env's own step (HalfCheetah). Metal and NVIDIA.
 tests/physics3d/test_xfrc_gpu.mojo
 # The same on the batched G1 — NVIDIA ONLY (prints SKIP elsewhere: the batched
-# G1 does not build for Metal). Written 2026-11-25 and NOT RUN YET: read the
-# printed values before trusting its bars.
+# G1 does not build for Metal). 18 of 18 on an RTX 5090, 2026-11-25.
 tests/physics3d/test_xfrc_g1_gpu.mojo

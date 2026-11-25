@@ -31,13 +31,16 @@ Not measured here: a device `XFRC=True` build with an all-zero buffer against
 a device `XFRC=False` build (it would compile a second G1 env; the float64
 gate measures it for the same function, and [3] measures the skip per lane).
 
-NVIDIA ONLY, and NOT RUN YET (2026-11-25): the batched G1 does not build for
-Metal (its action hook computes in float64), so this prints SKIP on Apple, as
-`test_supermimic_env_gpu` does. On the Mac it type-checks and lowers up to
-Metal's IR verifier, which then refuses that hook; no value below has been
-read. The same four questions on Metal, on other models:
-`tests/physics3d/test_xfrc_gpu.mojo`. Read the printed values before
-trusting the bars.
+NVIDIA ONLY: the batched G1 does not build for Metal (its action hook
+computes in float64), so this prints SKIP on Apple, as
+`test_supermimic_env_gpu` does. The same four questions on Metal, on other
+models: `tests/physics3d/test_xfrc_gpu.mojo`.
+
+First run 2026-11-25, RTX 5090 (driver 580.178.04), 18 of 18. Device vs CPU
+with the wrenches 8e-07 to 7e-06, without 2e-07 to 4e-06, for an effect of
+0.98 (1 step) and 4.9 (5 steps); the tightest row is the floor leg's lane 0
+at 5 steps, 5.4e-06 under the 1e-05 floor of its bar, 8 times its no-wrench
+6.6e-07.
 
 Run: pixi run -e nvidia mojo run -I . tests/physics3d/test_xfrc_g1_gpu.mojo
 """
