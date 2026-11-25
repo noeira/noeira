@@ -118,6 +118,13 @@ struct Data[
     # none. Read ONLY by an integrator built with `XFRC=True`
     # (`dynamics/xfrc.mojo`); the caller owns its contents, no reset clears it.
     var xfrc_applied: TensorImpl[Self.DTYPE]  # [BATCH, NBODY*6]
+    # A PER-LANE MASS for free bodies (`dynamics/lane_mass.mojo`): the scale of
+    # each body's mass in each lane (0 = the model's), and the model's
+    # `body_invweight0` held once per lane, the scaled bodies' rows over their
+    # scale. Read ONLY by an integrator built with `LANE_MASS=True`, after
+    # `lane_mass_reset` has filled the weights.
+    var lane_mass: TensorImpl[Self.DTYPE]  # [BATCH, NBODY]
+    var lane_body_invweight0: TensorImpl[Self.DTYPE]  # [BATCH*NBODY, 2]
     # World space (FK products)
     var xpos: TensorImpl[Self.DTYPE]  # [BATCH, NBODY*3]
     var xquat: TensorImpl[Self.DTYPE]  # [BATCH, NBODY*4]
@@ -333,6 +340,8 @@ struct Data[
         self.actdamp_act = TensorImpl[Self.DTYPE].alloc(_nact_alloc)
         self.lane_dr = TensorImpl[Self.DTYPE].alloc(B * dims.get_nbody() * 4)
         self.xfrc_applied = TensorImpl[Self.DTYPE].alloc(B * dims.get_nbody() * 6)
+        self.lane_mass = TensorImpl[Self.DTYPE].alloc(B * dims.get_nbody())
+        self.lane_body_invweight0 = TensorImpl[Self.DTYPE].alloc(B * dims.get_nbody() * 2)
         self.xpos = TensorImpl[Self.DTYPE].alloc(B * dims.get_nbody() * 3)
         self.xquat = TensorImpl[Self.DTYPE].alloc(B * dims.get_nbody() * 4)
         self.xipos = TensorImpl[Self.DTYPE].alloc(B * dims.get_nbody() * 3)
@@ -436,6 +445,8 @@ struct Data[
         self.actdamp_act.upload(ctx)
         self.lane_dr.upload(ctx)
         self.xfrc_applied.upload(ctx)
+        self.lane_mass.upload(ctx)
+        self.lane_body_invweight0.upload(ctx)
         self.xpos.upload(ctx)
         self.xquat.upload(ctx)
         self.xipos.upload(ctx)

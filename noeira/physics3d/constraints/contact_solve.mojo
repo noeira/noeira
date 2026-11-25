@@ -380,6 +380,10 @@ def _precompute_contact_normal[
     # reads them (the Newton and CG take `R` from `diag_n` as MuJoCo does).
     MINV_J: Bool = True,
     JM_CAP: Int = 1,
+    # `body_invweight0` holds every lane's rows, lane `env`'s from row
+    # `env * nbody` (`dynamics/lane_mass.mojo`: a per-lane mass changes a
+    # body's solver weight). Off: the model's table, as it always was.
+    BW_LANES: Bool = False,
 ](
     env: Int,
     contact_tid: Int,
@@ -621,10 +625,13 @@ def _precompute_contact_normal[
             # MuJoCo: R = (1-imp)/imp * diagApprox, inv_K_imp = 1/(K + R)
             # diagApprox = body_invweight0[2*body_a] + body_invweight0[2*body_b]
             var diag_n: Scalar[DTYPE] = 0
+            var bw_row0 = 0
+            comptime if BW_LANES:
+                bw_row0 = env * nbody
             if body > 0 and body < nbody:
-                diag_n += rebind[Scalar[DTYPE]](body_invweight0[body, 0])
+                diag_n += rebind[Scalar[DTYPE]](body_invweight0[bw_row0 + body, 0])
             if body_b > 0 and body_b < nbody:
-                diag_n += rebind[Scalar[DTYPE]](body_invweight0[body_b, 0])
+                diag_n += rebind[Scalar[DTYPE]](body_invweight0[bw_row0 + body_b, 0])
             if diag_n < Scalar[DTYPE](1e-10):
                 diag_n = rebind[Scalar[DTYPE]](k)  # Fallback to exact K
             var R_n = (Scalar[DTYPE](1.0) - imp) / imp * diag_n

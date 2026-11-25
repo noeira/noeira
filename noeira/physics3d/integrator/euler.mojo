@@ -69,6 +69,7 @@ from ..dynamics.rne_post import compute_rne_post
 from ..dynamics.fluid_forces import compute_fluid_forces
 from ..dynamics.gravcomp import compute_gravcomp_forces
 from ..dynamics.xfrc import compute_xfrc_forces
+from ..dynamics.lane_mass import apply_lane_mass_M, apply_lane_mass_bias
 from ..joint_types import JNT_FREE, JNT_BALL, JNT_HINGE, JNT_SLIDE
 from ..fields import (
     Data,
@@ -783,12 +784,16 @@ struct EulerIntegrator[
     NOSLIP_ITER: Int = 0,
     LANE_DR: Bool = False,
     XFRC: Bool = False,
+    LANE_MASS: Bool = False,
 ](Movable):
     """Owns its scratch; steps contact-free dynamics on either target. See
     module docstring for what is deliberately not yet ported.
     XFRC=True: each lane's external wrenches by body in `Data.xfrc_applied`
     (MuJoCo's `xfrc_applied`, `dynamics/xfrc.mojo`) are added to the smooth
     force. Refused with RNE_POST, which does not read them.
+    LANE_MASS=True: each lane's own mass for free bodies (`Data.lane_mass`,
+    `dynamics/lane_mass.mojo`): their block of the mass matrix, their bias
+    forces and their solver weight. Newton solver only; refused with RNE_POST.
     LANE_DR=True: each lane's per-body overrides in `Data.lane_dr`
     (`constraints/lane_dr.mojo`): contact friction after detection, the
     CoM offset in FK and body velocities.
@@ -952,6 +957,16 @@ struct EulerIntegrator[
             _e_cdof += _e_now - _e_last
             _e_last = _e_now
         compute_mass_matrix[target, Self.DTYPE, BATCH=Self.BATCH, PARALLEL = Self.PARALLEL_GPU, TREEWALK = Self.CRBA_TREEWALK](d, m, self.scratch, ctx)
+        # LANE_MASS: each lane's scale on its free bodies' blocks, on the
+        # composite inertia alone (before the armature, which is not mass).
+        comptime if Self.LANE_MASS:
+            comptime assert Self.SOLVER == "newton", (
+                "LANE_MASS: only the Newton solver reads the per-lane solver weights"
+            )
+            comptime assert not Self.RNE_POST, (
+                "LANE_MASS with RNE_POST: `compute_rne_post` reads the model's mass"
+            )
+            apply_lane_mass_M[target, Self.DTYPE, BATCH=Self.BATCH](d, m, self.scratch, ctx)
         comptime if _EULER_PROBE:
             var _e_now = Int(perf_counter_ns())
             _e_crba += _e_now - _e_last
@@ -1028,6 +1043,8 @@ struct EulerIntegrator[
             _e_minv += _e_now - _e_last
             _e_last = _e_now
         compute_bias_forces_rne[target, Self.DTYPE, BATCH=Self.BATCH, PARALLEL = Self.PARALLEL_GPU](d, m, self.scratch, ctx)
+        comptime if Self.LANE_MASS:
+            apply_lane_mass_bias[target, Self.DTYPE, BATCH=Self.BATCH](d, m, self.scratch, ctx)
         comptime if _EULER_PROBE:
             var _e_now = Int(perf_counter_ns())
             _e_rne += _e_now - _e_last
@@ -1145,7 +1162,7 @@ struct EulerIntegrator[
                 " or 'island'"
             )
             comptime if Self.SOLVER == "newton":
-                solve_newton[target, Self.DTYPE, CONE_TYPE=Self.CONE_TYPE, BATCH=Self.BATCH, MAX_CONDIM=Self.MAX_CONDIM, NOSLIP_ITER=Self.NOSLIP_ITER, JE_WS=Self.JE_WS](d, m, self.scratch, self.cscratch, ctx)
+                solve_newton[target, Self.DTYPE, CONE_TYPE=Self.CONE_TYPE, BATCH=Self.BATCH, MAX_CONDIM=Self.MAX_CONDIM, NOSLIP_ITER=Self.NOSLIP_ITER, JE_WS=Self.JE_WS, LANE_MASS=Self.LANE_MASS](d, m, self.scratch, self.cscratch, ctx)
             else:
                 comptime if Self.SOLVER == "cg":
                     solve_cg[target, Self.DTYPE, CONE_TYPE=Self.CONE_TYPE, BATCH=Self.BATCH](d, m, self.scratch, self.cscratch, ctx)

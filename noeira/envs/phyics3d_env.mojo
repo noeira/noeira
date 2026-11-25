@@ -55,6 +55,7 @@ from noeira.physics3d.joint_types import JNT_FREE
 from noeira.physics3d.integrator.rk4 import RK4Integrator
 from noeira.physics3d.integrator.euler import EulerIntegrator
 from noeira.physics3d.dynamics.xfrc import XFRC_STRIDE, xfrc_at_point
+from noeira.physics3d.dynamics.lane_mass import lane_mass_reset, set_lane_mass_scale
 from noeira.physics3d.gpu.constants import (
     MODEL_META_IDX_CTRL_MIN,
     MODEL_META_IDX_CTRL_MAX,
@@ -83,6 +84,7 @@ struct Phyics3dEnv[
     TERMINATE_ON_UNHEALTHY: Bool = False,
     SOLVER: StaticString = "newton",
     XFRC: Bool = False,
+    LANE_MASS: Bool = False,
 ](BoxContinuousActionEnv, RenderableEnv):
     """Generic MuJoCo env, physics on the per-field tensor path. See module
     docstring for the bridge design and scope.
@@ -91,6 +93,13 @@ struct Phyics3dEnv[
     `d.xfrc_applied`, MuJoCo's `xfrc_applied` (`physics3d/dynamics/xfrc.mojo`;
     `set_xfrc`, `set_xfrc_at_point`). Off by default: every other env compiles
     exactly as before.
+
+    LANE_MASS=True (Euler integrator, Newton solver, not with
+    CONFIG.RNE_POST): the step reads a scale on the mass of free bodies from
+    `d.lane_mass` (`physics3d/dynamics/lane_mass.mojo`; `set_mass_scale`),
+    the code path a batch uses for a per-lane mass. This env is one lane and
+    owns its model, so the model could be edited instead; the flag is here so
+    that the batch's path runs on the CPU. Off by default.
 
     SOLVER defaults to "newton" — the legacy env default physics
     (CONFIG.physics_substep = RK4 + Newton). This facade steps on CPU, so
@@ -168,6 +177,7 @@ struct Phyics3dEnv[
         MAX_CONDIM = Self.MODEL_DEF.MAX_CONDIM,
         NOSLIP_ITER = Self.MODEL_DEF.NOSLIP_ITER,
         XFRC = Self.XFRC,
+        LANE_MASS = Self.LANE_MASS,
     ]
     var integ_rk4: Self.IntegRK4
     var integ_euler: Self.IntegEuler
@@ -266,6 +276,8 @@ struct Phyics3dEnv[
         # grid of ZEROS — a flat terrain that collides and rays perfectly
         # happily and is simply not the surface the model declared.
         init_hfield_data(self.d, self.mf)
+        comptime if Self.LANE_MASS:
+            lane_mass_reset(self.d, self.mf)
         self.integ_rk4 = Self.IntegRK4()
         self.integ_euler = Self.IntegEuler()
 
@@ -466,6 +478,13 @@ struct Phyics3dEnv[
         self.d.xfrc_applied.data[o + 3] = Scalar[Self.dtype](tx)
         self.d.xfrc_applied.data[o + 4] = Scalar[Self.dtype](ty)
         self.d.xfrc_applied.data[o + 5] = Scalar[Self.dtype](tz)
+
+    def set_mass_scale(mut self, body: Int, s: Float64) raises:
+        """`body`'s mass times `s` through the per-lane path
+        (`physics3d/dynamics/lane_mass.mojo`): a free-jointed body without a
+        child; anything else is refused. Acts only in an env built with
+        `LANE_MASS=True`."""
+        set_lane_mass_scale(self.d, self.mf, 0, body, s)
 
     def set_xfrc_at_point(mut self, body: Int, fx: Float64, fy: Float64, fz: Float64, px: Float64, py: Float64, pz: Float64):
         """The world force `f` on `body` at the world point `p`, as the record
@@ -685,6 +704,7 @@ struct Phyics3dEnv[
                     self.integ_euler.step["cpu"](self.d, self.mf)
                 else:
                     comptime assert not Self.XFRC, "XFRC (external wrench) is wired into the Euler integrator only"
+                    comptime assert not Self.LANE_MASS, "LANE_MASS (per-lane mass) is wired into the Euler integrator only"
                     # ⚠ RK4 RE-EVALUATES THE ACTUATORS AT STAGES 1-3, as
                     # `mj_RungeKutta` does — a servo reads the stage's qpos,
                     # a site wrench the stage's orientation. For a `<motor>`

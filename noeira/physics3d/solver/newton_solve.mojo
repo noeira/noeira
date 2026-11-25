@@ -81,7 +81,7 @@ from std.sys import default_accelerator
 from layout import TileTensor, TensorLayout
 from noeira.core.tiles import RowMajor, Tile, shared_tile
 
-from ..types import _max_one, ConeType
+from ..types import _lane_rows, _max_one, ConeType
 from ..joint_types import JNT_HINGE, JNT_SLIDE, JNT_FREE, JNT_BALL
 from ..dynamics.body_joint_map import body_joint_map
 from .cholesky import (
@@ -968,6 +968,9 @@ def _newton_solve_env[
     # pass rather than once per solve, ~4 passes an iteration. That is why
     # this is not the default — CUDA and both CPU legs are untouched.
     JT_PC: Bool = False,
+    # The contact rows read each lane's own `body_invweight0` rows
+    # (`dynamics/lane_mass.mojo`, `_precompute_contact_normal[BW_LANES]`).
+    BW_LANES: Bool = False,
 ](
     env: Int,
     dims: D,
@@ -1218,7 +1221,7 @@ def _newton_solve_env[
     )
     for contact_tid in range(nc):
         _precompute_contact_normal[
-            DTYPE, V_CAP, MINV_J=False, JM_CAP=JM_CAP](
+            DTYPE, V_CAP, MINV_J=False, JM_CAP=JM_CAP, BW_LANES=BW_LANES](
             env,
             contact_tid,
             nc,
@@ -4061,6 +4064,7 @@ def _newton_solve_fields_kernel[
     SOLVER_WS: Int,
     MAX_CONDIM: Int = 3,
     NOSLIP_ITER: Int = 0,
+    BW_LANES: Bool = False,
 ](
     qpos: Tile[DTYPE, BATCH, NQ],
     qvel: Tile[DTYPE, BATCH, NV],
@@ -4077,7 +4081,7 @@ def _newton_solve_fields_kernel[
     tendons: Tile[DTYPE, NTENDON, MODEL_TENDON_SIZE],
     sites: Tile[DTYPE, NSITE, MODEL_SITE_SIZE],
     geoms_w: Tile[DTYPE, NGEOM, MODEL_GEOM_SIZE],
-    body_invweight0: Tile[DTYPE, NBODY, 2],
+    body_invweight0: Tile[DTYPE, _lane_rows[NBODY, BATCH, BW_LANES](), 2],
     dof_invweight0: Tile[DTYPE, NV],
     cdof: Tile[DTYPE, BATCH, NV * 6],
     M: Tile[DTYPE, BATCH, NV * NV],
@@ -4097,7 +4101,7 @@ def _newton_solve_fields_kernel[
         DTYPE,
         CONE_TYPE,
         BATCH,
-        SOLVER_WS, MAX_CONDIM=MAX_CONDIM, NOSLIP_ITER=NOSLIP_ITER,
+        SOLVER_WS, MAX_CONDIM=MAX_CONDIM, NOSLIP_ITER=NOSLIP_ITER, BW_LANES=BW_LANES,
         # ⚠ APPLE ONLY. See `JT_PC` on `_newton_solve_env`: Metal refuses this
         # kernel at condim 4 ("exceeds available stack space") because the
         # all-contact tangent cache is 33.8 KB of a ~91 KB frame. CUDA keeps
@@ -4109,6 +4113,28 @@ def _newton_solve_fields_kernel[
         dof_invweight0, cdof, M, m_inv, ldl_L, ldl_D, dof_parent, qacc_constrained, qacc_warmstart,
         solver, eq_force,
     )
+
+
+def _bw_cpu_view[DTYPE: DType, D: DimsLike, BATCH: Int, LANE_MASS: Bool](
+    mut d: Data[DTYPE, D, BATCH], mut m: Model[DTYPE, D]
+) -> TileTensor[DTYPE, DYN2, MutAnyOrigin]:
+    """The `body_invweight0` the contact rows read on the CPU: the model's
+    `[NBODY, 2]`, or under LANE_MASS every lane's rows, `[BATCH * NBODY, 2]`
+    (`dynamics/lane_mass.mojo`)."""
+    comptime if LANE_MASS:
+        return d.lane_body_invweight0.tt_dyn["cpu", DYN2](rl2(BATCH * d.dims.get_nbody(), 2))
+    else:
+        return m.body_invweight0.tt_dyn["cpu", DYN2](rl2(d.dims.get_nbody(), 2))
+
+
+def _bw_gpu_view[DTYPE: DType, D: DimsLike, BATCH: Int, LANE_MASS: Bool](
+    mut d: Data[DTYPE, D, BATCH], mut m: Model[DTYPE, D]
+) -> Tile[DTYPE, _lane_rows[D.NBODY, BATCH, LANE_MASS](), 2]:
+    """The same on the device."""
+    comptime if LANE_MASS:
+        return d.lane_body_invweight0.tt["gpu", _lane_rows[D.NBODY, BATCH, LANE_MASS](), 2]()
+    else:
+        return m.body_invweight0.tt["gpu", _lane_rows[D.NBODY, BATCH, LANE_MASS](), 2]()
 
 
 def solve_newton[
@@ -4124,6 +4150,9 @@ def solve_newton[
     # from `je_budget.je_ws_size` via the integrator — never computed here.
     JE_WS: Int = 0,
     # Appended, not grouped with NEXCLUDE — see `fields.Model`.
+    # Each lane's own mass for free bodies (`dynamics/lane_mass.mojo`): the
+    # contact rows then read `d.lane_body_invweight0`, not the model's table.
+    LANE_MASS: Bool = False,
 ](
     mut d: Data[DTYPE, D, BATCH],
     mut m: Model[DTYPE, D],
@@ -4213,7 +4242,7 @@ def solve_newton[
         var ten_v = m.tendons.tt_dyn["cpu", DYN2](rl_TEN)
         var site_v = m.sites.tt_dyn["cpu", DYN2](rl_SITE)
         var geomw_v = m.geoms.tt_dyn["cpu", DYN2](rl_GEOM_W)
-        var bw_v = m.body_invweight0.tt_dyn["cpu", DYN2](rl_BW)
+        var bw_v = _bw_cpu_view[LANE_MASS=LANE_MASS](d, m)
         var dw_v = m.dof_invweight0.tt_dyn["cpu", DYN1](rl_DW)
         var cdof_v = scratch.cdof.tt_dyn["cpu", DYN2](rl_CDOF)
         var M_v = scratch.M.tt_dyn["cpu", DYN2](rl_M)
@@ -4233,7 +4262,7 @@ def solve_newton[
                 CONE_TYPE,
                 BATCH,
                 SOLVER_WS, MAX_CONDIM=MAX_CONDIM, NOSLIP_ITER=NOSLIP_ITER,
-                TREE_AWARE=True](
+                TREE_AWARE=True, BW_LANES=LANE_MASS](
                 e, dm, qpos_v, qvel_v, xpos_v, xquat_v, stcom_v, con_v, smeta_v,
                 joints_v, bodies_v, mmeta_v, trees_v, eq_v, ten_v, site_v, geomw_v, bw_v, dw_v,
                 cdof_v, M_v, mi_v, L_v, D_v, P_v, qc_v, qw_v, sol_v, eqf_v,
@@ -4262,7 +4291,7 @@ def solve_newton[
             if (
                 default_accelerator().is_nvidia_gpu() or FORCE_BLOCKED_HERE
             ) and not NEWTON_FORCE_PER_ENV:
-                solve_newton_blocked["gpu", DTYPE, CONE_TYPE=CONE_TYPE, BATCH=BATCH, MAX_CONDIM=MAX_CONDIM, NOSLIP_ITER=NOSLIP_ITER, JE_WS=JE_WS](d, m, scratch, cscratch, ctx)
+                solve_newton_blocked["gpu", DTYPE, CONE_TYPE=CONE_TYPE, BATCH=BATCH, MAX_CONDIM=MAX_CONDIM, NOSLIP_ITER=NOSLIP_ITER, JE_WS=JE_WS, LANE_MASS=LANE_MASS](d, m, scratch, cscratch, ctx)
                 used_blocked = True
         if not used_blocked:
             var c = ctx.value()
@@ -4284,6 +4313,7 @@ def solve_newton[
                     SOLVER_WS,
                     MAX_CONDIM,
                     NOSLIP_ITER,
+                    BW_LANES=LANE_MASS,
                 ]
             ](
                 d.qpos.tt["gpu", BATCH, D.NQ](),
@@ -4301,7 +4331,7 @@ def solve_newton[
                 m.tendons.tt["gpu", D.NTENDON, MODEL_TENDON_SIZE](),
                 m.sites.tt["gpu", D.NSITE, MODEL_SITE_SIZE](),
                 m.geoms.tt["gpu", D.NGEOM, MODEL_GEOM_SIZE](),
-                m.body_invweight0.tt["gpu", D.NBODY, 2](),
+                _bw_gpu_view[LANE_MASS=LANE_MASS](d, m),
                 m.dof_invweight0.tt["gpu", D.NV](),
                 scratch.cdof.tt["gpu", BATCH, D.NV * 6](),
                 scratch.M.tt["gpu", BATCH, D.NV * D.NV](),
@@ -4389,6 +4419,7 @@ def _newton_blocked_fields_kernel[
     # Per-env spill size for `Je`; 0 = it fits threadgroup memory. Comes
     # from `je_budget.je_ws_size` via the integrator — never computed here.
     JE_WS: Int = 0,
+    BW_LANES: Bool = False,
 ](
     qpos: Tile[DTYPE, BATCH, NQ],
     qvel: Tile[DTYPE, BATCH, NV],
@@ -4405,7 +4436,7 @@ def _newton_blocked_fields_kernel[
     tendons: Tile[DTYPE, NTENDON, MODEL_TENDON_SIZE],
     sites: Tile[DTYPE, NSITE, MODEL_SITE_SIZE],
     geoms_w: Tile[DTYPE, NGEOM, MODEL_GEOM_SIZE],
-    body_invweight0: Tile[DTYPE, NBODY, 2],
+    body_invweight0: Tile[DTYPE, _lane_rows[NBODY, BATCH, BW_LANES](), 2],
     dof_invweight0: Tile[DTYPE, NV],
     cdof: Tile[DTYPE, BATCH, NV * 6],
     M: Tile[DTYPE, BATCH, NV * NV],
@@ -4653,7 +4684,7 @@ def _newton_blocked_fields_kernel[
             # solver workspace; the real passes below rewrite the same slots.
             for _r in range(SERIAL_PROBE_REPEAT - 1):
                 _precompute_contact_normal[
-                    DTYPE, V_SIZE, MINV_J=False](
+                    DTYPE, V_SIZE, MINV_J=False, BW_LANES=BW_LANES](
                     env, contact_tid, nc, Dims[nq=NQ, nv=NV, nbody=NBODY, njoint=NJOINT, max_contacts=MAX_CONTACTS, ngeom=NGEOM, nequality=NEQUALITY, ntendon=NTENDON, nsite=NSITE](), qvel, subtree_com, contacts, joints, bodies,
                     mmeta, body_invweight0, cdof, m_inv, qacc_constrained, solver,
                     K_spring, B_damp, si_dmin, si_dmax, si_width, si_midpoint,
@@ -4665,7 +4696,7 @@ def _newton_blocked_fields_kernel[
                     mmeta, cdof, solver, B_damp, impratio, K_spring,
                 )
         _precompute_contact_normal[
-            DTYPE, V_SIZE, MINV_J=False](
+            DTYPE, V_SIZE, MINV_J=False, BW_LANES=BW_LANES](
             env, contact_tid, nc, Dims[nq=NQ, nv=NV, nbody=NBODY, njoint=NJOINT, max_contacts=MAX_CONTACTS, ngeom=NGEOM, nequality=NEQUALITY, ntendon=NTENDON, nsite=NSITE](), qvel, subtree_com, contacts, joints, bodies,
             mmeta, body_invweight0, cdof, m_inv, qacc_constrained, solver,
             K_spring, B_damp, si_dmin, si_dmax, si_width, si_midpoint,
@@ -6975,6 +7006,9 @@ def solve_newton_blocked[
     # from `je_budget.je_ws_size` via the integrator — never computed here.
     JE_WS: Int = 0,
     # Appended, not grouped with NEXCLUDE — see `fields.Model`.
+    # Each lane's own mass for free bodies (`dynamics/lane_mass.mojo`): the
+    # contact rows then read `d.lane_body_invweight0`, not the model's table.
+    LANE_MASS: Bool = False,
 ](
     mut d: Data[DTYPE, D, BATCH],
     mut m: Model[DTYPE, D],
@@ -7082,7 +7116,7 @@ def solve_newton_blocked[
         var ten_v = m.tendons.tt_dyn["cpu", DYN2](rl_TEN)
         var site_v = m.sites.tt_dyn["cpu", DYN2](rl_SITE)
         var geomw_v = m.geoms.tt_dyn["cpu", DYN2](rl_GEOM_W)
-        var bw_v = m.body_invweight0.tt_dyn["cpu", DYN2](rl_BW)
+        var bw_v = _bw_cpu_view[LANE_MASS=LANE_MASS](d, m)
         var dw_v = m.dof_invweight0.tt_dyn["cpu", DYN1](rl_DW)
         var cdof_v = scratch.cdof.tt_dyn["cpu", DYN2](rl_CDOF)
         var M_v = scratch.M.tt_dyn["cpu", DYN2](rl_M)
@@ -7098,7 +7132,7 @@ def solve_newton_blocked[
         )
         for e in range(BATCH):
             _newton_solve_env[
-                DTYPE, CONE_TYPE, BATCH, SOLVER_WS, MAX_CONDIM=MAX_CONDIM, NOSLIP_ITER=NOSLIP_ITER](
+                DTYPE, CONE_TYPE, BATCH, SOLVER_WS, MAX_CONDIM=MAX_CONDIM, NOSLIP_ITER=NOSLIP_ITER, BW_LANES=LANE_MASS](
                 e, dm, qpos_v, qvel_v, xpos_v, xquat_v, stcom_v, con_v, smeta_v,
                 joints_v, bodies_v, mmeta_v, trees_v, eq_v, ten_v, site_v, geomw_v, bw_v, dw_v,
                 cdof_v, M_v, mi_v, L_v, D_v, P_v, qc_v, qw_v, sol_v, eqf_v,
@@ -7112,6 +7146,7 @@ def solve_newton_blocked[
                 MAX_CONDIM,
                 NOSLIP_ITER,
                 JE_WS,
+                BW_LANES=LANE_MASS,
             ]
         ](
             d.qpos.tt["gpu", BATCH, D.NQ](),
@@ -7129,7 +7164,7 @@ def solve_newton_blocked[
             m.tendons.tt["gpu", D.NTENDON, MODEL_TENDON_SIZE](),
             m.sites.tt["gpu", D.NSITE, MODEL_SITE_SIZE](),
                 m.geoms.tt["gpu", D.NGEOM, MODEL_GEOM_SIZE](),
-            m.body_invweight0.tt["gpu", D.NBODY, 2](),
+            _bw_gpu_view[LANE_MASS=LANE_MASS](d, m),
             m.dof_invweight0.tt["gpu", D.NV](),
             scratch.cdof.tt["gpu", BATCH, D.NV * 6](),
             scratch.M.tt["gpu", BATCH, D.NV * D.NV](),

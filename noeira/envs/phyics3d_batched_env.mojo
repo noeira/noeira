@@ -58,6 +58,7 @@ from noeira.physics3d.dynamics.osc_pose_gpu import (
 )
 from noeira.physics3d.integrator.rk4 import RK4Integrator
 from noeira.physics3d.integrator.euler import EulerIntegrator
+from noeira.physics3d.dynamics.lane_mass import lane_mass_reset, sync_lane_mass_weights
 from noeira.physics3d.kinematics.forward_kinematics import (
     forward_kinematics,
     compute_body_velocities,
@@ -127,6 +128,7 @@ struct Phyics3dBatchedEnv[
     CRBA_TREEWALK: Bool = True,
     LANE_DR: Bool = False,
     XFRC: Bool = False,
+    LANE_MASS: Bool = False,
 ](BatchedEnv):
     """GPU-batched MuJoCo env, physics on the per-field tensor path,
     driver IO via the `BatchedEnv` ABI. See module docstring.
@@ -149,7 +151,13 @@ struct Phyics3dBatchedEnv[
     adds `d.xfrc_applied`, MuJoCo's `xfrc_applied` per lane: by body a world
     force at the CoM and a world torque (`physics3d/dynamics/xfrc.mojo`;
     `xfrc_ptr`). The caller owns the buffer: no reset clears it. Off by
-    default, and then never bound."""
+    default, and then never bound.
+
+    LANE_MASS=True (Euler integrator and Newton solver only, not with
+    CONFIG.RNE_POST): each lane holds its own mass for free bodies, a scale
+    in `d.lane_mass` (`physics3d/dynamics/lane_mass.mojo`;
+    `set_lane_mass_scale` on the host, or `lane_mass_ptr` then
+    `sync_lane_mass`). Off by default."""
 
     comptime ENV_TARGET: StaticString = "gpu"
     comptime OBS_DIM: Int = Self.MODEL_DEF.OBS_DIM
@@ -274,6 +282,7 @@ struct Phyics3dBatchedEnv[
         NOSLIP_ITER = Self.MODEL_DEF.NOSLIP_ITER,
         LANE_DR = Self.LANE_DR,
         XFRC = Self.XFRC,
+        LANE_MASS = Self.LANE_MASS,
     ]
     var integ_rk4: Self.IntegRK4
     var integ_euler: Self.IntegEuler
@@ -401,6 +410,9 @@ struct Phyics3dBatchedEnv[
         # no guard — Swimmer runs on this facade.
 
         self.d = type_of(self.d)()
+        # LANE_MASS: every lane's solver weights start as the model's
+        comptime if Self.LANE_MASS:
+            lane_mass_reset(self.d, self.mf)
         self.d.upload_all(ctx)
 
         # ── OSC_POSE staging ──────────────────────────────────────────────
@@ -1439,6 +1451,7 @@ struct Phyics3dBatchedEnv[
             else:
                 comptime assert not Self.LANE_DR, "LANE_DR (per-lane DR) is wired into the Euler integrator only"
                 comptime assert not Self.XFRC, "XFRC (per-lane external wrench) is wired into the Euler integrator only"
+                comptime assert not Self.LANE_MASS, "LANE_MASS (per-lane mass) is wired into the Euler integrator only"
                 self.integ_rk4.step["gpu"](self.d, self.mf, ctx)
         comptime if DEBUG:
             c.synchronize()
@@ -1743,6 +1756,18 @@ struct Phyics3dBatchedEnv[
         only when this env is built with `XFRC=True`; the caller owns its
         contents."""
         return self.d.xfrc_applied.dev.value().unsafe_ptr().as_unsafe_any_origin()
+
+    def lane_mass_ptr(mut self) -> Pointer[Scalar[DT], MutAnyOrigin]:
+        """`Data.lane_mass` on the device, `[N_ENVS, NBODY]`: each lane's
+        scale on each body's mass (0 = the model's), for free bodies without
+        a child (`physics3d/dynamics/lane_mass.mojo`). After writing it on
+        the device, call `sync_lane_mass`. Read by the physics only when this
+        env is built with `LANE_MASS=True`."""
+        return self.d.lane_mass.dev.value().unsafe_ptr().as_unsafe_any_origin()
+
+    def sync_lane_mass(mut self, ctx: DeviceContext) raises:
+        """The lanes' solver weights from the scales now on the device."""
+        sync_lane_mass_weights(self.d, self.mf, ctx)
 
     def action_ptr(self) -> Pointer[Scalar[DT], MutAnyOrigin]:
         return mptr(self._action.unsafe_ptr())

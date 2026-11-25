@@ -18,6 +18,13 @@ def _max_one[n: Int]() -> Int:
     return n if n > 0 else 1
 
 
+@always_inline
+def _lane_rows[n: Int, batch: Int, lanes: Bool]() -> Int:
+    """Rows of a model table of `n` rows when it is held once per lane
+    (`lanes`), or once for the batch."""
+    return n * batch if lanes else n
+
+
 # Equality constraint types (MuJoCo mjtEq subset)
 # ⚠ THESE ARE MuJoCo's `mjtEq` VALUES AND MUST STAY THAT WAY. `EQ_TENDON` was
 # 2 until 2026-08-12, which is `mjEQ_JOINT` in MuJoCo — harmless only because

@@ -58,7 +58,10 @@ from noeira.envs.robots.berkeley_humanoid_lite_pd import (
 from noeira.nn.constants import DT
 from noeira.nn.core.ptr import mptr
 from noeira.envs.robots.unitree_g1_pd import G1_N_DOF, g1_default_pos, g1_effort, g1_kp
-from noeira.physics3d.gpu.constants import MODEL_BODY_SIZE, MODEL_GEOM_SIZE, MODEL_JOINT_SIZE, MODEL_META_IDX_GRAVITY_Z
+from noeira.physics3d.gpu.constants import (
+    BODY_IDX_INV_IXX, BODY_IDX_INV_MASS, BODY_IDX_IXX, BODY_IDX_MASS, MODEL_BODY_SIZE, MODEL_GEOM_SIZE, MODEL_JOINT_SIZE,
+    MODEL_META_IDX_GRAVITY_Z, MODEL_META_IDX_MEANINERTIA,
+)
 from noeira.physics3d.model.model_def import ModelDefLike
 from noeira.physics3d.parser.runtime_load import parse_model_runtime
 
@@ -129,6 +132,22 @@ trait TrackingSim(Movable & Deinitable):
         """The torque the last substep applied at actuated joint j, N·m
         (after the actuator's clip)."""
         raise Error("TrackingSim.joint_torque: this simulator does not report torques")
+
+    def scale_box_mass(mut self, s: Float64, weights: Bool) raises:
+        """The object's mass times `s` (> 0), in THIS simulator's model: its
+        mass and inertia and their inverses, and with `weights` the three
+        model-time quantities a build derives from them: the solver's weights
+        of the object and of its dofs (over `s`), its dofs' `dof_M0`, and the
+        model's mean inertia. Together that is the model built with that mass. Multiplies what the
+        model holds now: twice by 2 is 4. A CPU lane owns its model; a device
+        batch shares one, and takes a per-lane mass another way."""
+        raise Error("TrackingSim.scale_box_mass: this simulator holds no object")
+
+    def set_box_lane_mass(mut self, s: Float64) raises:
+        """The object's mass times `s` through the simulator's per-lane mass
+        (`physics3d/dynamics/lane_mass.mojo`), the path a device batch uses:
+        the model stays as it is. Needs `-D SM_LANE_MASS=1`."""
+        raise Error("TrackingSim.set_box_lane_mass: this simulator takes no per-lane mass")
 
     # The window, for `supermimic_viewer` (forwards to the env's renderer).
     def init_renderer(mut self) raises -> Bool:
@@ -812,7 +831,12 @@ struct G1MjlabRobot(TrackingRobot):
 # (`physics3d/dynamics/xfrc.mojo`), which `set_box_load` writes. Off by default:
 # the types below are then `UnitreeG1MjlabBox`'s, unchanged.
 comptime SM_XFRC: Bool = get_defined_int["SM_XFRC", 0]() != 0
-comptime _G1MjlabBoxCpuEnv = Phyics3dEnv[UnitreeG1MjlabBoxModel, UnitreeG1MjlabConfig, DType.float64, False, XFRC=SM_XFRC]
+# `-D SM_LANE_MASS=1`: they are built with a per-lane mass for the box
+# (`physics3d/dynamics/lane_mass.mojo`), which `set_box_lane_mass` writes.
+comptime SM_LANE_MASS: Bool = get_defined_int["SM_LANE_MASS", 0]() != 0
+comptime _G1MjlabBoxCpuEnv = Phyics3dEnv[
+    UnitreeG1MjlabBoxModel, UnitreeG1MjlabConfig, DType.float64, False, XFRC=SM_XFRC, LANE_MASS=SM_LANE_MASS
+]
 
 
 struct G1MjlabBoxSim(TrackingSim):
@@ -878,6 +902,36 @@ struct G1MjlabBoxSim(TrackingSim):
 
     def joint_torque(self, j: Int) raises -> Float64:
         return Float64(self.env.d.qfrc.data[G1M_ROOT_QVEL + j])
+
+    def set_box_lane_mass(mut self, s: Float64) raises:
+        comptime if SM_LANE_MASS:
+            self.env.set_mass_scale(_G1MjlabBoxCpuEnv.NBODY - 1, s)
+        else:
+            raise Error("G1MjlabBoxSim.set_box_lane_mass: build with -D SM_LANE_MASS=1")
+
+    def scale_box_mass(mut self, s: Float64, weights: Bool) raises:
+        if not s > 0.0:
+            raise Error("G1MjlabBoxSim.scale_box_mass: a scale above 0, got " + String(s))
+        var o = (_G1MjlabBoxCpuEnv.NBODY - 1) * MODEL_BODY_SIZE      # the box is the last body
+        self.env.mf.bodies.data[o + BODY_IDX_MASS] = self.env.mf.bodies.data[o + BODY_IDX_MASS] * s
+        self.env.mf.bodies.data[o + BODY_IDX_INV_MASS] = self.env.mf.bodies.data[o + BODY_IDX_INV_MASS] / s
+        for k in range(3):
+            self.env.mf.bodies.data[o + BODY_IDX_IXX + k] = self.env.mf.bodies.data[o + BODY_IDX_IXX + k] * s
+            self.env.mf.bodies.data[o + BODY_IDX_INV_IXX + k] = self.env.mf.bodies.data[o + BODY_IDX_INV_IXX + k] / s
+        if weights:
+            var b2 = (_G1MjlabBoxCpuEnv.NBODY - 1) * 2
+            self.env.mf.body_invweight0.data[b2] = self.env.mf.body_invweight0.data[b2] / s
+            self.env.mf.body_invweight0.data[b2 + 1] = self.env.mf.body_invweight0.data[b2 + 1] / s
+            for k in range(6):
+                self.env.mf.dof_invweight0.data[G1M_BOX_QVEL + k] = self.env.mf.dof_invweight0.data[G1M_BOX_QVEL + k] / s
+                self.env.mf.dof_M0.data[G1M_BOX_QVEL + k] = self.env.mf.dof_M0.data[G1M_BOX_QVEL + k] * s
+            # `stat.meaninertia`, the mean of the mass matrix's diagonal at qpos0 (the Newton's and the
+            # noslip's convergence scale), summed as the model build sums it
+            var nv = _G1MjlabBoxCpuEnv.NV
+            var sum = 0.0
+            for i in range(nv):
+                sum += Float64(self.env.mf.dof_M0.data[i])
+            self.env.mf.meta.data[MODEL_META_IDX_MEANINERTIA] = sum / Float64(nv)
 
     def qpos(self, i: Int) -> Float64:
         return Float64(self.env.d.qpos.data[i])

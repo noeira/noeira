@@ -39,6 +39,10 @@ tests/physics3d/test_newton_warmstart_vs_mujoco.mojo
 # tests/physics3d/xfrc_reference.py (no mujoco import at run time); the CPU
 # env's accessors.
 tests/physics3d/test_xfrc_vs_mujoco.mojo
+# A per-lane mass for free bodies (LANE_MASS=True) against the same mass in the
+# model, bit for bit, float64, CPU; what the host setter refuses. No MuJoCo
+# at run time (the reference is the model-edited twin).
+tests/physics3d/test_lane_mass.mojo
 # Ray + sensors
 tests/physics3d/test_ray_model_vs_mujoco.mojo
 tests/physics3d/test_rangefinder_vs_mujoco.mojo

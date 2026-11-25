@@ -10,7 +10,7 @@ far the interface's action is from the tracker's own.
     pixi run ./build/sm_obj_trace --ckpt TRACKER.ckpt --store CARRY_50HZ.h5 --object-dir OBJECT_CSV_DIR \\
         --only NAME[,NAME…] --out-dir DIR [--interface INTERFACE.ckpt] [--gain 0.1] [--near 0.6 --far 1.0]
         [--squeeze 40] [--ref-squeeze 0.05] [--ref-lower 1.0] [--trials 8 --seed 0] [--lead-in 50] [--csv OUT.csv]
-        [--box-load KG]
+        [--box-load KG] [--box-mass-scale S --box-mass-weights 1] [--box-lane-mass S]
         [--teacher 1 --ft-squeeze 10 --ft-squeeze-max 60 --ft-mu 0.5 --ft-mass 1 --ft-kp 200 --ft-kd 20 --ft-kr 5 --ft-kw 0.5
          --ft-point 0.11,-0.01,0 --ft-fmax 60 --ft-rel 1 --ft-mmax 1.5
          --ft-kh 300 --ft-hmax 30 --ft-reach-lead 35]
@@ -22,6 +22,14 @@ far the interface's action is from the tracker's own.
     --box-load KG    a constant vertical force on the box, the weight of KG more kilograms (negative: lighter), for
                      the whole run: weight without inertia (`TrackingSim.set_box_load`). Needs a build with
                      `-D SM_XFRC=1`; without it any KG other than 0 raises.
+
+    --box-mass-scale S  the box's mass times S in the simulator's model, set once (`TrackingSim.scale_box_mass`): its
+                     mass and inertia, and with `--box-mass-weights 1` (the default) the solver's weights of the box,
+                     which together are what an asset built with that mass holds; `--box-mass-weights 0` leaves the
+                     weights at the asset's.
+
+    --box-lane-mass S  the box's mass times S through the simulator's per-lane mass (`TrackingSim.set_box_lane_mass`),
+                     the path a device batch uses; the model is not touched. Needs a build with `-D SM_LANE_MASS=1`.
 
     --near A --far B the interface's gain by the box's horizontal distance to the robot's root: whole within A metres,
                      zero beyond B, linear between (the tracker alone walks up to a box it has never seen from afar).
@@ -160,6 +168,9 @@ def main() raises:
     var rng_seed = Int(_opt(args, String("--seed"), String("0")))
     var csv_path = _opt(args, String("--csv"), String(""))
     var box_load = Float64(_opt(args, String("--box-load"), String("0")))
+    var box_mass_scale = Float64(_opt(args, String("--box-mass-scale"), String("1")))
+    var box_mass_weights = Int(_opt(args, String("--box-mass-weights"), String("1"))) != 0
+    var box_lane_mass = Float64(_opt(args, String("--box-lane-mass"), String("0")))
     var teacher = Int(_opt(args, String("--teacher"), String("0"))) != 0
     var ft = List[Scalar[DT]](length=SM_FT_PARAMS, fill=0)
     ft[FT_SQUEEZE] = Scalar[DT](Float64(_opt(args, String("--ft-squeeze"), String("10"))))
@@ -292,6 +303,12 @@ def main() raises:
     var sum_ka = 0.0
     var sum_kt = 0.0
 
+    if box_mass_scale != 1.0:
+        env.lanes[0].sim.scale_box_mass(box_mass_scale, box_mass_weights)
+        print("the box's mass times", box_mass_scale, "(the solver's weights", "with it)" if box_mass_weights else "left at the asset's)")
+    if box_lane_mass != 0.0:
+        env.lanes[0].sim.set_box_lane_mass(box_lane_mass)
+        print("the box's mass times", box_lane_mass, "through the per-lane mass")
     for c in range(len(lens)):
         var f0 = env.lib.clip_start[c]
         var clip_carry = sm_obj_carry_steps(orefs, f0, lens[c])
