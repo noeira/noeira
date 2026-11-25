@@ -34,6 +34,11 @@ tests/physics3d/test_spatial_tendon_transmission_vs_mujoco.mojo
 tests/physics3d/test_humanoid_limits_fields_vs_mujoco.mojo
 tests/physics3d/test_ball_joint_vs_mujoco.mojo
 tests/physics3d/test_newton_warmstart_vs_mujoco.mojo
+# `xfrc_applied` (an Euler integrator built with XFRC=True): a chain, a box in
+# contact and the G1 against MuJoCo's numbers, PASTED in the file by
+# tests/physics3d/xfrc_reference.py (no mujoco import at run time); the CPU
+# env's accessors.
+tests/physics3d/test_xfrc_vs_mujoco.mojo
 # Ray + sensors
 tests/physics3d/test_ray_model_vs_mujoco.mojo
 tests/physics3d/test_rangefinder_vs_mujoco.mojo

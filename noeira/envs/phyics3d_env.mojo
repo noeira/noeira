@@ -54,6 +54,7 @@ from noeira.physics3d.collision.broadphase_sap import detect_contacts_auto
 from noeira.physics3d.joint_types import JNT_FREE
 from noeira.physics3d.integrator.rk4 import RK4Integrator
 from noeira.physics3d.integrator.euler import EulerIntegrator
+from noeira.physics3d.dynamics.xfrc import XFRC_STRIDE, xfrc_at_point
 from noeira.physics3d.gpu.constants import (
     MODEL_META_IDX_CTRL_MIN,
     MODEL_META_IDX_CTRL_MAX,
@@ -81,9 +82,15 @@ struct Phyics3dEnv[
     DTYPE: DType = DType.float64,
     TERMINATE_ON_UNHEALTHY: Bool = False,
     SOLVER: StaticString = "newton",
+    XFRC: Bool = False,
 ](BoxContinuousActionEnv, RenderableEnv):
     """Generic MuJoCo env, physics on the per-field tensor path. See module
     docstring for the bridge design and scope.
+
+    XFRC=True (Euler integrator only, not with CONFIG.RNE_POST): the step adds
+    `d.xfrc_applied`, MuJoCo's `xfrc_applied` (`physics3d/dynamics/xfrc.mojo`;
+    `set_xfrc`, `set_xfrc_at_point`). Off by default: every other env compiles
+    exactly as before.
 
     SOLVER defaults to "newton" — the legacy env default physics
     (CONFIG.physics_substep = RK4 + Newton). This facade steps on CPU, so
@@ -160,6 +167,7 @@ struct Phyics3dEnv[
         RNE_POST = Self.CONFIG.RNE_POST,
         MAX_CONDIM = Self.MODEL_DEF.MAX_CONDIM,
         NOSLIP_ITER = Self.MODEL_DEF.NOSLIP_ITER,
+        XFRC = Self.XFRC,
     ]
     var integ_rk4: Self.IntegRK4
     var integ_euler: Self.IntegEuler
@@ -446,6 +454,24 @@ struct Phyics3dEnv[
             if Int(self.d.meta.data[META_IDX_NUM_CONTACTS]) == 0:
                 return
 
+    def set_xfrc(mut self, body: Int, fx: Float64, fy: Float64, fz: Float64, tx: Float64, ty: Float64, tz: Float64):
+        """Body `body`'s external wrench, MuJoCo's `xfrc_applied` record: the
+        world force at its CoM, then the world torque. Stays until it is
+        written again (no reset clears it). Acts only in an env built with
+        `XFRC=True`."""
+        var o = body * XFRC_STRIDE
+        self.d.xfrc_applied.data[o + 0] = Scalar[Self.dtype](fx)
+        self.d.xfrc_applied.data[o + 1] = Scalar[Self.dtype](fy)
+        self.d.xfrc_applied.data[o + 2] = Scalar[Self.dtype](fz)
+        self.d.xfrc_applied.data[o + 3] = Scalar[Self.dtype](tx)
+        self.d.xfrc_applied.data[o + 4] = Scalar[Self.dtype](ty)
+        self.d.xfrc_applied.data[o + 5] = Scalar[Self.dtype](tz)
+
+    def set_xfrc_at_point(mut self, body: Int, fx: Float64, fy: Float64, fz: Float64, px: Float64, py: Float64, pz: Float64):
+        """The world force `f` on `body` at the world point `p`, as the record
+        `(f, (p - xipos) x f)`, from the kinematics of the current state."""
+        xfrc_at_point(self.d, 0, body, fx, fy, fz, px, py, pz)
+
     def set_state(mut self, qpos: List[Float64], qvel: List[Float64]):
         """Deterministic state injection (tests / eval)."""
         for i in range(min(Self.NQ, len(qpos))):
@@ -658,6 +684,7 @@ struct Phyics3dEnv[
                 comptime if Self.CONFIG.INTEGRATOR == "euler":
                     self.integ_euler.step["cpu"](self.d, self.mf)
                 else:
+                    comptime assert not Self.XFRC, "XFRC (external wrench) is wired into the Euler integrator only"
                     # ⚠ RK4 RE-EVALUATES THE ACTUATORS AT STAGES 1-3, as
                     # `mj_RungeKutta` does — a servo reads the stage's qpos,
                     # a site wrench the stage's orientation. For a `<motor>`

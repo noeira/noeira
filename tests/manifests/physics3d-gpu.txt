@@ -52,3 +52,11 @@ tests/tasks/test_device_placement_gpu.mojo
 # for bit, a plain batch carrying the same values in its model; zeros are the
 # model. Runs on Metal and NVIDIA (the dm_control quadruped).
 tests/physics3d/test_lane_dr_gpu.mojo
+# A per-lane external wrench (`Data.xfrc_applied`, XFRC=True): the device
+# kernel against the CPU pass on the Ant (air and floor), lanes independent
+# bit for bit, and a batched env's own step (HalfCheetah). Metal and NVIDIA.
+tests/physics3d/test_xfrc_gpu.mojo
+# The same on the batched G1 — NVIDIA ONLY (prints SKIP elsewhere: the batched
+# G1 does not build for Metal). Written 2026-11-25 and NOT RUN YET: read the
+# printed values before trusting its bars.
+tests/physics3d/test_xfrc_g1_gpu.mojo

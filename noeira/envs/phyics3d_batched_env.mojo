@@ -126,6 +126,7 @@ struct Phyics3dBatchedEnv[
     PARALLEL_GPU: Bool = True,
     CRBA_TREEWALK: Bool = True,
     LANE_DR: Bool = False,
+    XFRC: Bool = False,
 ](BatchedEnv):
     """GPU-batched MuJoCo env, physics on the per-field tensor path,
     driver IO via the `BatchedEnv` ABI. See module docstring.
@@ -142,7 +143,13 @@ struct Phyics3dBatchedEnv[
     LANE_DR=True (Euler integrator only): the physics reads `d.lane_dr`,
     per-lane overrides of shared model quantities — contact friction by
     body and a CoM offset by body (`physics3d/constraints/lane_dr.mojo`).
-    Off by default: every other env compiles exactly as before."""
+    Off by default: every other env compiles exactly as before.
+
+    XFRC=True (Euler integrator only, not with CONFIG.RNE_POST): the physics
+    adds `d.xfrc_applied`, MuJoCo's `xfrc_applied` per lane: by body a world
+    force at the CoM and a world torque (`physics3d/dynamics/xfrc.mojo`;
+    `xfrc_ptr`). The caller owns the buffer: no reset clears it. Off by
+    default, and then never bound."""
 
     comptime ENV_TARGET: StaticString = "gpu"
     comptime OBS_DIM: Int = Self.MODEL_DEF.OBS_DIM
@@ -266,6 +273,7 @@ struct Phyics3dBatchedEnv[
         MAX_CONDIM = Self.MODEL_DEF.MAX_CONDIM,
         NOSLIP_ITER = Self.MODEL_DEF.NOSLIP_ITER,
         LANE_DR = Self.LANE_DR,
+        XFRC = Self.XFRC,
     ]
     var integ_rk4: Self.IntegRK4
     var integ_euler: Self.IntegEuler
@@ -1430,6 +1438,7 @@ struct Phyics3dBatchedEnv[
                 self.integ_euler.step["gpu"](self.d, self.mf, ctx)
             else:
                 comptime assert not Self.LANE_DR, "LANE_DR (per-lane DR) is wired into the Euler integrator only"
+                comptime assert not Self.XFRC, "XFRC (per-lane external wrench) is wired into the Euler integrator only"
                 self.integ_rk4.step["gpu"](self.d, self.mf, ctx)
         comptime if DEBUG:
             c.synchronize()
@@ -1726,6 +1735,14 @@ struct Phyics3dBatchedEnv[
         lane_dr.mojo`). Read by the physics only when this env is built with
         `LANE_DR=True`."""
         return self.d.lane_dr.dev.value().unsafe_ptr().as_unsafe_any_origin()
+
+    def xfrc_ptr(mut self) -> Pointer[Scalar[DT], MutAnyOrigin]:
+        """`Data.xfrc_applied` on the device, `[N_ENVS, NBODY * 6]`: per lane
+        and body (world body included) a world force at the body's CoM, then
+        a world torque (`physics3d/dynamics/xfrc.mojo`). Read by the physics
+        only when this env is built with `XFRC=True`; the caller owns its
+        contents."""
+        return self.d.xfrc_applied.dev.value().unsafe_ptr().as_unsafe_any_origin()
 
     def action_ptr(self) -> Pointer[Scalar[DT], MutAnyOrigin]:
         return mptr(self._action.unsafe_ptr())

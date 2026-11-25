@@ -52,7 +52,10 @@ of the code. The refusal is real as of 2026-09-13 and lives at LOAD, in
 hand and it costs nothing per step. What blocks the implementation is that
 those rows' `efc_force` is not retained past the solve.
 
-`xfrc_applied` is likewise absent: we have no such field.
+`xfrc_applied` is likewise not read here. The field exists since 2026-11-25
+(`Data.xfrc_applied`, `dynamics/xfrc.mojo`, an Euler integrator built with
+`XFRC=True`), and MuJoCo starts `cfrc_ext` from it; this stage does not, so
+that integrator refuses `XFRC` together with `RNE_POST` at compile time.
 """
 
 from max.gpu import thread_idx, block_idx, block_dim

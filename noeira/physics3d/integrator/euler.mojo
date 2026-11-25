@@ -68,6 +68,7 @@ from ..dynamics.rne import compute_bias_forces_rne
 from ..dynamics.rne_post import compute_rne_post
 from ..dynamics.fluid_forces import compute_fluid_forces
 from ..dynamics.gravcomp import compute_gravcomp_forces
+from ..dynamics.xfrc import compute_xfrc_forces
 from ..joint_types import JNT_FREE, JNT_BALL, JNT_HINGE, JNT_SLIDE
 from ..fields import (
     Data,
@@ -781,9 +782,13 @@ struct EulerIntegrator[
     MAX_CONDIM: Int = 3,
     NOSLIP_ITER: Int = 0,
     LANE_DR: Bool = False,
+    XFRC: Bool = False,
 ](Movable):
     """Owns its scratch; steps contact-free dynamics on either target. See
     module docstring for what is deliberately not yet ported.
+    XFRC=True: each lane's external wrenches by body in `Data.xfrc_applied`
+    (MuJoCo's `xfrc_applied`, `dynamics/xfrc.mojo`) are added to the smooth
+    force. Refused with RNE_POST, which does not read them.
     LANE_DR=True: each lane's per-body overrides in `Data.lane_dr`
     (`constraints/lane_dr.mojo`): contact friction after detection, the
     CoM offset in FK and body velocities.
@@ -1065,6 +1070,15 @@ struct EulerIntegrator[
         # (engine_passive.c:1000-1022). No-op unless the model declares
         # `<body gravcomp>`.
         compute_gravcomp_forces[target, Self.DTYPE, BATCH=Self.BATCH](d, m, self.scratch, ctx)
+        # `mj_xfrcAccumulate`, the last term of `qfrc_smooth`
+        # (engine_forward.c:1028). Off unless the integrator is built for it.
+        comptime if Self.XFRC:
+            comptime assert not Self.RNE_POST, (
+                "XFRC with RNE_POST: `compute_rne_post` does not start cfrc_ext from"
+                " `xfrc_applied` as `mj_rnePostConstraint` does, so cacc / cfrc_int /"
+                " cfrc_ext and their sensors would miss the wrench"
+            )
+            compute_xfrc_forces[target, Self.DTYPE, BATCH=Self.BATCH](d, m, self.scratch, ctx)
 
         comptime if _EULER_PROBE:
             var _e_now = Int(perf_counter_ns())
