@@ -66,6 +66,16 @@ from noeira.physics3d.model.model_def import ModelDefLike
 from noeira.physics3d.parser.runtime_load import parse_model_runtime
 
 
+# Build defines of the mjlab G1's simulators. Off by default: the types are then the ones they were.
+# `-D SM_XFRC=1`: the CPU box simulator takes an external wrench (`physics3d/dynamics/xfrc.mojo`), which
+# `set_box_load` writes.
+comptime SM_XFRC: Bool = get_defined_int["SM_XFRC", 0]() != 0
+# `-D SM_LANE_MASS=1`: the simulators hold a per-lane mass for free bodies (`physics3d/dynamics/lane_mass.mojo`):
+# `set_box_lane_mass` on the CPU box simulator, `lane_mass_ptr` / `sync_lane_mass` on the batched ones (the
+# object env draws each lane's mass at its reset, `object_env_gpu.SMObjTrackingEnvGpu`).
+comptime SM_LANE_MASS: Bool = get_defined_int["SM_LANE_MASS", 0]() != 0
+
+
 trait TrackingSim(Movable & Deinitable):
     """One simulator lane."""
 
@@ -180,6 +190,7 @@ trait TrackingBatchedSim(Movable & Deinitable):
     float32 buffers; lane l's slice starts at l·width."""
     comptime N: Int
     comptime LANE_DR: Bool       # takes per-lane friction / CoM overrides
+    comptime LANE_MASS: Bool = False   # takes a per-lane mass for free bodies (`lane_mass_ptr`, `sync_lane_mass`)
     # The SIMULATOR's per-lane strides. They are the robot's (R.NQ, R.NV,
     # R.NBODY + 1) unless the simulator holds more bodies than the robot, which
     # then come AFTER it in every array (the carry-box family): the robot's
@@ -234,6 +245,18 @@ trait TrackingBatchedSim(Movable & Deinitable):
 
     def set_geom_field_all(mut self, ctx: DeviceContext, g: Int, k: Int, v: Float64) raises:
         ...
+
+    # A per-lane mass for free bodies (`physics3d/dynamics/lane_mass.mojo`). A
+    # simulator without one keeps these defaults, which REFUSE.
+    def lane_mass_ptr(mut self) raises -> Pointer[Scalar[DT], MutAnyOrigin]:
+        """[N · SIM_NBODY] on the device: each lane's scale on each body's
+        mass (0 = the model's), for free bodies without a child. After
+        writing it, call `sync_lane_mass`."""
+        raise Error("TrackingBatchedSim.lane_mass_ptr: this simulator holds no per-lane mass")
+
+    def sync_lane_mass(mut self, ctx: DeviceContext) raises:
+        """The lanes' solver weights from the scales now on the device."""
+        raise Error("TrackingBatchedSim.sync_lane_mass: this simulator holds no per-lane mass")
 
 
 trait TrackingRobot:
@@ -676,7 +699,7 @@ def _k_g1m_action(
 
 
 comptime _G1MjlabBatchedEnv[M: ModelDefLike, N: Int] = Phyics3dBatchedEnv[
-    M, UnitreeG1MjlabConfig, N, TERMINATE_ON_UNHEALTHY=False, LANE_DR=True
+    M, UnitreeG1MjlabConfig, N, TERMINATE_ON_UNHEALTHY=False, LANE_DR=True, LANE_MASS=SM_LANE_MASS
 ]
 
 
@@ -688,6 +711,7 @@ struct G1MjlabBatchedSimOf[M: ModelDefLike, N_: Int](TrackingBatchedSim):
     and the box, when there is one, sits after the robot in every array."""
     comptime N = Self.N_
     comptime LANE_DR = True
+    comptime LANE_MASS = SM_LANE_MASS
     comptime SIM_NQ = Self.M.NQ
     comptime SIM_NV = Self.M.NV
     comptime SIM_NBODY = Self.M.NBODY
@@ -755,6 +779,18 @@ struct G1MjlabBatchedSimOf[M: ModelDefLike, N_: Int](TrackingBatchedSim):
     def set_geom_field_all(mut self, ctx: DeviceContext, g: Int, k: Int, v: Float64) raises:
         self.env.mf.geoms.data[g * MODEL_GEOM_SIZE + k] = Scalar[DT](v)
         self.env.mf.geoms.upload_resident(ctx)
+
+    def lane_mass_ptr(mut self) raises -> Pointer[Scalar[DT], MutAnyOrigin]:
+        comptime if SM_LANE_MASS:
+            return self.env.lane_mass_ptr()
+        else:
+            raise Error("G1MjlabBatchedSimOf.lane_mass_ptr: build with -D SM_LANE_MASS=1")
+
+    def sync_lane_mass(mut self, ctx: DeviceContext) raises:
+        comptime if SM_LANE_MASS:
+            self.env.sync_lane_mass(ctx)
+        else:
+            raise Error("G1MjlabBatchedSimOf.sync_lane_mass: build with -D SM_LANE_MASS=1")
 
 
 comptime G1MjlabBatchedSim[N: Int] = G1MjlabBatchedSimOf[UnitreeG1MjlabModel, N]
@@ -827,13 +863,6 @@ struct G1MjlabRobot(TrackingRobot):
 
 
 # ── the same G1 with a free box to carry (`UnitreeG1MjlabBox`) ──────────────
-# `-D SM_XFRC=1`: the box simulators are built with an external wrench
-# (`physics3d/dynamics/xfrc.mojo`), which `set_box_load` writes. Off by default:
-# the types below are then `UnitreeG1MjlabBox`'s, unchanged.
-comptime SM_XFRC: Bool = get_defined_int["SM_XFRC", 0]() != 0
-# `-D SM_LANE_MASS=1`: they are built with a per-lane mass for the box
-# (`physics3d/dynamics/lane_mass.mojo`), which `set_box_lane_mass` writes.
-comptime SM_LANE_MASS: Bool = get_defined_int["SM_LANE_MASS", 0]() != 0
 comptime _G1MjlabBoxCpuEnv = Phyics3dEnv[
     UnitreeG1MjlabBoxModel, UnitreeG1MjlabConfig, DType.float64, False, XFRC=SM_XFRC, LANE_MASS=SM_LANE_MASS
 ]

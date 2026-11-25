@@ -19,3 +19,9 @@ tests/deep_agents/data/test_episodic_replay_gpu.mojo
 # with the CPU env. Its bands were set before any NVIDIA run; read the
 # printed values first.
 tests/deep_agents/supermimic/test_supermimic_env_gpu.mojo
+# The object's mass per lane in the device env that carries it (the draw at a
+# reset, the context, the simulator's scales and solver weights) — NVIDIA ONLY.
+# Run from here it is the build WITHOUT the per-lane mass: a mass range is
+# refused (2 checks). The draw itself needs `mojo build -D SM_LANE_MASS=1`
+# (8 checks; 8 of 8 on an RTX 5090, 2026-11-25).
+tests/deep_agents/supermimic/test_supermimic_obj_mass_gpu.mojo

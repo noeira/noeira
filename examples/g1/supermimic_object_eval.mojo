@@ -17,7 +17,7 @@ criterion, against the same number of a run without `--interface`).
     pixi run -e nvidia mojo build -I . -D SM_PAPER=1 examples/g1/supermimic_object_eval.mojo -o /tmp/sm_obj_eval
     /tmp/sm_obj_eval --ckpt TRACKER.ckpt --store CARRY_50HZ.h5 --object-dir OBJECT_CSV_DIR --clips CLIPS.tsv \\
         [--interface INTERFACE.ckpt] [--split eval] [--gain 0.1] [--csv OUT.csv]
-        [--trials 8] [--seed 0] [--honesty 500] [--squeeze 40] [--lead-in 50] [--w-pos 1.0] [--std-pos 0.2] [--w-ori 0.5] [--std-ori 0.4] [--w-hands 1.0] [--std-hands 0.1]
+        [--trials 8] [--seed 0] [--honesty 500] [--squeeze 40] [--lead-in 50] [--mass-scale 3] [--w-pos 1.0] [--std-pos 0.2] [--w-ori 0.5] [--std-ori 0.4] [--w-hands 1.0] [--std-hands 0.1]
 
     --interface  `supermimic_object_train.mojo --out`'s checkpoint. WITHOUT it the object encoder is at
                  its zero start and the score is the BLIND tracker's on the same clips: the number to beat.
@@ -25,6 +25,8 @@ criterion, against the same number of a run without `--interface`).
     --trials     every clip this many times, each start perturbed by the training's reset noise (1: the
                  deterministic benchmark). The summary then gives the share of carry steps held per trial
                  (mean, lowest, highest) and how many runs pass; rank arms on these, not on one trial.
+    --mass-scale S  the box weighs the model's mass times S in every lane (`physics3d/dynamics/lane_mass.mojo`); needs a
+                 build with `-D SM_LANE_MASS=1`. Not applied to `--honesty`.
     --lead-in N  N frames of standing at each clip's first pose before the clip (`object_task.sm_lead_in`; 50 = 1 s).
                   Half the carry clips lift the box within a second of their first frame; train and score with the same N.
     --squeeze    the benchmark with the scripted squeeze of this many newtons on every lane
@@ -203,6 +205,9 @@ def main() raises:
     if len(lens) != len(want):
         raise Error("the store holds " + String(len(lens)) + " of the " + String(len(want)) + " `" + split + "` clips named")
     var lead = Int(_opt(args, String("--lead-in"), String("0")))
+    var mass_scale = Float64(_opt(args, String("--mass-scale"), String("1")))
+    if mass_scale != 1.0:
+        print("the box's mass: the model's times", mass_scale, "in every lane")
     if lead > 0:
         sm_lead_in[Robot](rows, lens, poses, lead)
         print("lead-in:", lead, "frames of standing at each clip's first pose before it")
@@ -250,6 +255,7 @@ def main() raises:
         print("SCRIPTED SQUEEZE of", squeeze, "N on every lane while the reference box is lifted: a probe, not the interface's score")
     var res = sm_obj_benchmark[OC, Sim](
         ctx, tr, SMMotionLibrary[Robot](rows^, lens, q0), track, orefs, Sim.create(ctx), 0, True, squeeze, ks, 15, trials, eval_seed,
+        mass_scale=mass_scale,
     )
     var t_carry = List[Int](length=max(trials, 1), fill=0)
     var t_held = List[Int](length=max(trials, 1), fill=0)

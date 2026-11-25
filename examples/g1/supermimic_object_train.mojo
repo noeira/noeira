@@ -12,13 +12,17 @@ G1 with one free box; the object's pose is the simulator's (no perception).
         [--seed 0] [--utd 0.4] [--warmup 40] [--lr 2e-4] [--om-lr 5e-5] [--gain 0.1] [--replay 1000]
         [--w-pos 1.0] [--std-pos 0.2] [--w-ori 0.5] [--std-ori 0.4] [--w-hands 1.0] [--std-hands 0.1]
         [--no-noise 1] [--resume INTERFACE.ckpt] [--squeeze-copies 0.10] [--squeeze-force 40] [--squeeze-until 6000]
-        [--lead-in 50]
+        [--lead-in 50] [--mass-lo 0.5 --mass-hi 3.0]
 
     --ckpt         the tracker's checkpoint (its world model, encoder, decoder: none of them is written)
     --object-ckpt  the object network alone, as `supermimic_object_fit.mojo --out` saves it;
                    without it the object network starts at zero (a box at constant velocity)
     --clips        a TSV with `name` and `split` columns; the `train` rows are used
     the six reward numbers are data: a revision is a run, not a build
+    --mass-lo A --mass-hi B   each lane's box weighs the model's mass times a scale drawn in [A, B] at every reset of
+                   the lane (`object_env_gpu.SMObjTrackingEnvGpu`); the world model and the critic are given the
+                   lane's mass, the object network is not. Needs a build with `-D SM_LANE_MASS=1`. 1 1, the
+                   default: the model's mass in every lane.
     --lead-in N    N frames of standing at each clip's first pose before the clip (`object_task.sm_lead_in`; 50 = 1 s).
                   Half the carry clips lift the box within a second of their first frame; train and score with the same N.
     --squeeze-copies D  the library is the train clips TWICE: as they are, and with the hands aimed D metres
@@ -214,6 +218,10 @@ def main() raises:
     if len(lens) != len(want):
         raise Error("the store holds " + String(len(lens)) + " of the " + String(len(want)) + " train clips named")
     var lead = Int(_opt(args, String("--lead-in"), String("0")))
+    var mass_lo = Float64(_opt(args, String("--mass-lo"), String("1")))
+    var mass_hi = Float64(_opt(args, String("--mass-hi"), String("1")))
+    if mass_lo != 1.0 or mass_hi != 1.0:
+        print("the box's mass per lane: the model's times a scale drawn in [", mass_lo, ",", mass_hi, "] at every reset")
     if lead > 0:
         sm_lead_in[Robot](rows, lens, poses, lead)
         print("lead-in:", lead, "frames of standing at each clip's first pose before it")
@@ -271,7 +279,9 @@ def main() raises:
             ks[j] = g1m_kp(j) * g1m_action_scale(j)
         sq = SMObjSqueeze[Robot](ctx, LANES, lens, track, SM_OBJ, forces, ks, ARM0)
         print("squeeze on the executed actions: lane l's hands pushed toward the box with", sq_force, "· (l mod 8) / 7 newtons while the reference box is lifted")
-    var agent = SMObjAgentGpu[OC, Sim](ctx, SMMotionLibrary[Robot](rows^, lens, q0), track, orefs, Sim.create(ctx), tr^, sched^)
+    var agent = SMObjAgentGpu[OC, Sim](
+        ctx, SMMotionLibrary[Robot](rows^, lens, q0), track, orefs, Sim.create(ctx), tr^, sched^, mass_lo=mass_lo, mass_hi=mass_hi,
+    )
     agent.om_lr = om_lr
     agent.squeeze = sq^
     agent.squeeze_until = sq_until

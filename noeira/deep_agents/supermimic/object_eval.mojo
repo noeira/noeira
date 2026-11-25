@@ -122,14 +122,16 @@ struct SMObjClipResult(Copyable, Movable):
 def sm_obj_benchmark[OC: SMObjConfigT, BS: TrackingBatchedSim](
     ctx: DeviceContext, mut trainer: SMObjTrainer[OC], var lib: SMMotionLibrary[OC.BASE.ROBOT], track: List[Scalar[DT]],
     orefs: List[Scalar[DT]], var sim: BS, max_clips: Int, verbose: Bool, squeeze_force: Float64,
-    squeeze_ks: List[Float64], squeeze_arm0: Int, trials: Int = 1, rng_seed: Int = 0,
+    squeeze_ks: List[Float64], squeeze_arm0: Int, trials: Int = 1, rng_seed: Int = 0, mass_scale: Float64 = 1.0,
 ) raises -> List[SMObjClipResult]:
     """Every clip of `lib` (the first `max_clips` if > 0) with the trainer's
     interface over the device env's lanes. `track` and `orefs` as
     `SMObjAgentGpu`'s. `squeeze_force` > 0: `SMObjSqueeze` with that force on
     every lane (a probe of the scripted squeeze, not a score of the interface).
     `trials` > 1: every clip that many times, the starts perturbed by the
-    reset noise (seeded by `rng_seed`); results in the order the runs end."""
+    reset noise (seeded by `rng_seed`); results in the order the runs end.
+    `mass_scale`: the object weighs the model's mass times this in every
+    lane (other than 1: a simulator with `LANE_MASS`)."""
     comptime R = OC.BASE.ROBOT
     comptime N = BS.N
     var n_clips = lib.num_clips if max_clips <= 0 else min(max_clips, lib.num_clips)
@@ -146,7 +148,7 @@ def sm_obj_benchmark[OC: SMObjConfigT, BS: TrackingBatchedSim](
     ctx.enqueue_copy(orows, ht)
     var env = SMObjTrackingEnvGpu[R, BS](
         ctx, lib^, track, sim^, dr=False, obs_noise=False, reset_noise=trials > 1, action_noise=0.0, rng_seed=rng_seed,
-        max_episode_steps=0, friction_dr=False,
+        max_episode_steps=0, friction_dr=False, mass_lo=mass_scale, mass_hi=mass_scale,
     )
     # the queue: run k is clip k mod clips, trial k div clips
     var n_runs = n_clips * max(trials, 1)
