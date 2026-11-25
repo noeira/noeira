@@ -10,6 +10,7 @@ far the interface's action is from the tracker's own.
     pixi run ./build/sm_obj_trace --ckpt TRACKER.ckpt --store CARRY_50HZ.h5 --object-dir OBJECT_CSV_DIR \\
         --only NAME[,NAME…] --out-dir DIR [--interface INTERFACE.ckpt] [--gain 0.1] [--near 0.6 --far 1.0]
         [--squeeze 40] [--ref-squeeze 0.05] [--ref-lower 1.0] [--trials 8 --seed 0] [--lead-in 50] [--csv OUT.csv]
+        [--box-load KG]
         [--teacher 1 --ft-squeeze 10 --ft-squeeze-max 60 --ft-mu 0.5 --ft-mass 1 --ft-kp 200 --ft-kd 20 --ft-kr 5 --ft-kw 0.5
          --ft-point 0.11,-0.01,0 --ft-fmax 60 --ft-rel 1 --ft-mmax 1.5
          --ft-kh 300 --ft-hmax 30 --ft-reach-lead 35]
@@ -17,6 +18,10 @@ far the interface's action is from the tracker's own.
     --csv OUT.csv    one row a run with `supermimic_object_eval.mojo --csv`'s columns (the same account of the
                      carry, `object_task.SMObjCarryTally`, and the same kernels): the laptop's stand-in for the
                      device benchmark. A run's last step is in neither the carry's account nor the kernels here.
+
+    --box-load KG    a constant vertical force on the box, the weight of KG more kilograms (negative: lighter), for
+                     the whole run: weight without inertia (`TrackingSim.set_box_load`). Needs a build with
+                     `-D SM_XFRC=1`; without it any KG other than 0 raises.
 
     --near A --far B the interface's gain by the box's horizontal distance to the robot's root: whole within A metres,
                      zero beyond B, linear between (the tracker alone walks up to a box it has never seen from afar).
@@ -41,7 +46,9 @@ far the interface's action is from the tracker's own.
 Per clip, in `--out-dir`:
 
     NAME.trace.tsv   one row a step (columns in the header; `k_all` and `k_trunk_legs` are the six tracking
-                     kernels of the step over their maximum, `heads.sm_tracking_kernels_lane`)
+                     kernels of the step over their maximum, `heads.sm_tracking_kernels_lane`; `tau_arm` and
+                     `tau_wrist` are the largest share of its torque limit that a joint of the two arms, and one
+                     of the four wrist pitch and yaw joints, was given in the step's last substep)
     NAME.qpos.tsv    one row a step: the simulator's qpos (robot 36, box 7),
                      then the reference box's pose (7) and the reference
                      robot's qpos (36): what a renderer needs
@@ -80,7 +87,7 @@ from noeira.deep_agents.supermimic.object_task import (
 )
 from noeira.deep_agents.supermimic.object_trainer import SMObjTrainer
 from noeira.deep_agents.supermimic.robot import G1MjlabBoxRobot, SMDims
-from noeira.envs.robots.unitree_g1_mjlab_pd import g1m_action_scale, g1m_kp
+from noeira.envs.robots.unitree_g1_mjlab_pd import g1m_action_scale, g1m_effort, g1m_kp
 from noeira.io.fileio import read_file_bytes, write_text_atomic
 from noeira.nn.constants import DT
 from noeira.nn.core.tensor import TensorImpl
@@ -152,6 +159,7 @@ def main() raises:
     var trials = Int(_opt(args, String("--trials"), String("1")))
     var rng_seed = Int(_opt(args, String("--seed"), String("0")))
     var csv_path = _opt(args, String("--csv"), String(""))
+    var box_load = Float64(_opt(args, String("--box-load"), String("0")))
     var teacher = Int(_opt(args, String("--teacher"), String("0"))) != 0
     var ft = List[Scalar[DT]](length=SM_FT_PARAMS, fill=0)
     ft[FT_SQUEEZE] = Scalar[DT](Float64(_opt(args, String("--ft-squeeze"), String("10"))))
@@ -304,10 +312,12 @@ def main() raises:
             for k in range(6):
                 bv.append(Float64(track[f0 * SM_OBJ + 7 + k]))
             env.lanes[0].sim.set_box(bq, bv)
+            if box_load != 0.0:
+                env.lanes[0].sim.set_box_load(box_load)
             var z0 = Float64(track[f0 * SM_OBJ + 2])
             var trace = String(
                 "step\tframe\tref_carry\tref_rise\tbox_err\tbox_dz\tbox_dxy\tbox_tilt\tbox_rise\thand0_box\thand1_box\tref_hand0_box\tref_hand1_box\t"
-                + "da_arm\tda_arm_max\tda_rest\troot_speed\tref_root_speed\troot_z\tbox_speed\treward\tr_pos\tr_ori\tr_hands\thand_z\tref_hand_z\tk_all\tk_trunk_legs\tft_f0\tft_f1\tft_m\tbox_lean\n"
+                + "da_arm\tda_arm_max\tda_rest\troot_speed\tref_root_speed\troot_z\tbox_speed\treward\tr_pos\tr_ori\tr_hands\thand_z\tref_hand_z\tk_all\tk_trunk_legs\tft_f0\tft_f1\tft_m\tbox_lean\ttau_arm\ttau_wrist\n"
             )
             var dump = String("")
             var step = 0
@@ -436,6 +446,14 @@ def main() raises:
                 ka += ka_s
                 kt += kt_s
                 k_steps += 1
+                # the arms' torques against their limits (joints 15 .. 28; wrist pitch and yaw: 20, 21, 27, 28)
+                var tau_arm = 0.0
+                var tau_wrist = 0.0
+                for j in range(15, 29):
+                    var u = abs(env.lanes[0].sim.joint_torque(j)) / g1m_effort(j)
+                    tau_arm = max(tau_arm, u)
+                    if j == 20 or j == 21 or j == 27 or j == 28:
+                        tau_wrist = max(tau_wrist, u)
                 trace += (
                     String(step) + "\t" + String(fr - f0) + "\t" + ("1" if rise >= CARRY_RISE else "0") + "\t" + String(rise) + "\t"
                     + String(sqrt(dx * dx + dy * dy + dz * dz)) + "\t" + String(dz) + "\t" + String(sqrt(dx * dx + dy * dy)) + "\t"
@@ -443,7 +461,7 @@ def main() raises:
                     + String(rhd[0]) + "\t" + String(rhd[1]) + "\t" + String(sqrt(da)) + "\t" + String(da_max) + "\t" + String(sqrt(da_rest)) + "\t"
                     + String(vr) + "\t" + String(vref) + "\t" + String(Float64(env.lanes[0].s[2])) + "\t" + String(sqrt(bs)) + "\t"
                     + String(env.last_reward[0]) + "\t" + String(Float64(terms[0])) + "\t" + String(Float64(terms[1])) + "\t"
-                    + String(Float64(terms[2])) + "\t" + String(hz) + "\t0\t" + String(ka_s) + "\t" + String(kt_s) + "\t" + String(ft_f0) + "\t" + String(ft_f1) + "\t" + String(ft_m) + "\t" + String(lean) + "\n"
+                    + String(Float64(terms[2])) + "\t" + String(hz) + "\t0\t" + String(ka_s) + "\t" + String(kt_s) + "\t" + String(ft_f0) + "\t" + String(ft_f1) + "\t" + String(ft_m) + "\t" + String(lean) + "\t" + String(tau_arm) + "\t" + String(tau_wrist) + "\n"
                 )
                 for k in range(D.NQ):
                     dump += String(Float64(env.lanes[0].s[k])) + "\t"

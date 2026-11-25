@@ -189,6 +189,11 @@ tests/deep_agents/supermimic/test_supermimic_mirror.mojo
 # nothing from the host's random stream (the in-run benchmark shares it with
 # the training run). Known answers, no dump.
 tests/deep_agents/supermimic/test_supermimic_skip_guard.mojo
+# A load on the carried box (`TrackingSim.set_box_load`, the simulator's external
+# wrench) and the joints' torques, known answers on the CPU G1-with-a-box. Run
+# from here it is the build WITHOUT the wrench: the load is refused (3 checks).
+# The load itself needs `mojo build -D SM_XFRC=1` (5 checks; see the header).
+tests/deep_agents/supermimic/test_supermimic_box_load.mojo
 # The shared per-env episodic window replay (deep_agents/data), against the
 # SuperMimic reproduction's ReplayBuffer (same dump as test_supermimic_lib)
 tests/deep_agents/data/test_episodic_replay.mojo /tmp/sm_lib

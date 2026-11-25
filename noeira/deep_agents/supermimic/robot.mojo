@@ -35,6 +35,7 @@ Every width the method uses follows from the robot (`SMDims[R]`):
 """
 
 from std.math import ceildiv
+from std.sys import get_defined_int
 
 from max.gpu import global_idx
 from max.gpu.host import DeviceBuffer, DeviceContext
@@ -47,7 +48,8 @@ from noeira.envs.robots.unitree_g1_mjlab import UnitreeG1Mjlab
 from noeira.envs.robots.unitree_g1_mjlab_box import UnitreeG1MjlabBox
 from noeira.envs.robots.unitree_g1_mjlab_box_xml import G1M_BOX_QPOS, G1M_BOX_QVEL, UnitreeG1MjlabBoxModel
 from noeira.envs.robots.unitree_g1_mjlab_config import UnitreeG1MjlabConfig
-from noeira.envs.robots.unitree_g1_mjlab_xml import UnitreeG1MjlabModel
+from noeira.envs.robots.unitree_g1_mjlab_xml import ROOT_QVEL_SIZE as G1M_ROOT_QVEL, UnitreeG1MjlabModel
+from noeira.envs.phyics3d_env import Phyics3dEnv
 from noeira.envs.robots.unitree_g1_mjlab_pd import G1M_N_DOF, g1m_action_scale, g1m_default_pos, g1m_dof_name
 from noeira.envs.robots.berkeley_humanoid_lite import BerkeleyHumanoidLite, BerkeleyHumanoidLiteBatchedDR
 from noeira.envs.robots.berkeley_humanoid_lite_pd import (
@@ -56,7 +58,7 @@ from noeira.envs.robots.berkeley_humanoid_lite_pd import (
 from noeira.nn.constants import DT
 from noeira.nn.core.ptr import mptr
 from noeira.envs.robots.unitree_g1_pd import G1_N_DOF, g1_default_pos, g1_effort, g1_kp
-from noeira.physics3d.gpu.constants import MODEL_BODY_SIZE, MODEL_GEOM_SIZE, MODEL_JOINT_SIZE
+from noeira.physics3d.gpu.constants import MODEL_BODY_SIZE, MODEL_GEOM_SIZE, MODEL_JOINT_SIZE, MODEL_META_IDX_GRAVITY_Z
 from noeira.physics3d.model.model_def import ModelDefLike
 from noeira.physics3d.parser.runtime_load import parse_model_runtime
 
@@ -115,6 +117,18 @@ trait TrackingSim(Movable & Deinitable):
 
     def box_qvel(self, k: Int) raises -> Float64:
         raise Error("TrackingSim.box_qvel: this simulator holds no object")
+
+    def set_box_load(mut self, kg: Float64) raises:
+        """A constant vertical force on the object, the weight of `kg` more
+        kilograms (negative: lighter), until it is set again. Weight only:
+        the object's inertia stays the model's. Needs a simulator built with
+        an external wrench (`-D SM_XFRC=1`)."""
+        raise Error("TrackingSim.set_box_load: this simulator takes no load on an object")
+
+    def joint_torque(self, j: Int) raises -> Float64:
+        """The torque the last substep applied at actuated joint j, N·m
+        (after the actuator's clip)."""
+        raise Error("TrackingSim.joint_torque: this simulator does not report torques")
 
     # The window, for `supermimic_viewer` (forwards to the env's renderer).
     def init_renderer(mut self) raises -> Bool:
@@ -794,15 +808,22 @@ struct G1MjlabRobot(TrackingRobot):
 
 
 # ── the same G1 with a free box to carry (`UnitreeG1MjlabBox`) ──────────────
+# `-D SM_XFRC=1`: the box simulators are built with an external wrench
+# (`physics3d/dynamics/xfrc.mojo`), which `set_box_load` writes. Off by default:
+# the types below are then `UnitreeG1MjlabBox`'s, unchanged.
+comptime SM_XFRC: Bool = get_defined_int["SM_XFRC", 0]() != 0
+comptime _G1MjlabBoxCpuEnv = Phyics3dEnv[UnitreeG1MjlabBoxModel, UnitreeG1MjlabConfig, DType.float64, False, XFRC=SM_XFRC]
+
+
 struct G1MjlabBoxSim(TrackingSim):
     """`UnitreeG1MjlabBox` on the CPU: `G1MjlabSim`'s robot and action law, plus
     one free box in the simulator's last state slots. `set_state`, `qpos` and
     `qvel` address the ROBOT (the trait's contract: a state row is the
     robot's); the box has its own accessors below, and `set_state` leaves it
     where it is."""
-    var env: UnitreeG1MjlabBox[DType.float64]
+    var env: _G1MjlabBoxCpuEnv
 
-    def __init__(out self, var env: UnitreeG1MjlabBox[DType.float64]):
+    def __init__(out self, var env: _G1MjlabBoxCpuEnv):
         self.env = env^
 
     def __init__(out self, *, deinit move: Self):
@@ -810,7 +831,7 @@ struct G1MjlabBoxSim(TrackingSim):
 
     @staticmethod
     def create() raises -> Self:
-        var e = UnitreeG1MjlabBox[DType.float64]()
+        var e = _G1MjlabBoxCpuEnv()
         _ = e.reset()
         return Self(e^)
 
@@ -845,6 +866,18 @@ struct G1MjlabBoxSim(TrackingSim):
 
     def box_qvel(self, k: Int) raises -> Float64:
         return Float64(self.env.d.qvel.data[G1M_BOX_QVEL + k])
+
+    def set_box_load(mut self, kg: Float64) raises:
+        comptime if SM_XFRC:
+            # the box is the simulator's last body; the model's own gravity
+            self.env.set_xfrc(
+                _G1MjlabBoxCpuEnv.NBODY - 1, 0.0, 0.0, kg * Float64(self.env.mf.meta.data[MODEL_META_IDX_GRAVITY_Z]), 0.0, 0.0, 0.0
+            )
+        else:
+            raise Error("G1MjlabBoxSim.set_box_load: build with -D SM_XFRC=1")
+
+    def joint_torque(self, j: Int) raises -> Float64:
+        return Float64(self.env.d.qfrc.data[G1M_ROOT_QVEL + j])
 
     def qpos(self, i: Int) -> Float64:
         return Float64(self.env.d.qpos.data[i])
