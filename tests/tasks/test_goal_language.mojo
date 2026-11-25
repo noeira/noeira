@@ -123,6 +123,31 @@ def main() raises:
     # resolve one body early and still return an id — the silent kind.
     ta.check(fmd.body_names[0] == "world", "body 0 is the worldbody")
 
+    # ⚠ A COMPOSED BODY'S OWN NAME BINDS TOO, AFTER THE PREFIX. A base model's
+    # free body is in no slot (the G1 room's crate, `robot_box`), so a goal
+    # names it as the scene spells it. The prefix must still win, or a name
+    # that resolved before would move to another body.
+    var whole = String(fmd.body_names[brick_id])
+    ta.check(
+        slot_body_id(whole, fmd.body_names) == brick_id,
+        "a composed body's own name ('" + whole + "') resolves to that body",
+    )
+    var mixed: List[String] = ["world", "a_x", "a", "b"]
+    ta.check(slot_body_id(String("a"), mixed) == 1, "the prefix wins over a body spelled like the slot")
+    ta.check(slot_body_id(String("b"), mixed) == 3, "a name that is no prefix binds to the body spelled so")
+    var unknown_raised = False
+    try:
+        _ = slot_body_id(String("c"), mixed)
+    except e:
+        unknown_raised = True
+    ta.check(unknown_raised, "a name that is neither a prefix nor a body still raises")
+    var part_raised = False
+    try:
+        _ = slot_body_id(String("a_"), mixed)
+    except e:
+        part_raised = True
+    ta.check(part_raised, "a part of a body's name ('a_') is not that body")
+
     var b1 = bind_goal(g1, f, fmd.body_names, fmd.site_names)
     ta.check(len(b1.terms) == 1, "bound goal has the same shape")
     ta.check(b1.terms[0].a == brick_id, "In's first arg is the brick's body")

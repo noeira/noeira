@@ -495,16 +495,29 @@ def slot_body_id(slot: String, body_names: List[String]) raises -> Int:
     ⚠ `body_names[0]` IS THE WORLDBODY and these ids include it, matching
     `FlatModelDef.body_names`' own convention. Off-by-one here would name the
     wrong object and still resolve, which is the silent kind.
+
+    ⚠ A NAME THAT IS NO PREFIX MAY BE A COMPOSED BODY'S OWN NAME. A base model
+    can bring a movable body of its own (the G1 room's crate is `robot_box`,
+    a free body of the base beside the robot, in no slot), and a goal about
+    it had no way to say so. The prefix is tried FIRST, so every name that
+    resolved before resolves to the same body; only a name that used to raise
+    can now bind, to the one body spelled exactly that way. It is what `Joint`
+    and `AtRegion` already do for joints and sites: name the composed element.
+    Such a body is its own root for `Touching`: `eval.body_in_slot` walks up
+    from a contact's body and stops at it.
     """
     var want = slot + "_"
     for i in range(len(body_names)):
         if String(body_names[i]).startswith(want):
             return i
+    for i in range(len(body_names)):
+        if String(body_names[i]) == slot:
+            return i
     raise Error(
         "tasks: slot '" + slot + "' has no body in the composed scene — no"
-        " body name starts with '" + want + "'. Either the slot is not in the"
-        " family's table, or the scene is stale (`pixi run"
-        " gen-family-scenes`)."
+        " body name starts with '" + want + "' and none is named '" + slot
+        + "'. Either the slot is not in the family's table, or the scene is"
+        " stale (`pixi run gen-family-scenes`)."
     )
 
 
