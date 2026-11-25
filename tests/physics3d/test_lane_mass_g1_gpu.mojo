@@ -20,9 +20,21 @@ moves alike whatever it weighs).
   [3] the solver's weights are live: a twin without them differs
   [4] the scales written alone on the device buffer, then `sync_lane_mass`:
       the host setter's run, bit for bit
-  [5] the env's integrator on the device against the same type on the CPU,
-      60 raw steps with a scale of 3 in lane 1: e <= max(10 e0, 1e-5), e0 the
-      distance with no scale
+  [5] the env's integrator alone (20 raw steps, no actuation), the crate
+      thrown down at 3 m/s so that it hits the head within them, scales of 4
+      and 0.5: each lane equals its twin bit for bit on the device, and on
+      the CPU; the scales move the device's answer by more than 1e-3. The
+      distance between the two targets is printed, for the lanes and for the
+      twins, and is not a bar.
+
+Two earlier forms of [5] (2026-11-25, on the box). The first was void: 60
+raw steps with the crate dropped from rest, the robot without actuation
+falling as fast as the crate, no contact, the scale's effect 0.0; it passed
+and tested nothing. The second threw the crate and asked the device within
+10 times the no-scale distance of the CPU: a crate at half its mass was 0.027
+away for a bar of 0.002. The no-scale distance is not the yardstick of a
+lighter crate that bounces; the twin with that mass is, and identity with it
+on each target is the sharper question.
 
 NVIDIA ONLY: the batched G1 does not build for Metal (its action hook
 computes in float64), so this prints SKIP elsewhere.
@@ -56,7 +68,8 @@ comptime NB = GEnv[True].NBODY
 comptime BOX = NB - 1                 # the box is the model's last body
 comptime ROW = NQ + NV
 comptime ENV_STEPS = 25
-comptime RAW_STEPS = 60
+comptime RAW_STEPS = 20
+comptime RAW_THROW = -3.0             # the crate's vertical velocity at the start of a raw run, m/s
 comptime W_SETTER = 0
 comptime W_KERNEL = 1
 
@@ -78,9 +91,9 @@ struct Tally:
             print("  FAIL:", msg)
 
 
-def _state(base: List[Scalar[DT]], mut d: GData):
+def _state(base: List[Scalar[DT]], mut d: GData, box_vz: Float64):
     """Both lanes at the reset pose, at rest, the crate 10 cm over the head
-    (lane 1's a little to the side)."""
+    (lane 1's a little to the side), moving vertically at `box_vz`."""
     for l in range(NL):
         for k in range(NQ):
             d.qpos.data[l * NQ + k] = base[k]
@@ -97,6 +110,7 @@ def _state(base: List[Scalar[DT]], mut d: GData):
         d.qpos.data[o + 4] = Scalar[DT](0)
         d.qpos.data[o + 5] = Scalar[DT](0)
         d.qpos.data[o + 6] = Scalar[DT](0)
+        d.qvel.data[l * NV + G1M_BOX_QVEL + 2] = Scalar[DT](box_vz)
 
 
 def _edit_model[LM: Bool](mut env: GEnv[LM], ctx: DeviceContext, s: Float64, weights: Bool) raises:
@@ -123,11 +137,11 @@ def _rows(d: GData, mut out: List[Scalar[DT]]):
             out.append(d.qvel.data[l * NV + k])
 
 
-def _start[LM: Bool](mut env: GEnv[LM], ctx: DeviceContext, base: List[Scalar[DT]], scales: List[Float64], how: Int) raises:
+def _start[LM: Bool](mut env: GEnv[LM], ctx: DeviceContext, base: List[Scalar[DT]], scales: List[Float64], how: Int, box_vz: Float64) raises:
     """A fresh episode, the state on the device, and (LM) lane l's scale
     `scales[l]` (0 = none) by the host setter or by the device kernel."""
     env.reset_batch[NL](Optional(ctx), 0)
-    _state(base, env.d)
+    _state(base, env.d, box_vz)
     env.d.qpos.upload_resident(ctx)
     env.d.qvel.upload_resident(ctx)
     env.d.qacc.upload_resident(ctx)
@@ -152,7 +166,7 @@ def _start[LM: Bool](mut env: GEnv[LM], ctx: DeviceContext, base: List[Scalar[DT
 
 def _env_run[LM: Bool](mut env: GEnv[LM], ctx: DeviceContext, base: List[Scalar[DT]], scales: List[Float64], how: Int) raises -> List[Scalar[DT]]:
     """`step_batch` at a zero action, ENV_STEPS control steps."""
-    _start[LM](env, ctx, base, scales, how)
+    _start[LM](env, ctx, base, scales, how, 0.0)
     var ha = ctx.enqueue_create_host_buffer[DT](NL * NA)
     ctx.synchronize()
     for i in range(NL * NA):
@@ -167,9 +181,9 @@ def _env_run[LM: Bool](mut env: GEnv[LM], ctx: DeviceContext, base: List[Scalar[
     return out^
 
 
-def _raw_gpu(mut env: GEnv[True], ctx: DeviceContext, base: List[Scalar[DT]], scales: List[Float64]) raises -> List[Scalar[DT]]:
+def _raw_gpu[LM: Bool](mut env: GEnv[LM], ctx: DeviceContext, base: List[Scalar[DT]], scales: List[Float64]) raises -> List[Scalar[DT]]:
     """The env's integrator alone on the device, RAW_STEPS steps, no actuation."""
-    _start[True](env, ctx, base, scales, W_SETTER)
+    _start[LM](env, ctx, base, scales, W_SETTER, RAW_THROW)
     for _ in range(RAW_STEPS):
         env.integ_euler.step["gpu"](env.d, env.mf, ctx)
     env.d.qpos.download(ctx)
@@ -179,15 +193,16 @@ def _raw_gpu(mut env: GEnv[True], ctx: DeviceContext, base: List[Scalar[DT]], sc
     return out^
 
 
-def _raw_cpu(mut env: GEnv[True], base: List[Scalar[DT]], scales: List[Float64]) raises -> List[Scalar[DT]]:
+def _raw_cpu[LM: Bool](mut env: GEnv[LM], base: List[Scalar[DT]], scales: List[Float64]) raises -> List[Scalar[DT]]:
     """The same integrator type on the CPU, on the env's model."""
     var d = GData()
-    _state(base, d)
-    lane_mass_reset(d, env.mf)
-    for l in range(len(scales)):
-        if scales[l] > 0.0:
-            set_lane_mass_scale(d, env.mf, l, BOX, scales[l])
-    var integ = GEnv[True].IntegEuler()
+    _state(base, d, RAW_THROW)
+    comptime if LM:
+        lane_mass_reset(d, env.mf)
+        for l in range(len(scales)):
+            if scales[l] > 0.0:
+                set_lane_mass_scale(d, env.mf, l, BOX, scales[l])
+    var integ = GEnv[LM].IntegEuler()
     for _ in range(RAW_STEPS):
         integ.step["cpu"](d, env.mf)
     var out = List[Scalar[DT]]()
@@ -263,18 +278,30 @@ def main() raises:
         var dk = _dist(by_kernel, got, 0, 2 * ROW)
         tl.check(dk[0] == 0, "scales written alone, then sync_lane_mass: " + String(dk[0]) + " values differ from the host setter's run")
 
-        print("[5] the env's integrator: the device against the CPU")
-        var s3: List[Float64] = [0.0, 3.0]
-        var g3 = _raw_gpu(env, ctx, base, s3)
-        var g0 = _raw_gpu(env, ctx, base, none)
-        var c3 = _raw_cpu(env, base, s3)
-        var c0 = _raw_cpu(env, base, none)
-        for l in range(NL):
-            var ee0 = _dist(g0, c0, l * ROW, (l + 1) * ROW)[1]
-            var ee = _dist(g3, c3, l * ROW, (l + 1) * ROW)[1]
-            var eff = _dist(c3, c0, l * ROW, (l + 1) * ROW)[1]
-            var bar = max(10.0 * ee0, 1e-5)
-            tl.check(ee <= bar, "lane " + String(l) + " after " + String(RAW_STEPS) + " steps: device vs CPU " + String(ee) + " (no scale " + String(ee0) + ", bar " + String(bar) + "), the scale's effect " + String(eff))
+        print("[5] the env's integrator alone, the crate thrown at the head")
+        var s5: List[Float64] = [4.0, 0.5]
+        var g5 = _raw_gpu[True](env, ctx, base, s5)
+        var c5 = _raw_cpu[True](env, base, s5)
+        var gp = _raw_gpu[False](plain_env, ctx, base, none)
+        var t5a = GEnv[False](ctx)
+        _edit_model[False](t5a, ctx, 4.0, True)
+        var t5b = GEnv[False](ctx)
+        _edit_model[False](t5b, ctx, 0.5, True)
+        var ga = _raw_gpu[False](t5a, ctx, base, none)
+        var gb = _raw_gpu[False](t5b, ctx, base, none)
+        var ca = _raw_cpu[False](t5a, base, none)
+        var cb = _raw_cpu[False](t5b, base, none)
+        var r0 = _dist(g5, ga, 0, ROW)
+        var r1 = _dist(g5, gb, ROW, 2 * ROW)
+        var k0 = _dist(c5, ca, 0, ROW)
+        var k1 = _dist(c5, cb, ROW, 2 * ROW)
+        var f0 = _dist(g5, gp, 0, ROW)
+        var f1 = _dist(g5, gp, ROW, 2 * ROW)
+        tl.check(r0[0] == 0 and r1[0] == 0, "device, " + String(RAW_STEPS) + " raw steps: lane 0 (x4) " + String(r0[0]) + " values differ from its twin, lane 1 (x0.5) " + String(r1[0]))
+        tl.check(k0[0] == 0 and k1[0] == 0, "CPU, the same: " + String(k0[0]) + " and " + String(k1[0]) + " differ from their twins")
+        tl.check(f0[1] > 1e-3 and f1[1] > 1e-3, "the scales' effect on the device: " + String(f0[1]) + " and " + String(f1[1]))
+        # for the record: how far the two targets are from each other, by lane, and the twins the same
+        print("  device vs CPU: lanes", _dist(g5, c5, 0, ROW)[1], _dist(g5, c5, ROW, 2 * ROW)[1], " twins", _dist(ga, ca, 0, ROW)[1], _dist(gb, cb, ROW, 2 * ROW)[1], " no scale", _dist(gp, _raw_cpu[False](plain_env, base, none), 0, ROW)[1])
 
         print("\n===", tl.ok, "/", tl.total, "passed ===")
         if tl.ok != tl.total:

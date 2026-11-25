@@ -65,5 +65,6 @@ tests/physics3d/test_xfrc_g1_gpu.mojo
 # against the CPU. Metal runs the per-env Newton kernel, NVIDIA the blocked one.
 tests/physics3d/test_lane_mass_gpu.mojo
 # The same on the batched G1 with its crate, through `step_batch` — NVIDIA ONLY
-# (prints SKIP elsewhere), where the blocked Newton kernel runs.
+# (prints SKIP elsewhere), where the blocked Newton kernel runs. 10 of 10 on
+# an RTX 5090, 2026-11-25.
 tests/physics3d/test_lane_mass_g1_gpu.mojo
