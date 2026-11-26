@@ -250,6 +250,24 @@ def main() raises:
                        fmd.body_names, fmd.site_names)
     ta.check(bt.is_tier_a(), "Touching is Tier A since L3 (the reward kernel"
              " has the lane's contacts)")
+    # ⚠ The world is no contact partner. A composed body's own name binds
+    # (above), and the worldbody is named "world": `Touching(brick, world)`
+    # would bind to body 0, and the contact walk (`eval.body_in_slot`) stops
+    # at the root it is given — every body is under the world, so the term
+    # would read "the brick touches ANYTHING" on both legs. Refused at bind.
+    for src in ["Touching(brick, world)", "Touching(world, brick)"]:
+        var raised_w = False
+        try:
+            _ = bind_goal(parse_goal(String(src)), f,
+                          fmd.body_names, fmd.site_names)
+        except e:
+            raised_w = True
+        ta.check(raised_w, String(src) + " is REFUSED (the world as a contact"
+                 " partner would mean 'anything')")
+    var bw = bind_goal(parse_goal(String("Above(brick, world, 0.1)")), f,
+                       fmd.body_names, fmd.site_names)
+    ta.check(bw.terms[0].b == 0, "Above(obj, world, m) still binds: a height"
+             " over the world's origin reads one position, no contact walk")
     ta.refuses(String("Joint(j, lt)"), "Joint with a missing threshold")
     ta.refuses(String("Joint(j, 0.5)"), "Joint with a missing comparison")
 

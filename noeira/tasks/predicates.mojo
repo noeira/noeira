@@ -679,6 +679,24 @@ def bind_goal(
                     )
             elif t.arg1.byte_length() > 0:
                 b = slot_body_id(t.arg1, body_names)
+            # ⚠ THE WORLD IS NO CONTACT PARTNER. Since a composed body's own
+            # name binds (`slot_body_id`), "world" resolves to body 0 — and
+            # the contact walk (`eval.body_in_slot`, the device's
+            # `_slots_touching_gpu`) climbs from a contact's body until it
+            # reaches the root it was given. EVERY body is under the world,
+            # so `Touching(x, world)` would read "x touches anything", robot
+            # and furniture included, on both legs and with no error. A
+            # ground plane is a geom of the worldbody: saying "rests on the
+            # floor" by contact needs the walk to mean "body 0 itself" for
+            # that root, on both legs, and nothing asks for it yet.
+            if op_reads_contacts(op) and (a == 0 or b == 0):
+                raise Error(
+                    "tasks: " + op_name(op) + "(" + t.arg0 + ", " + t.arg1
+                    + ") names the worldbody as a contact partner. Every"
+                    " body is under the world, so the term would mean"
+                    " 'touches anything'. Name the slot that is touched; a"
+                    " height over the ground is Above(<obj>, <slot>, <m>)."
+                )
         out.terms.append(BoundTerm(op, a, b, t.param))
     return out^
 
