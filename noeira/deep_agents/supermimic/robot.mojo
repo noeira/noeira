@@ -68,7 +68,7 @@ from noeira.physics3d.parser.runtime_load import parse_model_runtime
 
 # Build defines of the mjlab G1's simulators. Off by default: the types are then the ones they were.
 # `-D SM_XFRC=1`: the CPU box simulator takes an external wrench (`physics3d/dynamics/xfrc.mojo`), which
-# `set_box_load` writes.
+# `set_box_load` and `set_body_force_at` write.
 comptime SM_XFRC: Bool = get_defined_int["SM_XFRC", 0]() != 0
 # `-D SM_LANE_MASS=1`: the simulators hold a per-lane mass for free bodies (`physics3d/dynamics/lane_mass.mojo`):
 # `set_box_lane_mass` on the CPU box simulator, `lane_mass_ptr` / `sync_lane_mass` on the batched ones (the
@@ -142,6 +142,24 @@ trait TrackingSim(Movable & Deinitable):
         """The torque the last substep applied at actuated joint j, N·m
         (after the actuator's clip)."""
         raise Error("TrackingSim.joint_torque: this simulator does not report torques")
+
+    def body_point(self, body: Int, lx: Float64, ly: Float64, lz: Float64) raises -> List[Float64]:
+        """The world position of the point (lx, ly, lz) of body `body`'s own
+        frame (model body id, world = 0), from the simulator's kinematics: of
+        the state last set, or, after a control step, of its last substep."""
+        raise Error("TrackingSim.body_point: this simulator does not report body poses")
+
+    def set_body_force_at(
+        mut self, body: Int, lx: Float64, ly: Float64, lz: Float64, fx: Float64, fy: Float64, fz: Float64,
+    ) raises:
+        """The WORLD force (fx, fy, fz) on body `body`, acting at the point
+        (lx, ly, lz) of its own frame, in place of whatever wrench the body
+        held. Written from the current kinematics as MuJoCo's record (the
+        force at the body's centre of mass and the torque of its lever), so it
+        is the caller's to write again as the body moves: once a control step.
+        Zero clears it. Needs a simulator built with an external wrench
+        (`-D SM_XFRC=1`)."""
+        raise Error("TrackingSim.set_body_force_at: this simulator takes no external force")
 
     def scale_box_mass(mut self, s: Float64, weights: Bool) raises:
         """The object's mass times `s` (> 0), in THIS simulator's model: its
@@ -931,6 +949,36 @@ struct G1MjlabBoxSim(TrackingSim):
 
     def joint_torque(self, j: Int) raises -> Float64:
         return Float64(self.env.d.qfrc.data[G1M_ROOT_QVEL + j])
+
+    def body_point(self, body: Int, lx: Float64, ly: Float64, lz: Float64) raises -> List[Float64]:
+        if body < 0 or body >= _G1MjlabBoxCpuEnv.NBODY:
+            raise Error("G1MjlabBoxSim.body_point: body " + String(body) + " of " + String(_G1MjlabBoxCpuEnv.NBODY))
+        # `xquat` is stored (x, y, z, w), as the body records are
+        var x = Float64(self.env.d.xquat.data[body * 4])
+        var y = Float64(self.env.d.xquat.data[body * 4 + 1])
+        var z = Float64(self.env.d.xquat.data[body * 4 + 2])
+        var w = Float64(self.env.d.xquat.data[body * 4 + 3])
+        # v' = v + 2 w (u x v) + 2 u x (u x v), u = (x, y, z)
+        var cx = y * lz - z * ly
+        var cy = z * lx - x * lz
+        var cz = x * ly - y * lx
+        var dx = y * cz - z * cy
+        var dy = z * cx - x * cz
+        var dz = x * cy - y * cx
+        return [
+            Float64(self.env.d.xpos.data[body * 3]) + lx + 2.0 * (w * cx + dx),
+            Float64(self.env.d.xpos.data[body * 3 + 1]) + ly + 2.0 * (w * cy + dy),
+            Float64(self.env.d.xpos.data[body * 3 + 2]) + lz + 2.0 * (w * cz + dz),
+        ]
+
+    def set_body_force_at(
+        mut self, body: Int, lx: Float64, ly: Float64, lz: Float64, fx: Float64, fy: Float64, fz: Float64,
+    ) raises:
+        comptime if SM_XFRC:
+            var p = self.body_point(body, lx, ly, lz)
+            self.env.set_xfrc_at_point(body, fx, fy, fz, p[0], p[1], p[2])
+        else:
+            raise Error("G1MjlabBoxSim.set_body_force_at: build with -D SM_XFRC=1")
 
     def set_box_lane_mass(mut self, s: Float64) raises:
         comptime if SM_LANE_MASS:

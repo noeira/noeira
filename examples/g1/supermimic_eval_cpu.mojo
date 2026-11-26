@@ -47,6 +47,31 @@ lift here is a lift the latent can command.
 scores must be the robot-only build's (the box family adds a body, not a
 difference to the robot).
 
+A LOAD AT THE HANDS (`-D SM_BOX=1 -D SM_XFRC=1`, the tracker alone: use it
+with `--box-park`). `--hand-down N` puts N newtons straight down on EACH hand,
+`--hand-back N` N newtons on each, horizontal, against the robot's heading.
+The force acts at the centre of the hand's capsule (0.11 m along the wrist-yaw
+link, 1 cm to the side: the model's `*_hand_collision`), is written again at
+every control step (`TrackingSim.set_body_force_at`) and held through the
+step's substeps. `--load-when lifted` (the default): while the reference box
+is lifted, which needs `--object-dir`; `--load-when always`: the whole clip,
+and with `--box-park` no `--object-dir` is needed. It ramps over `LOAD_RAMP`
+steps when it comes on and when it goes off. `--hand-readings` adds the
+columns below without a force (the 0 N cell); a force adds them too. Over the
+"loaded steps", the steps of that schedule whatever the force:
+
+    load_steps      how many the episode reached
+    hand_drop       the reference height of the capsule's centre minus the
+                    simulated one, mean of the two hands and of those steps (m)
+    root_dist_end / root_dist_max   the root's horizontal distance to its
+                    reference at the last step reached, and its largest (m)
+    tau_wrist_med / tau_wrist_sat   the largest share of its torque limit
+                    given to a wrist pitch or yaw joint: its median over the
+                    loaded steps, and the share of them where it is ≥ 0.95
+
+The two heights come from one kinematics-only simulator given the simulated
+and the reference pose in turn. `--only a,b,c` scores those clips alone.
+
 ⚠ CPU PHYSICS: the float64 single-lane path. It agrees with the batched env
 to 1e-7 over a step (`test_supermimic_env_gpu` [2]) but long clips diverge, so
 a clip's number can differ from `supermimic_eval.mojo`'s.
@@ -54,7 +79,7 @@ a clip's number can differ from `supermimic_eval.mojo`'s.
 mjlab's G1 only.
 """
 
-from std.math import sqrt
+from std.math import atan2, cos, sin, sqrt
 from std.sys import argv, get_defined_int
 from std.time import perf_counter_ns
 
@@ -64,8 +89,8 @@ from noeira.deep_agents.supermimic.env import SMReplayOf, SMTrackingEnv
 from noeira.deep_agents.supermimic.motion_library import SMMotionLibrary
 from noeira.deep_agents.supermimic.object_task import sm_squeeze_lane, sm_squeeze_reference
 from noeira.core.bytes import string_from_bytes
-from noeira.deep_agents.supermimic.robot import G1MjlabBoxRobot, G1MjlabRobot, SMDims
-from noeira.envs.robots.unitree_g1_mjlab_pd import g1m_action_scale, g1m_kp
+from noeira.deep_agents.supermimic.robot import G1MjlabBoxRobot, G1MjlabRobot, SMDims, sm_body_ids
+from noeira.envs.robots.unitree_g1_mjlab_pd import g1m_action_scale, g1m_effort, g1m_kp
 from noeira.io.fileio import read_file_bytes, write_text_atomic
 from noeira.nn.constants import DT
 from noeira.physics3d.gpu.constants import GEOM_IDX_FRICTION
@@ -79,6 +104,9 @@ comptime CARRY_RISE = 0.05      # the reference box counts as carried above its 
 comptime CARRY_TOL = 0.10       # the simulated box counts as with it within this distance (m)
 comptime SQUEEZE_LEAD = 10      # frames before the reference lifts at which the squeeze starts
 comptime SQUEEZE_ARM0 = 15      # the arms' joints: 15..28 (7 left, 7 right)
+comptime LOAD_RAMP = 25         # control steps over which a hand load comes on and goes off (0.5 s)
+comptime HAND_X = 0.11          # the hand capsule's centre in the wrist-yaw link's frame: fromto (0.07, 0, 0) .. (0.15, ∓0.02, 0)
+comptime HAND_Y = 0.01          # left: −HAND_Y, right: +HAND_Y
 # the training example's widths (a checkpoint loads only into its own), one lane
 comptime C = SMConfig[
     "cpu", Robot,
@@ -118,6 +146,23 @@ def _object_track(path: String) raises -> List[Float64]:
     return out^
 
 
+def _median(v: List[Float64]) -> Float64:
+    """The median of `v` (0 for none), by an insertion sort of a copy."""
+    var a = v.copy()
+    for i in range(1, len(a)):
+        var x = a[i]
+        var j = i - 1
+        while j >= 0 and a[j] > x:
+            a[j + 1] = a[j]
+            j -= 1
+        a[j + 1] = x
+    if len(a) == 0:
+        return 0.0
+    if len(a) % 2 == 1:
+        return a[len(a) // 2]
+    return 0.5 * (a[len(a) // 2 - 1] + a[len(a) // 2])
+
+
 def main() raises:
     var raw = argv()
     var args = List[String]()
@@ -131,15 +176,31 @@ def main() raises:
     var box_mu = Float64(_opt(args, String("--box-friction"), String("-1")))
     var squeeze = Float64(_opt(args, String("--squeeze"), String("0")))
     var ref_squeeze = Float64(_opt(args, String("--ref-squeeze"), String("0")))
+    var hand_down = Float64(_opt(args, String("--hand-down"), String("0")))
+    var hand_back = Float64(_opt(args, String("--hand-back"), String("0")))
+    var load_when = _opt(args, String("--load-when"), String("lifted"))
+    var only = _opt(args, String("--only"), String(""))
     var park = False
+    var hands_on = hand_down != 0.0 or hand_back != 0.0
     for i in range(len(args)):
         if args[i] == "--box-park":
             park = True
+        if args[i] == "--hand-readings":
+            hands_on = True
+    if load_when != "lifted" and load_when != "always":
+        raise Error("--load-when lifted | always, got " + load_when)
+    var wanted = List[String]()
+    if only != "":
+        for w in only.split(","):
+            wanted.append(String(String(w).strip()))
     if ckpt == "" or store == "":
         raise Error("give --ckpt PATH --store STORE.h5 [--out scores.tsv] [--max-clips N]")
     comptime if BOX:
-        if object_dir == "":
-            raise Error("-D SM_BOX=1 needs --object-dir DIR (one <clip>.csv per clip)")
+        if object_dir == "" and not (park and load_when == "always"):
+            raise Error("-D SM_BOX=1 needs --object-dir DIR (one <clip>.csv per clip), except with --box-park --load-when always")
+    else:
+        if hands_on:
+            raise Error("--hand-down, --hand-back and --hand-readings need the box build (-D SM_BOX=1 -D SM_XFRC=1)")
 
     var st = TrajectoryStore(store.copy())
     var names = List[String]()
@@ -154,6 +215,12 @@ def main() raises:
     var q0 = List[Float64](length=Robot.NDOF, fill=0.0)
     for j in range(Robot.NDOF):
         q0[j] = Robot.default_joint_pos(j)
+    # the reference poses (the first NQ of each library row), kept for the hands' readings
+    var ref_q = List[Float64]()
+    if hands_on:
+        for f in range(len(refc) // D.S):
+            for k in range(Robot.NQ):
+                ref_q.append(Float64(refc[f * D.S + k]))
 
     var trainer = SuperMimicTrainer[C].for_robot(Robot.SIM.create())
     var ctr = trainer.load_state(ckpt)
@@ -198,7 +265,16 @@ def main() raises:
     var tsv = String("clip\tname\tframes\tsteps\tnorm_return\tfailed")
     comptime if BOX:
         tsv += "\tcarry_frames\tcarried\tbox_err\tlift_ref\tlift_sim"
+        if hands_on:
+            tsv += "\tload_steps\thand_drop\troot_dist_end\troot_dist_max\ttau_wrist_med\ttau_wrist_sat"
     tsv += "\n"
+    var hand_ids = List[Int]()
+    var kin = Robot.SIM.create()              # a kinematics-only simulator, for the hands' readings
+    comptime if BOX:
+        if hands_on:
+            hand_ids = sm_body_ids[Robot](Robot.hand_bodies())
+            print("hands: bodies", hand_ids[0], hand_ids[1], "|", hand_down, "N down and", hand_back, "N backward on each, load", load_when, "| ramp", LOAD_RAMP, "steps")
+    var n_scored = 0
     var sum_ret = 0.0
     var n_failed = 0
     var total_steps = 0
@@ -206,6 +282,14 @@ def main() raises:
     var sum_share = 0.0
     var t0 = perf_counter_ns()
     for c in range(n):
+        if len(wanted) > 0:
+            var hit = False
+            for w in range(len(wanted)):
+                if wanted[w] == names[c]:
+                    hit = True
+            if not hit:
+                continue
+        n_scored += 1
         var first: List[Int] = [env.lib.clip_start[c]]
         env.restart(first)
         env.terminations = True
@@ -217,9 +301,21 @@ def main() raises:
         var err_n = 0
         var lift_ref = 0.0
         var lift_sim = 0.0
+        var ramp = 0.0
+        var load_steps = 0
+        var drop_sum = 0.0
+        var root_end = 0.0
+        var root_max = 0.0
+        var tw = List[Float64]()
         comptime if BOX:
-            track = _object_track(object_dir + "/" + names[c] + ".csv")
+            if object_dir == "":
+                track = [50.0, 50.0, 0.1805, 1.0, 0.0, 0.0, 0.0, 50.0, 50.0, 0.1805, 1.0, 0.0, 0.0, 0.0]      # parked, never lifted
+            else:
+                track = _object_track(object_dir + "/" + names[c] + ".csv")
             rows_n = len(track) // 7
+            if hands_on:
+                for h in range(2):
+                    env.lanes[0].sim.set_body_force_at(hand_ids[h], HAND_X, (-HAND_Y if h == 0 else HAND_Y), 0.0, 0.0, 0.0, 0.0)
             var bq = List[Float64]()
             for k in range(7):
                 bq.append(track[k])
@@ -254,12 +350,56 @@ def main() raises:
                         box_now.unsafe_ptr().as_unsafe_any_origin(), sq_scratch.unsafe_ptr().as_unsafe_any_origin(),
                         a.data.unsafe_ptr().as_unsafe_any_origin(),
                     )
+            var loaded = False
+            comptime if BOX:
+                if hands_on:
+                    var fr = min(step, rows_n - 1)
+                    loaded = load_when == "always" or track[fr * 7 + 2] - track[2] > CARRY_RISE
+                    ramp = min(1.0, ramp + 1.0 / Float64(LOAD_RAMP)) if loaded else max(0.0, ramp - 1.0 / Float64(LOAD_RAMP))
+                    # the heading: the root's yaw (qpos 3..6 = w, x, y, z)
+                    var qw = env.lanes[0].sim.qpos(3)
+                    var qx = env.lanes[0].sim.qpos(4)
+                    var qy = env.lanes[0].sim.qpos(5)
+                    var qz = env.lanes[0].sim.qpos(6)
+                    var yaw = atan2(2.0 * (qw * qz + qx * qy), 1.0 - 2.0 * (qy * qy + qz * qz))
+                    for h in range(2):
+                        env.lanes[0].sim.set_body_force_at(
+                            hand_ids[h], HAND_X, (-HAND_Y if h == 0 else HAND_Y), 0.0,
+                            -hand_back * cos(yaw) * ramp, -hand_back * sin(yaw) * ramp, -hand_down * ramp,
+                        )
             _ = env.step(a.data, rb)
             ret += env.last_reward[0]
             step += 1
             if env.lanes[0].ep_len == 0:        # the clip ended; the lane is back at its first frame
                 failed = env.last_terminated[0]
                 break
+            comptime if BOX:
+                if hands_on:
+                    # the state after `step` steps against the reference's frame `step`
+                    var fh = env.lib.clip_start[c] + min(step, lens[c] - 1)
+                    var qs = List[Float64]()
+                    var qr = List[Float64]()
+                    for k in range(Robot.NQ):
+                        qs.append(env.lanes[0].sim.qpos(k))
+                        qr.append(ref_q[fh * Robot.NQ + k])
+                    var rd = sqrt((qs[0] - qr[0]) * (qs[0] - qr[0]) + (qs[1] - qr[1]) * (qs[1] - qr[1]))
+                    root_end = rd
+                    root_max = max(root_max, rd)
+                    if loaded:
+                        var zero_v = List[Float64](length=Robot.NV, fill=0.0)
+                        var drop = 0.0
+                        kin.set_state(qs, zero_v)
+                        for h in range(2):
+                            drop -= 0.5 * kin.body_point(hand_ids[h], HAND_X, (-HAND_Y if h == 0 else HAND_Y), 0.0)[2]
+                        kin.set_state(qr, zero_v)
+                        for h in range(2):
+                            drop += 0.5 * kin.body_point(hand_ids[h], HAND_X, (-HAND_Y if h == 0 else HAND_Y), 0.0)[2]
+                        drop_sum += drop
+                        load_steps += 1
+                        var u = 0.0
+                        for j in [20, 21, 27, 28]:      # wrist pitch and yaw, left and right
+                            u = max(u, abs(env.lanes[0].sim.joint_torque(j)) / g1m_effort(j))
+                        tw.append(u)
             comptime if BOX:
                 var f = min(step, rows_n - 1)
                 var dx = env.lanes[0].sim.box_qpos(0) - track[f * 7]
@@ -287,10 +427,20 @@ def main() raises:
                 n_carried += 1
             tsv += "\t" + String(carry_frames) + "\t" + String(carried) + "\t" + String(be) + "\t" + String(lift_ref) + "\t" + String(lift_sim)
             extra = "  box: carried " + String(carried) + "/" + String(carry_frames) + ", err " + String(be) + " m, lift " + String(lift_sim) + " of " + String(lift_ref)
+            if hands_on:
+                var sat = 0
+                for i in range(len(tw)):
+                    if tw[i] >= 0.95:
+                        sat += 1
+                var hd = drop_sum / Float64(max(load_steps, 1))
+                var ts = Float64(sat) / Float64(max(len(tw), 1))
+                tsv += "\t" + String(load_steps) + "\t" + String(hd) + "\t" + String(root_end) + "\t" + String(root_max) + "\t" + String(_median(tw)) + "\t" + String(ts)
+                extra = "  hands: " + String(load_steps) + " loaded steps, drop " + String(hd) + " m, root " + String(root_end) + " m (max " + String(root_max) + "), wrists " + String(_median(tw)) + " (" + String(ts) + " at the limit)"
         tsv += "\n"
-        print("  [" + String(c + 1) + "/" + String(n) + "] " + names[c] + "  " + String(nr) + (String("  FAILED at step ") + String(step) if failed else String("")) + extra)
+        print("  [" + String(n_scored) + "] " + names[c] + "  " + String(nr) + (String("  FAILED at step ") + String(step) if failed else String("")) + extra)
     var secs = Float64(perf_counter_ns() - t0) * 1e-9
-    print("mean normalised return", sum_ret / Float64(n), "| failed", n_failed, "of", n, "|", total_steps, "steps in", secs, "s")
+    n = n_scored
+    print("mean normalised return", sum_ret / Float64(max(n, 1)), "| failed", n_failed, "of", n, "|", total_steps, "steps in", secs, "s")
     comptime if BOX:
         if squeeze > 0.0:
             print("scripted squeeze of", squeeze, "N while the reference box is lifted: a probe, not a policy")
