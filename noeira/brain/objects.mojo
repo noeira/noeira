@@ -39,8 +39,9 @@ down.
 THE CALLER REPORTS FACTS: whatever decides that the hands have the object
 (the object policy, a grasp check) calls `picked_up`; whatever releases it
 calls `put_down` with the place it was put at ("" = on the floor, at no
-place). The executive's `pick:` and `put:` steps end on those facts
-(`noeira.brain.tasks`).
+place) and whether it came to rest the way it was taken (`tipped`: a crate
+let go on its side). The executive's `pick:` and `put:` steps end on those
+facts (`noeira.brain.tasks`): a put at the right place, tipped, has FAILED.
 
 THE LOG KEEPS THE LAST POSE: each object event's text is the whole record
 (`object_event_text`), so `restore_objects` (`noeira.brain.memory`) rebuilds
@@ -56,6 +57,9 @@ comptime OBJ_HELD: Int = 1
 """In the robot's hands."""
 comptime OBJ_PUT: Int = 2
 """Put down by the robot at a place (`put_at`)."""
+
+comptime TIPPED_SUFFIX = "_tipped"
+"""After the log's word for `where` when the object is `tipped`."""
 
 comptime HOW_SEEN = "seen"
 """The pose is a perception fit."""
@@ -133,6 +137,11 @@ struct ObjectXY(Copyable, Movable):
     """`OBJ_FLOOR`, `OBJ_HELD` or `OBJ_PUT`."""
     var put_at: String
     """The place it was put down at (`OBJ_PUT`); "" otherwise."""
+    var tipped: Bool
+    """The body let it go and it did NOT come to rest the way it was taken
+    (`put_down(..., tipped = True)`): on a side, upside down. What the body
+    said at the last put: a sighting gives x, y and a heading and cannot
+    change it; `picked_up` and `told_object` clear it."""
     var how: String
     """`HOW_SEEN`, `HOW_TOLD` or `HOW_REMEMBERED`; "" before any pose."""
     var source: String
@@ -171,6 +180,7 @@ struct ObjectXY(Copyable, Movable):
         self.yaw_deg = 0.0
         self.where = OBJ_FLOOR
         self.put_at = String("")
+        self.tipped = False
         self.how = String("")
         self.source = String("")
         self.score = 0.0
@@ -230,8 +240,14 @@ def object_event_text(o: ObjectXY) -> String:
 
         crate | 1.234 0.456 35.0 | put table | crate 0.13 0.215 0.19 180.0 | seen
 
+    A tipped object's word has `TIPPED_SUFFIX`: `put_tipped table`,
+    `floor_tipped`. ⚠ A binary from before the suffix reads such a word as
+    `floor` (`where_from_word`'s default): it loses the place, not the pose.
+
     ⚠ ONE FORMAT, WRITTEN AND READ HERE: a second writer would drift."""
     var where = where_word(o.where)
+    if o.tipped and o.where != OBJ_HELD:
+        where += TIPPED_SUFFIX
     if o.where == OBJ_PUT:
         where += " " + o.put_at
     return (
@@ -259,7 +275,12 @@ def parse_object_event(text: String) raises -> ObjectXY:
         Float64(String(kind[1])), Float64(String(kind[2])), Float64(String(kind[3])), Float64(String(kind[4])),
     )
     o.set_pose(Float64(String(pose[0])), Float64(String(pose[1])), Float64(String(pose[2])))
-    o.where = where_from_word(String(where[0]))
+    var word = String(where[0])
+    if word.endswith(TIPPED_SUFFIX):
+        o.tipped = True
+        var bare = String(word[byte = 0 : word.byte_length() - String(TIPPED_SUFFIX).byte_length()])
+        word = bare^
+    o.where = where_from_word(word)
     if o.where == OBJ_PUT and len(where) > 1:
         var place = String("")
         for i in range(1, len(where)):

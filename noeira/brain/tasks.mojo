@@ -34,6 +34,9 @@ A STEP is one command of the body, as the body takes it (`goto:table`,
   body is given anything, when the state has no pose for the object or it is
   missing. A put step whose object was held and then let go anywhere but at
   its place has failed at once (`NOTICE_PUT_ELSEWHERE`): no timeout to wait.
+  So has one whose object was let go AT its place and did not come to rest
+  the way it was taken (`ObjectXY.tipped`, `NOTICE_PUT_TIPPED`): a crate on
+  its side on the table is not "done".
 A command the body refuses fails its step (`refuse_step`, with the body's
 reason for the log); for an object step the notice names the object and the
 place (« Je ne peux pas porter la caisse jusqu'à la table. »).
@@ -79,6 +82,9 @@ comptime NOTICE_NOT_DONE = "not_done"
 """A step's object was not picked up (or not put at its place) in time."""
 comptime NOTICE_PUT_ELSEWHERE = "put_elsewhere"
 """A put step's object was held, then let go somewhere other than its place."""
+comptime NOTICE_PUT_TIPPED = "put_tipped"
+"""A put step's object was held, then let go at its place, where it did not
+come to rest the way it was taken (`ObjectXY.tipped`)."""
 
 
 @fieldwise_init
@@ -95,10 +101,12 @@ struct ExecAction(Copyable, Movable):
         return ExecAction(EX_NONE, String(""), String(""), String(""), String(""))
 
 
-def _finish(mut ws: WorldState, status: Int, reason: String, t: Float64, now: Int):
-    """The task in hand becomes the last task."""
+def _finish(mut ws: WorldState, status: Int, reason: String, t: Float64, now: Int, notice: String = ""):
+    """The task in hand becomes the last task. `notice`: the notice a
+    failure gives the person, kept on the task (`Task.notice`)."""
     ws.task.status = status
     ws.task.reason = reason
+    ws.task.notice = notice
     ws.task.t_end = t
     var what = ws.task.describe()
     if status == TASK_DONE:
@@ -147,7 +155,7 @@ def refuse_step(mut ws: WorldState, t: Float64, now: Int, why: String = "") -> E
     var cmd = ws.task.steps[k].command.copy()
     var place = ws.task.steps[k].place.copy()
     var obj = ws.task.steps[k].obj.copy()
-    _finish(ws, TASK_FAILED, ("the robot has no command '" + cmd + "'") if why == "" else ("the body refused '" + cmd + "': " + why), t, now)
+    _finish(ws, TASK_FAILED, ("the robot has no command '" + cmd + "'") if why == "" else ("the body refused '" + cmd + "': " + why), t, now, String(NOTICE_REFUSED))
     return ExecAction(EX_NOTICE, String(""), String(NOTICE_REFUSED), place, obj)
 
 
@@ -162,7 +170,7 @@ def tick_tasks(mut ws: WorldState, t: Float64, now: Int) -> ExecAction:
         if obj != "" and (oi < 0 or not ws.objects[oi].has_pose or ws.objects[oi].missing):
             ws.task.steps[k].status = STEP_FAILED
             var place0 = ws.task.steps[k].place.copy()
-            _finish(ws, TASK_FAILED, "where the " + obj + " is is not known", t, now)
+            _finish(ws, TASK_FAILED, "where the " + obj + " is is not known", t, now, String(NOTICE_NO_OBJECT))
             return ExecAction(EX_NOTICE, String(""), String(NOTICE_NO_OBJECT), place0, obj)
         ws.task.steps[k].status = STEP_RUNNING
         ws.task.steps[k].t_start = t
@@ -178,20 +186,27 @@ def tick_tasks(mut ws: WorldState, t: Float64, now: Int) -> ExecAction:
         if oi >= 0 and place == "":
             done = ws.objects[oi].where == OBJ_HELD
         elif oi >= 0:
-            done = ws.objects[oi].where == OBJ_PUT and ws.objects[oi].put_at == place
+            var there = ws.objects[oi].where == OBJ_PUT and ws.objects[oi].put_at == place
+            done = there and not ws.objects[oi].tipped
             if ws.objects[oi].where == OBJ_HELD:
                 ws.task.steps[k].held = True
+            elif there and not done and ws.task.steps[k].held:
+                # held, then let go at the place, where it tipped: the body has ended its carry
+                ws.task.steps[k].status = STEP_FAILED
+                _finish(ws, TASK_FAILED, "the " + obj + " was put down at the " + place + ", and does not rest the way it was taken",
+                        t, now, String(NOTICE_PUT_TIPPED))
+                return ExecAction(EX_NOTICE, String(""), String(NOTICE_PUT_TIPPED), place, obj)
             elif not done and ws.task.steps[k].held:
                 # held, then let go elsewhere: the body has ended its carry
                 ws.task.steps[k].status = STEP_FAILED
                 var at = ws.objects[oi].put_at.copy()
                 _finish(ws, TASK_FAILED, "the " + obj + " was put down " + (("at the " + at) if at != "" else String("at no place"))
-                        + ", not at the " + place, t, now)
+                        + ", not at the " + place, t, now, String(NOTICE_PUT_ELSEWHERE))
                 return ExecAction(EX_NOTICE, String(""), String(NOTICE_PUT_ELSEWHERE), place, obj)
         if not done and elapsed > ws.task.steps[k].timeout_s:
             ws.task.steps[k].status = STEP_FAILED
             var what = ("the " + obj + " was not picked up") if place == "" else ("the " + obj + " was not put at the " + place)
-            _finish(ws, TASK_FAILED, what + " after " + String(Int(ws.task.steps[k].timeout_s)) + " seconds", t, now)
+            _finish(ws, TASK_FAILED, what + " after " + String(Int(ws.task.steps[k].timeout_s)) + " seconds", t, now, String(NOTICE_NOT_DONE))
             return ExecAction(EX_NOTICE, String(STOP_COMMAND), String(NOTICE_NOT_DONE), place, obj)
     elif place != "":
         if ws.at == place:
@@ -201,6 +216,7 @@ def tick_tasks(mut ws: WorldState, t: Float64, now: Int) -> ExecAction:
             _finish(
                 ws, TASK_FAILED,
                 "the " + place + " was not reached after " + String(Int(ws.task.steps[k].timeout_s)) + " seconds", t, now,
+                String(NOTICE_NOT_REACHED),
             )
             return ExecAction(EX_NOTICE, String(STOP_COMMAND), String(NOTICE_NOT_REACHED), place, String(""))
     elif elapsed >= ws.task.steps[k].hold_s:
@@ -247,6 +263,8 @@ def notice_text(ref ws: WorldState, act: ExecAction) -> String:
         if fr:
             return "J'ai posé " + thing + ", mais pas " + pres_de(place) + "."
         return "I put " + thing + " down, but not at " + place + "."
+    if act.notice == NOTICE_PUT_TIPPED:
+        return put_tipped_text(thing, place, fr)
     if act.notice == NOTICE_NO_OBJECT:
         if fr:
             return "Je ne sais pas où est " + thing + "."
@@ -260,6 +278,14 @@ def notice_text(ref ws: WorldState, act: ExecAction) -> String:
             return "Je n'ai pas réussi à porter " + thing + " " + jusqua(place) + "."
         return "I could not carry " + thing + " to " + place + "."
     return String("")
+
+
+def put_tipped_text(thing: String, place: String, fr: Bool) -> String:
+    """« J'ai posé la caisse près de la table, mais pas dans le bon sens. »
+    ⚠ No word that agrees with the thing's gender: the words come from people."""
+    if fr:
+        return "J'ai posé " + thing + " " + pres_de(place) + ", mais pas dans le bon sens."
+    return "I put " + thing + " down at " + place + ", but not the right way up."
 
 
 def pres_de(word: String) -> String:

@@ -43,7 +43,7 @@ from .geometry import PlaceXY, places_around
 from .objects import OBJ_HELD, OBJ_PUT, HOW_TOLD, HOW_REMEMBERED
 from .people import asks_identity, identity_answer
 from .state import WorldState, Skill, TASK_DONE, TASK_FAILED
-from .tasks import pres_de
+from .tasks import pres_de, notice_text, ExecAction, EX_NOTICE, NOTICE_NOT_DONE
 
 
 def _plain(text: String) -> List[UInt8]:
@@ -168,8 +168,20 @@ def task_done_answer(ref ws: WorldState) -> String:
     if ws.last_task.status == TASK_FAILED:
         var k = ws.last_task.at
         var place = String("")
+        var obj = String("")
         if k < len(ws.last_task.steps):
             place = ws.last_task.steps[k].place.copy()
+            obj = ws.last_task.steps[k].obj.copy()
+        if obj != "":
+            # a step about an object did not fail on the walk: « je n'ai pas réussi à atteindre la table » would be
+            # false of a crate that was carried there and tipped. The answer is the sentence the failure itself gave
+            # (`notice_text`), from the TASK's record: the object's own has moved on since (`Task.notice`)
+            var why = ws.last_task.notice.copy()
+            if why == "":
+                why = String(NOTICE_NOT_DONE)     # a task from before the notice was kept
+            var told = notice_text(ws, ExecAction(EX_NOTICE, String(""), why, place, obj))
+            if told != "":
+                return (String("Non. ") if fr else String("No. ")) + told
         if place != "":
             var word = ws.word_for(place, ws.language)
             if fr:
@@ -613,6 +625,8 @@ def object_answer(ref ws: WorldState, i: Int) -> String:
                 where += ", "
             where += parts[k]
     var said = (word + " est " + where) if fr else (word + " is " + where)
+    if o.tipped:
+        said += String(", mais pas dans le bon sens") if fr else String(", but not the right way up")
     if o.how == HOW_TOLD:
         return ("D'après ce qu'on m'a dit, " + said + ".") if fr else ("I was told " + said + ".")
     if o.how == HOW_REMEMBERED:

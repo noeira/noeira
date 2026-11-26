@@ -453,6 +453,7 @@ def restore_objects(mut ws: WorldState, dir: String, now: Int) -> Int:
         ws.objects[i].has_pose = True
         ws.objects[i].where = o.where
         ws.objects[i].put_at = o.put_at.copy()
+        ws.objects[i].tipped = o.tipped
         ws.objects[i].missing = o.missing
         ws.objects[i].how = String(HOW_REMEMBERED)
         ws.objects[i].source = String("log")

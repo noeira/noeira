@@ -228,6 +228,8 @@ def object_phrase(ref ws: WorldState, i: Int) -> String:
             t += ", " + _side(a.bearing) + ", " + metres(a.distance_m)
         if a.next_to != "none":
             t += ", next to the " + a.next_to
+    if o.tipped:
+        t += ", not the right way up (it tipped when you put it down)"
     if o.how == HOW_TOLD:
         t += " (you were told so; you have not seen it)"
     elif o.how == HOW_REMEMBERED:

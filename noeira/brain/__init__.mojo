@@ -50,7 +50,7 @@ from .people import People, Person, name_given, asks_identity, identity_answer, 
 from .tasks import (
     ExecAction, give_task, cancel_task, refuse_step, tick_tasks, notice_text,
     EX_NONE, EX_START, EX_NOTICE, STOP_COMMAND, NOTICE_NOT_REACHED, NOTICE_REFUSED, NOTICE_ALL_DONE,
-    NOTICE_NO_OBJECT, NOTICE_NOT_DONE, NOTICE_PUT_ELSEWHERE, jusqua, pres_de,
+    NOTICE_NO_OBJECT, NOTICE_NOT_DONE, NOTICE_PUT_ELSEWHERE, NOTICE_PUT_TIPPED, put_tipped_text, jusqua, pres_de,
 )
 from .answers import (
     asks_task_done, task_done_answer, computed_reply, computed_reply_final, computed_turn, ComputedTurn,

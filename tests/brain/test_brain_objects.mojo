@@ -33,7 +33,7 @@ from noeira.brain import (
     OBJ_FLOOR, OBJ_HELD, OBJ_PUT, HOW_SEEN, HOW_TOLD, HOW_REMEMBERED, OBJ_GAP_S,
     EV_SAW, EV_TOLD_WHERE, EV_LOST, EV_PICKED, EV_PUT,
     Task, Step, give_task, tick_tasks, refuse_step, notice_text, jusqua, pres_de,
-    NOTICE_REFUSED, NOTICE_PUT_ELSEWHERE,
+    NOTICE_REFUSED, NOTICE_PUT_ELSEWHERE, NOTICE_PUT_TIPPED, task_done_answer, object_phrase,
     EX_NONE, EX_START, EX_NOTICE, NOTICE_NO_OBJECT, NOTICE_NOT_DONE, NOTICE_ALL_DONE, STOP_COMMAND,
     TASK_DONE, TASK_FAILED, restore_objects, BrainEvent, EventLog,
     object_named, place_named, object_answer, computed_turn, carry_turn, capabilities_answer,
@@ -281,6 +281,88 @@ def main() raises:
     check(fails, notice_text(ex, a) == "Je ne peux pas prendre la caisse." and ex.last_task.reason == "the robot has no command 'pick:crate'",
           "  a refused pick: « " + notice_text(ex, a) + " », " + ex.last_task.reason)
 
+    print("5b. a put at the right place that tipped")
+    var tp = room()
+    tp.language = String("fr")
+    tp.add_object(ObjectXY.box("crate", "crate", 0.13, 0.215, 0.19))
+    _ = tp.saw_object("crate", 2.0, 0.5, 0.0, 500.0, "sim", 0.0, 2200)
+    var ti = tp.object_index("crate")
+    var tip = Task(String("porte la caisse à la table"))
+    tip.steps.append(Step.put("crate", "table"))
+    give_task(tp, tip^, 0.0, 2200)
+    _ = tick_tasks(tp, 0.0, 2200)
+    _ = tp.picked_up("crate", 1.0, 2201)
+    a = tick_tasks(tp, 1.0, 2201)
+    check(fails, a.kind == EX_NONE and tp.has_task and tp.task.steps[0].held, "put: held, carrying")
+    _ = tp.put_down("crate", "table", 0.0, -1.6, 90.0, 9.0, 2209, True)
+    check(fails, tp.objects[ti].where == OBJ_PUT and tp.objects[ti].put_at == "table" and tp.objects[ti].tipped, "let go at the table, tipped: the record says both")
+    a = tick_tasks(tp, 9.0, 2209)
+    check(fails, a.kind == EX_NOTICE and a.notice == NOTICE_PUT_TIPPED and a.command == "" and a.place == "table" and a.obj == "crate"
+          and not tp.has_task and tp.last_task.status == TASK_FAILED, "  the step FAILED at once, no stop: a tipped crate is not done")
+    check(fails, notice_text(tp, a) == "J'ai posé la caisse près de la table, mais pas dans le bon sens.", "  « " + notice_text(tp, a) + " »")
+    check(fails, tp.last_task.reason == "the crate was put down at the table, and does not rest the way it was taken", "  " + tp.last_task.reason)
+    check(fails, task_done_answer(tp) == "Non. J'ai posé la caisse près de la table, mais pas dans le bon sens.", "  « Tu as fini ? » « " + task_done_answer(tp) + " »")
+    check(fails, object_answer(tp, ti) == "La caisse est près de la table, mais pas dans le bon sens.", "  « Où est la caisse ? » « " + object_answer(tp, ti) + " »")
+    check(fails, tp.last_task.notice == NOTICE_PUT_TIPPED, "  the task keeps the notice of its failure")
+    check(fails, object_phrase(tp, ti) == "next to the table, where you put it, not the right way up (it tipped when you put it down)", "  for the reply model: " + object_phrase(tp, ti))
+    tp.language = String("en")
+    check(fails, notice_text(tp, a) == "I put the crate down at the table, but not the right way up.", "  " + notice_text(tp, a))
+    check(fails, task_done_answer(tp) == "No. I put the crate down at the table, but not the right way up.", "  " + task_done_answer(tp))
+    check(fails, object_answer(tp, ti) == "The crate is next to the table, but not the right way up.", "  " + object_answer(tp, ti))
+    tp.language = String("fr")
+    var ttxt = object_event_text(tp.objects[ti])
+    # the Orin's spoken replay, 26 Nov: a second after the put the tipped crate is seen again, turned 58 deg (a heading read off
+    # a crate on its side), and its record is "on the floor" again. « Tu as fini ? » still says what happened
+    var seen_again = room()
+    seen_again.language = String("fr")
+    seen_again.add_object(ObjectXY.box("crate", "crate", 0.13, 0.215, 0.19))
+    _ = seen_again.saw_object("crate", 2.0, 0.5, 0.0, 500.0, "sim", 0.0, 2200)
+    var tip2 = Task(String("porte la caisse à la table"))
+    tip2.steps.append(Step.put("crate", "table"))
+    give_task(seen_again, tip2^, 0.0, 2200)
+    _ = tick_tasks(seen_again, 0.0, 2200)
+    _ = seen_again.picked_up("crate", 1.0, 2201)
+    _ = tick_tasks(seen_again, 1.0, 2201)
+    _ = seen_again.put_down("crate", "table", 0.0, -1.6, 90.0, 9.0, 2209, True)
+    _ = tick_tasks(seen_again, 9.0, 2209)
+    _ = seen_again.saw_object("crate", 0.0, -1.6, 32.0, 500.0, "sim", 9.5, 2210)
+    var si2 = seen_again.object_index("crate")
+    check(fails, seen_again.objects[si2].where == OBJ_FLOOR and seen_again.objects[si2].tipped, "seen turned a second later: on the floor again, still tipped")
+    check(fails, task_done_answer(seen_again) == "Non. J'ai posé la caisse près de la table, mais pas dans le bon sens.",
+          "  « Tu as fini ? » « " + task_done_answer(seen_again) + " »")
+    check(fails, object_answer(seen_again, si2).endswith(", mais pas dans le bon sens."), "  « Où est la caisse ? » « " + object_answer(seen_again, si2) + " »")
+    check(fails, ttxt == "crate | 0.0 -1.6 90.0 | put_tipped table | crate 0.13 0.215 0.19 180.0 | seen", "the log's text: " + ttxt)
+    var tback = parse_object_event(ttxt)
+    check(fails, tback.tipped and tback.where == OBJ_PUT and tback.put_at == "table" and near(tback.yaw_deg, 90.0), "  read back: put at the table, tipped")
+    check(fails, not parse_object_event(String("crate | 0.0 -1.6 90.0 | put table | crate 0.13 0.215 0.19 180.0 | seen")).tipped, "  a text from before the suffix: not tipped")
+    # the same step again with the crate tipped at the table from before: not done, and not a failure it did not cause
+    var again = Task(String("porte la caisse à la table"))
+    again.steps.append(Step.put("crate", "table"))
+    give_task(tp, again^, 10.0, 2210)
+    _ = tick_tasks(tp, 10.0, 2210)
+    a = tick_tasks(tp, 11.0, 2211)
+    check(fails, a.kind == EX_NONE and tp.has_task, "a new put while it lies tipped at the table: NOT done (before: done at once), no failure before a pick")
+    _ = tp.picked_up("crate", 12.0, 2212)
+    check(fails, not tp.objects[ti].tipped and tp.objects[ti].where == OBJ_HELD, "  picked up: no longer tipped")
+    _ = tick_tasks(tp, 12.0, 2212)
+    _ = tp.put_down("crate", "table", 0.0, -1.6, 90.0, 20.0, 2220)
+    a = tick_tasks(tp, 20.0, 2220)
+    check(fails, not tp.has_task and tp.last_task.status == TASK_DONE and not tp.objects[ti].tipped, "  put down the right way up (`tipped` not given): done")
+    check(fails, task_done_answer(tp) == "Oui, j'ai fini ce que tu m'as demandé.", "  « " + task_done_answer(tp) + " »")
+    _ = tp.put_down("crate", "", 1.0, 1.0, 0.0, 21.0, 2221, True)
+    check(fails, object_event_text(tp.objects[ti]).find("| floor_tipped |") >= 0 and parse_object_event(object_event_text(tp.objects[ti])).tipped
+          and parse_object_event(object_event_text(tp.objects[ti])).where == OBJ_FLOOR, "tipped at no place: `floor_tipped`, read back")
+    _ = tp.told_object("crate", 2.0, 0.5, 0.0, "trials", 22.0, 2222)
+    check(fails, not tp.objects[ti].tipped, "  told where it is anew: no longer tipped")
+    # a put step that failed for another reason does not say the place was not reached
+    var late = Task(String("porte la caisse à la table"))
+    late.steps.append(Step.put("crate", "table"))
+    give_task(tp, late^, 30.0, 2230)
+    _ = tick_tasks(tp, 30.0, 2230)
+    a = tick_tasks(tp, 30.0 + 1000.0, 3230)
+    check(fails, a.notice == NOTICE_NOT_DONE and tp.last_task.notice == NOTICE_NOT_DONE
+          and task_done_answer(tp) == "Non. Je n'ai pas réussi à porter la caisse jusqu'à la table.", "a put that timed out: « " + task_done_answer(tp) + " »")
+
     print("6. restore_objects")
     var dir = getenv("TMPDIR", "/tmp") + "/noeira_brain_objects_" + String(perf_counter_ns())
     var now = 1794000000
@@ -317,6 +399,17 @@ def main() raises:
     check(fails, a.kind == EX_START, "a remembered crate can be picked up")
     var w3 = room()
     check(fails, restore_objects(w3, dir + "_none", now) == 0 and len(w3.objects) == 0, "no log: nothing")
+    check(fails, not w2.objects[k2].tipped, "the crate put the right way up: restored not tipped")
+    var w4 = room()
+    w4.open_log(dir + "_tipped", now)
+    w4.add_object(ObjectXY.box("crate", "crate", 0.13, 0.215, 0.19))
+    _ = w4.saw_object("crate", 2.0, 0.5, 0.0, 500.0, "eye", 0.0, now + 1)
+    _ = w4.picked_up("crate", 1.0, now + 2)
+    _ = w4.put_down("crate", "table", 0.0, -1.6, 90.0, 9.0, now + 3, True)
+    var w5 = room()
+    w5.add_object(ObjectXY.box("crate", "crate", 0.13, 0.215, 0.19))
+    check(fails, restore_objects(w5, dir + "_tipped", now + 100) == 1 and w5.objects[0].tipped and w5.objects[0].where == OBJ_PUT
+          and w5.objects[0].put_at == "table", "a crate put tipped in an earlier session: restored put at the table, TIPPED")
 
     print("7. the voice side")
     var v = room()

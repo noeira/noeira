@@ -342,6 +342,11 @@ struct Task(Copyable, Movable):
     var status: Int
     var reason: String
     """Why it failed or was cancelled; "" otherwise."""
+    var notice: String
+    """The notice its failure gave the person (`NOTICE_*` of
+    `noeira.brain.tasks`); "" otherwise. ⚠ Kept HERE, not read back off the
+    objects: a crate put down tipped is seen again, turned, a second later,
+    and its record is no longer "put at the table"."""
     var t_start: Float64
     var t_end: Float64
 
@@ -351,6 +356,7 @@ struct Task(Copyable, Movable):
         self.at = 0
         self.status = TASK_RUNNING
         self.reason = String("")
+        self.notice = String("")
         self.t_start = 0.0
         self.t_end = 0.0
 
@@ -650,6 +656,7 @@ struct WorldState(Movable):
         self.objects[i].missing = False
         self.objects[i].where = OBJ_FLOOR
         self.objects[i].put_at = String("")
+        self.objects[i].tipped = False
         self.objects[i].t_seen = t
         self.objects[i].now_seen = now
         self._log_object(i, EV_TOLD_WHERE, source, t, now)
@@ -676,21 +683,26 @@ struct WorldState(Movable):
             return False
         self.objects[i].where = OBJ_HELD
         self.objects[i].put_at = String("")
+        self.objects[i].tipped = False
         self.objects[i].missing = False
         self._log_object(i, EV_PICKED, String("body"), t, now)
         return True
 
     def put_down(mut self, name: String, place: String, x: Float64, y: Float64, yaw_deg: Float64,
-                 t: Float64, now: Int) -> Bool:
+                 t: Float64, now: Int, tipped: Bool = False) -> Bool:
         """The object was let go at (x, y, heading): put at `place`
         (`OBJ_PUT`), or on the floor at no place when `place` is "". The pose
-        is the body's estimate; the next sightings refine it. False = not added."""
+        is the body's estimate; the next sightings refine it. `tipped`: it
+        did not come to rest the way it was taken (on a side, upside down) —
+        a `put:` step then fails at the right place too (`noeira.brain.tasks`).
+        False = not added."""
         var i = self.object_index(name)
         if i < 0:
             return False
         self.objects[i].set_pose(x, y, yaw_deg)
         self.objects[i].where = OBJ_PUT if place != "" else OBJ_FLOOR
         self.objects[i].put_at = place.copy()
+        self.objects[i].tipped = tipped
         self.objects[i].missing = False
         self.objects[i].now_seen = now
         self._log_object(i, EV_PUT, String("body"), t, now)
