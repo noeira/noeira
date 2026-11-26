@@ -56,6 +56,61 @@ struct BcDataset(Movable):
             for j in range(self.act_dim):
                 self.y_tr.append(Scalar[DT](act[j]))
 
+    def add_demo_set_chunked(
+        mut self, ref ds: DemoSet, horizon: Int, val_episodes: Int,
+        max_episodes: Int = 0,
+    ) raises -> Int:
+        """Append a recording as CHUNK rows: the observation of row `r`
+        against the `horizon` actions recorded from `r` on, concatenated.
+        Returns the number of episodes used.
+
+        Only successful episodes are used, the first `max_episodes` of them
+        (0 = all); the LAST `val_episodes` of those are held out. Past an
+        episode's end the last action is repeated: the demonstrator was
+        holding, and the chunk says so."""
+        if horizon < 1 or self.act_dim != horizon * ds.act_dim:
+            raise Error(
+                "BcDataset: chunks of " + String(horizon) + " x "
+                + String(ds.act_dim) + " words into a dataset of "
+                + String(self.act_dim)
+            )
+        if self.obs_dim != ds.obs_dim:
+            raise Error(
+                "BcDataset: a recording of " + String(ds.obs_dim)
+                + "-word observations into a dataset of " + String(self.obs_dim)
+            )
+        var used = List[Int]()
+        for e in range(ds.n_episodes()):
+            if not ds.ep_success[e] or ds.ep_len[e] < 1:
+                continue
+            if max_episodes > 0 and len(used) >= max_episodes:
+                break
+            used.append(e)
+        if val_episodes >= len(used):
+            raise Error(
+                "BcDataset: holding out " + String(val_episodes) + " of "
+                + String(len(used)) + " usable episodes leaves nothing to fit"
+            )
+        var o = List[Scalar[DT]](length=ds.obs_dim, fill=Scalar[DT](0))
+        var a = List[Scalar[DT]](length=ds.act_dim, fill=Scalar[DT](0))
+        var y = List[Scalar[DT]](length=self.act_dim, fill=Scalar[DT](0))
+        var first_val = len(used) - val_episodes
+        for u in range(len(used)):
+            var e = used[u]
+            var start = ds.ep_start[e]
+            var ln = ds.ep_len[e]
+            for k in range(ln):
+                ds.row_obs[DT](start + k, o)
+                for i in range(horizon):
+                    var src = k + i
+                    if src > ln - 1:
+                        src = ln - 1
+                    ds.row_act[DT](start + src, a)
+                    for j in range(ds.act_dim):
+                        y[i * ds.act_dim + j] = a[j]
+                self.add(o, y, u >= first_val)
+        return len(used)
+
     @staticmethod
     def from_demo_set(
         ref ds: DemoSet, filter: DemoFilter, val_episodes: Int,
