@@ -534,6 +534,7 @@ project-pull = { cmd = "mojo run -I . tools/project/project_cli.mojo pull", desc
 project-rerun = { cmd = "mojo run -I . tools/project/project_cli.mojo rerun", description = "How to run a run again exactly (commit, patch, command): project-rerun <run_id> [--exec]" }
 project-resume = { cmd = "mojo run -I . tools/project/project_cli.mojo resume", description = "Continue a run from its last checkpoint with its own arguments: project-resume <run_id> [--from last] [--dry-run]" }
 run-tag = { cmd = "mojo run -I . tools/project/project_cli.mojo tag", description = 'Tag a run: run-tag <run_id> "free text"' }
+checkpoint-mean = { cmd = "mojo run -I . tools/nn/checkpoint_mean.mojo", description = "The mean of a run's kept copies as one checkpoint (v3 files of one model): checkpoint-mean --out OUT IN1 IN2 [IN3 ...] [--force]; --list IN prints a file's sections" }
 
 # Record teleoperation into a LeRobot v3 dataset. ⚠ SAFE BY DEFAULT: without
 # `--arm` the follower is never energised. Pass `-- --arm --out DIR --task "..."`.

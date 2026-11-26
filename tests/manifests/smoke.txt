@@ -17,6 +17,7 @@
 tests/nn/test_checkpoint_v2_storage.mojo
 tests/nn/test_checkpoint_scalars.mojo
 tests/nn/test_checkpoint_stream.mojo
+tests/nn/test_checkpoint_mean.mojo
 tests/nn/test_adam_visitor_ref.mojo
 tests/nn/test_checkpoint_adam_storage.mojo
 
