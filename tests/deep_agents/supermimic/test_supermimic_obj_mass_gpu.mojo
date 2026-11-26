@@ -1,6 +1,7 @@
 """The object's mass per lane in the device env that carries it
-(`object_env_gpu.SMObjTrackingEnvGpu`, its `mass_lo` / `mass_hi`): the draw
-at a reset, what it writes, and that it lasts until the lane's next reset.
+(`object_env_gpu.SMObjTrackingEnvGpu`, its `mass_lo` / `mass_hi` and its
+`mass_nominal`): the draw at a reset, what it writes, and that it lasts until
+the lane's next reset.
 
 NVIDIA ONLY (the batched G1 does not build for Metal). The PHYSICS of a
 per-lane mass is gated elsewhere (`tests/physics3d/test_lane_mass*.mojo`, the
@@ -22,6 +23,12 @@ batched G1 with its crate among them); this file gates the WIRING. Built with
   [3] the same value twice (2, 2): 2 in every lane, exactly
   [4] (1, 1), the default: nothing is written (`lane_mass` all zero), the
       context is the model's mass
+  [5] a range of (0.5, 3) with `mass_nominal` 0.5: 20 to 44 of the 64 lanes
+      hold a scale of exactly 1 and the model's mass as context (none does
+      in [1]), and every other lane holds the scale it holds in [1]: the
+      share takes lanes out of the draw, it does not move the draw
+  [6] `mass_nominal` 1: a scale of 1 in every lane, written at the box
+  [7] a `mass_nominal` outside [0, 1] is refused, and one without a range
 
 Built WITHOUT the define: a mass range is refused, and (1, 1) builds as before.
 
@@ -112,13 +119,13 @@ def _resting_poses(lens: List[Int]) -> List[Float64]:
     return out^
 
 
-def _env(ctx: DeviceContext, stand: List[Scalar[DT]], lo: Float64, hi: Float64) raises -> EnvO:
+def _env(ctx: DeviceContext, stand: List[Scalar[DT]], lo: Float64, hi: Float64, nominal: Float64 = 0.0) raises -> EnvO:
     """Long clips (no lane ends within the test), no noise."""
     var lens: List[Int] = [400, 400]
     var track = sm_object_track(_resting_poses(lens), lens, FPS)
     return EnvO(
         ctx, _library(stand, lens), track, BS.create(ctx), dr=False, obs_noise=False, reset_noise=False, action_noise=0.0,
-        friction_dr=False, max_episode_steps=0, mass_lo=lo, mass_hi=hi,
+        friction_dr=False, max_episode_steps=0, mass_lo=lo, mass_hi=hi, mass_nominal=nominal,
     )
 
 
@@ -199,6 +206,8 @@ def main() raises:
                             eo = max(eo, abs(got - mod))
             tl.check(ew <= 1e-6 and eo == 0.0, "the lanes' solver weights: the box's is the model's over its scale (rel. " + String(ew) + "), the others the model's (max |d| " + String(eo) + ")")
 
+            var sc_a = sc.copy()          # [1]'s scales, for [5]
+
             print("[2] a scale lasts until the lane's next reset")
             var rb = SMReplayGpuOf[R](ctx, NL, 16)
             var orb = SMObjReplayGpu(ctx, NL, 16)
@@ -253,6 +262,61 @@ def main() raises:
             for l in range(NL):
                 off1 = max(off1, abs(cm1[l] - m0))
             tl.check(set1 == 0 and off1 == 0.0, "nothing written (" + String(set1) + " scales set), the context is the model's mass")
+
+            print("[5] a range of (0.5, 3), half the resets at the model's mass")
+            var e5 = _env(ctx, stand, 0.5, 3.0, 0.5)
+            var cm5 = _ctx_mass(ctx, e5)
+            var sc5n = _scales(ctx, e5)
+            var nom = 0
+            var nom_a = 0
+            var nom_ctx_off = 0
+            var moved5 = 0
+            var e5c = 0.0
+            for l in range(NL):
+                var s5 = sc5n[l * NB + EnvO.OB]
+                if sc_a[l * NB + EnvO.OB] == 1.0:
+                    nom_a += 1
+                if s5 == 1.0:
+                    nom += 1
+                    if cm5[l] != m0:
+                        nom_ctx_off += 1
+                elif s5 != sc_a[l * NB + EnvO.OB]:
+                    moved5 += 1
+                e5c = max(e5c, abs(cm5[l] / m0 - s5))
+            tl.check(nom >= 20 and nom <= 44 and nom_a == 0 and nom_ctx_off == 0, String(nom) + " of " + String(NL) + " lanes hold a scale of exactly 1 (" + String(nom_a) + " without the share), their context the model's mass (" + String(nom_ctx_off) + " off)")
+            tl.check(moved5 == 0 and e5c <= 1e-6, "every other lane holds the scale it holds without the share (" + String(moved5) + " differ), context and scale agree (max |d| " + String(e5c) + ")")
+
+            print("[6] every reset at the model's mass")
+            var e6 = _env(ctx, stand, 0.5, 3.0, 1.0)
+            var cm6 = _ctx_mass(ctx, e6)
+            var sc6 = _scales(ctx, e6)
+            var bad6 = 0
+            var stray6 = 0
+            for l in range(NL):
+                if cm6[l] != m0 or sc6[l * NB + EnvO.OB] != 1.0:
+                    bad6 += 1
+                for b in range(NB):
+                    if b != EnvO.OB and sc6[l * NB + b] != 0.0:
+                        stray6 += 1
+            tl.check(bad6 == 0 and stray6 == 0, "a share of 1: a scale of 1 written at the box in every lane (" + String(bad6) + " lanes off, " + String(stray6) + " other entries set)")
+
+            print("[7] what is refused")
+            var refused_hi = False
+            try:
+                var eh = _env(ctx, stand, 0.5, 3.0, 1.5)
+            except err:
+                refused_hi = True
+            var refused_neg = False
+            try:
+                var en = _env(ctx, stand, 0.5, 3.0, -0.1)
+            except err:
+                refused_neg = True
+            var refused_plain = False
+            try:
+                var ep = _env(ctx, stand, 1.0, 1.0, 0.5)
+            except err:
+                refused_plain = True
+            tl.check(refused_hi and refused_neg and refused_plain, "a share of 1.5, of -0.1, and a share without a range are refused")
 
         print("\n===", tl.ok, "/", tl.total, "passed ===")
         if tl.ok != tl.total:

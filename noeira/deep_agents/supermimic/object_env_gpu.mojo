@@ -19,7 +19,9 @@ adds what the object needs around it:
                     range other than (1, 1) the lane draws the object's MASS
                     too, the model's times U(lo, hi), as its per-lane mass
                     (`physics3d/dynamics/lane_mass.mojo`; a simulator built
-                    with `LANE_MASS`), and the context's mass is the lane's
+                    with `LANE_MASS`), and the context's mass is the lane's;
+                    with `mass_nominal` p > 0 a lane keeps the model's mass
+                    with probability p and draws in the range otherwise
     at every step   the object's state is read from the simulator AFTER the
                     control step and BEFORE the resets (`_k_obj_read`) and
                     written to the object's ring
@@ -71,6 +73,7 @@ comptime SM_OBJ_MU_MID: Float64 = 0.9     # the object's friction per lane: U(mi
 comptime SM_OBJ_MU_HALF: Float64 = 0.4
 comptime _RNG_OBJ_MU: UInt32 = 7          # a hash stream the robot's env does not use (`env_gpu.RNG_*`: 1..6)
 comptime _RNG_OBJ_MASS: UInt32 = 8        # the object's mass per lane: the model's times U(lo, hi)
+comptime _RNG_OBJ_MASS_NOM: UInt32 = 9    # which lanes keep the model's mass (`mass_nominal`); the range's draw is untouched by it
 
 
 # ── the reference track ─────────────────────────────────────────────────────
@@ -154,11 +157,14 @@ def _k_obj_inject[OQ: Int, OV: Int, OB: Int, QS: Int, VS: Int, NB: Int](
     nl: Int64, seed: UInt32, dr: Int64, mass: Scalar[DT], mu0: Scalar[DT],
     orows: FP[DT], reset_f: FPi, qpos: FP[DT], qvel: FP[DT], lane_dr: FP[DT], octx: FP[DT],
     mdr: Int64, seed_m: UInt32, m_lo: Scalar[DT], m_hi: Scalar[DT], lane_mass: FP[DT],
+    seed_n: UInt32, m_nom: Scalar[DT],
 ):
     """The lanes the robot's env just reset (`reset_f[l]` ≥ 0): the object at
     its reference state of that frame, its friction drawn, its context.
     `mdr` ≠ 0: its mass drawn too, the scale U(m_lo, m_hi) written to the
-    lane's `lane_mass` (the caller then syncs the lanes' solver weights)."""
+    lane's `lane_mass` (the caller then syncs the lanes' solver weights);
+    with probability `m_nom` the scale is 1 instead (a second stream, so the
+    other lanes hold the scale they would hold with `m_nom` = 0)."""
     var l = Int(global_idx.x)
     if l >= Int(nl):
         return
@@ -177,6 +183,8 @@ def _k_obj_inject[OQ: Int, OV: Int, OB: Int, QS: Int, VS: Int, NB: Int](
     var m = mass
     if mdr != 0:
         var sc = m_lo + (m_hi - m_lo) * Scalar[DT](sm_hash_u01(seed_m, UInt32(l)))
+        if Scalar[DT](sm_hash_u01(seed_n, UInt32(l))) < m_nom:
+            sc = 1
         lane_mass[unsafe_offset=l * NB + OB] = sc
         m = mass * sc
     octx[unsafe_offset=l * SM_OBJ_CTX] = m
@@ -298,13 +306,14 @@ struct SMObjTrackingEnvGpu[R: TrackingRobot, BS: TrackingBatchedSim](Movable):
     var seed_base: UInt32
     var mass_lo: Float64                 # each lane's mass at its reset: the model's times U(lo, hi); (1, 1) = the model's
     var mass_hi: Float64
+    var mass_nominal: Float64            # the share of the resets that keep the model's mass instead of drawing; 0 = every lane draws
 
     def __init__(
         out self, ctx: DeviceContext, var lib: SMMotionLibrary[Self.R], track: List[Scalar[DT]], var sim: Self.BS,
         dr: Bool = True, obs_noise: Bool = True, reset_noise: Bool = True,
         action_noise: Float64 = SM_ACTION_NOISE, friction_period: Int = SM_EPISODE_STEPS, rng_seed: Int = 0,
         max_episode_steps: Int = SM_EPISODE_STEPS, friction_dr: Bool = True,
-        mass_lo: Float64 = 1.0, mass_hi: Float64 = 1.0,
+        mass_lo: Float64 = 1.0, mass_hi: Float64 = 1.0, mass_nominal: Float64 = 0.0,
     ) raises:
         """`track` is `sm_object_track`'s rows for `lib`'s frames; the other
         arguments are the robot env's. `friction_dr` needs a simulator with
@@ -312,13 +321,20 @@ struct SMObjTrackingEnvGpu[R: TrackingRobot, BS: TrackingBatchedSim](Movable):
         `mass_hi`: each lane's object weighs the model's mass times a scale
         drawn in that range at every reset of the lane (the same value twice:
         that scale in every lane); anything but (1, 1) needs a simulator with
-        `LANE_MASS`."""
+        `LANE_MASS`. `mass_nominal`, in [0, 1]: at a reset a lane keeps the
+        model's mass with this probability and draws in the range otherwise
+        (0: every lane draws); it needs a range."""
         if not (mass_lo > 0.0 and mass_hi >= mass_lo):
             raise Error("SMObjTrackingEnvGpu: a mass range 0 < lo <= hi, got " + String(mass_lo) + " .. " + String(mass_hi))
         if (mass_lo != 1.0 or mass_hi != 1.0) and not Self.BS.LANE_MASS:
             raise Error("SMObjTrackingEnvGpu: a mass range needs a simulator with a per-lane mass (build with -D SM_LANE_MASS=1)")
+        if not (mass_nominal >= 0.0 and mass_nominal <= 1.0):
+            raise Error("SMObjTrackingEnvGpu: mass_nominal is a probability, got " + String(mass_nominal))
+        if mass_nominal > 0.0 and mass_lo == 1.0 and mass_hi == 1.0:
+            raise Error("SMObjTrackingEnvGpu: mass_nominal needs a mass range (with (1, 1) every lane holds the model's mass already)")
         self.mass_lo = mass_lo
         self.mass_hi = mass_hi
+        self.mass_nominal = mass_nominal
         comptime assert Self.BS.SIM_NQ == Self.R.NQ + 7, "the simulator must hold one free object after the robot (qpos)"
         comptime assert Self.BS.SIM_NV == Self.R.NV + 6, "the simulator must hold one free object after the robot (qvel)"
         comptime assert Self.BS.SIM_NBODY == Self.R.NBODY + 2, "the simulator must hold one body after the robot's (world included)"
@@ -366,6 +382,7 @@ struct SMObjTrackingEnvGpu[R: TrackingRobot, BS: TrackingBatchedSim](Movable):
         self.seed_base = move.seed_base
         self.mass_lo = move.mass_lo
         self.mass_hi = move.mass_hi
+        self.mass_nominal = move.mass_nominal
 
     def num_lanes(self) -> Int:
         return Self.BS.N
@@ -381,6 +398,7 @@ struct SMObjTrackingEnvGpu[R: TrackingRobot, BS: TrackingBatchedSim](Movable):
         then the kinematics again (the env refreshed before the object moved)."""
         var seed = UInt32(self.env.step_count) * UInt32(16) + _RNG_OBJ_MU + self.seed_base * UInt32(0x9E3779B1)
         var seed_m = UInt32(self.env.step_count) * UInt32(16) + _RNG_OBJ_MASS + self.seed_base * UInt32(0x9E3779B1)
+        var seed_n = UInt32(self.env.step_count) * UInt32(16) + _RNG_OBJ_MASS_NOM + self.seed_base * UInt32(0x9E3779B1)
         var dr = Self.BS.LANE_DR and self.friction_dr
         var mdr = self.mass_lo != 1.0 or self.mass_hi != 1.0
         # the lanes' mass scales; a simulator without them is never asked to draw (the constructor refused)
@@ -392,6 +410,7 @@ struct SMObjTrackingEnvGpu[R: TrackingRobot, BS: TrackingBatchedSim](Movable):
             mptr(self.orows.unsafe_ptr()), mptr(self.env.reset_f.unsafe_ptr()),
             self.env.sim.qpos_ptr(), self.env.sim.qvel_ptr(), self.env.sim.lane_dr_ptr(), tp["gpu"](self.octx),
             Int64(1 if mdr else 0), seed_m, Scalar[DT](self.mass_lo), Scalar[DT](self.mass_hi), lm,
+            seed_n, Scalar[DT](self.mass_nominal),
             grid_dim=ceildiv(Self.BS.N, _TPB), block_dim=_TPB,
         )
         comptime if Self.BS.LANE_MASS:

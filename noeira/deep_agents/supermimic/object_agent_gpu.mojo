@@ -270,12 +270,13 @@ struct SMObjAgentGpu[OC: SMObjConfigT, BS: TrackingBatchedSim](Movable):
     def __init__(
         out self, ctx: DeviceContext, var lib: SMMotionLibrary[Self.OC.BASE.ROBOT], track: List[Scalar[DT]],
         orefs: List[Scalar[DT]], var sim: Self.BS, var trainer: SMObjTrainer[Self.OC], var sched: SMSchedule,
-        mass_lo: Float64 = 1.0, mass_hi: Float64 = 1.0,
+        mass_lo: Float64 = 1.0, mass_hi: Float64 = 1.0, mass_nominal: Float64 = 0.0,
     ) raises:
         """`track`: `sm_object_track`'s rows for `lib`'s frames; `orefs`:
         `object_task.sm_object_ref_rows` of the same frames. `mass_lo`,
         `mass_hi`: the env's range for each lane's object mass, a scale of
-        the model's drawn at every reset (`SMObjTrackingEnvGpu`)."""
+        the model's drawn at every reset; `mass_nominal`: the share of the
+        resets that keep the model's mass instead (`SMObjTrackingEnvGpu`)."""
         comptime B = Self.OC.BASE
         comptime R = B.ROBOT
         comptime D = SMDims[R]
@@ -298,7 +299,7 @@ struct SMObjAgentGpu[OC: SMObjConfigT, BS: TrackingBatchedSim](Movable):
         self.env = SMObjTrackingEnvGpu[R, Self.BS](
             ctx, lib^, track, sim^, dr=noise, obs_noise=noise, reset_noise=noise,
             action_noise=0.1 if noise else 0.0, rng_seed=sched.seed, friction_dr=noise,
-            mass_lo=mass_lo, mass_hi=mass_hi,
+            mass_lo=mass_lo, mass_hi=mass_hi, mass_nominal=mass_nominal,
         )
         self.rb = SMReplayGpuOf[R](ctx, L, sched.replay_capacity)
         self.orb = SMObjReplayGpu(ctx, L, sched.replay_capacity)
