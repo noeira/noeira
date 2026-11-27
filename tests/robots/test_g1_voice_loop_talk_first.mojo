@@ -54,6 +54,15 @@ False, `noeira.brain.answers.can_turn`, live room 2026-11-18):
     amount read by code (3 m, §12.9.7) and the note shows it; off, one state
     for both and no amount.
 
+18. (`place_never_sketched`) « Va au centre de la pièce. » in a room with no
+    such place: the first request says it asks for a place (the gate at 0.5
+    or more), no place is routed and no command fits. The reward sketch is
+    NOT asked (it answered "forward, fast" and the robot ran, Orin
+    2026-11-26); the robot says a fixed sentence, the reply model is not
+    asked (it said it was going, and the robot stood); nothing more after a
+    talk-first reply. The gate under the bar, or the option off: the sketch,
+    as before. `reply_refused` off: refused silently.
+
 The loop is the real `G1VoiceLoopOf`, its microphone closed, a stand-in
 recogniser handing it the sentence, a stand-in decision answering from a
 script, and a stand-in reply model.
@@ -439,6 +448,57 @@ def run_computed(
     return r^
 
 
+def place_answer(gate: Float64, talk_p: Float64 = 0.1) -> String:
+    """The destination request: no place routed (`none` at 0.6), the gate at `gate`, triage `talk` at `talk_p`
+    (the top kind over 0.5, else `go_place`)."""
+    var top = String("talk") if talk_p > 0.5 else String("go_place")
+    return (String('{"model":"script","usage":{"input_tokens":819},"answers":{')
+            + String('"destination":{"choice":"none","probabilities":{"none":0.60,"table":0.25,"sofa":0.15}},')
+            + String('"is_request":{"noul":') + String(gate) + String('},')
+            + String('"kind":{"choice":"') + top + String('","probabilities":{"go_place":') + String(0.9 - talk_p)
+            + String(',"talk":') + String(talk_p) + String(',"act_here":0.1}}}}'))
+
+
+def none_answer() -> String:
+    """The commands request: addressed, and no command fits (`none` at 0.6): `no such command`."""
+    return (String('{"model":"script","usage":{"input_tokens":1228},"answers":{')
+            + String('"command":{"choice":"none","probabilities":{"none":0.60,"run":0.20,"walk":0.10}},')
+            + String('"needs_world":{"noul":0.05},"addressed":{"noul":0.95},"extent":{"score":1.0}}}'))
+
+
+def run_place(gate: Float64, never_sketched: Bool, reply_refused: Bool, ref bank: G1CommandBank, lang: String = String("fr"),
+              talk_p: Float64 = 0.1) raises -> Run:
+    """« Va au centre de la pièce. » in a room with no such place, the loop given a reward pool's miss path."""
+    var loop = make_loop(0.7, bank)
+    loop.cfg.lang = lang.copy()
+    loop.has_pool = True            # the miss path is open (no pool is read before the sketch's answer)
+    loop.cfg.place_never_sketched = never_sketched
+    loop.cfg.reply_refused = reply_refused
+    loop.stt.text = String("Va au centre de la pièce.")
+    loop.jev.script.append(place_answer(gate, talk_p))
+    loop.jev.script.append(none_answer())
+    loop.state = VL_ST_STT
+    var ctx = G1Context()
+    var r = Run()
+    for _ in range(40):
+        var ev = loop.poll(ctx, bank)
+        if ev.kind == VL_TALK:
+            r.order += String("T")
+            r.said = ev.text
+        elif ev.kind == VL_COMMAND:
+            r.order += String("C") + ev.name
+        var n = loop.take_note()
+        if n != "":
+            print("     ", n)
+            if not n.startswith("[heard]"):
+                r.notes.append(n)
+        if loop.jev.asked.endswith("S"):
+            break                   # the reward sketch was asked: what this test is about, and the script has no answer for it
+    r.asked = loop.jev.asked
+    r.replies = loop.llm.asked
+    return r^
+
+
 def refused_answer() -> String:
     """The commands request: addressed, nothing clear (`squat` 0.30, under `min_top` 0.35)."""
     return (String('{"model":"script","usage":{"input_tokens":1228},"answers":{')
@@ -608,6 +668,43 @@ def main() raises:
             check(fails, refused_note and talked == 1 and rf.llm.asked == 1, "on: refused, then the model's reply, once")
         else:
             check(fails, refused_note and talked == 0 and rf.llm.asked == 0, "off: refused and silent, as before")
+
+    print("18. `place_never_sketched`: a place the room does not have is asked about, not turned into a speed")
+    var p1 = run_place(0.97, True, True, bank)
+    var said_so = False
+    for n in p1.notes:
+        if n.find("a place asked") >= 0 and n.find("said so") >= 0:
+            said_so = True
+    check(fails, p1.asked == "DC", "a place asked, none routed, no command: the reward sketch is NOT asked: " + p1.asked)
+    check(fails, p1.order == "T" and p1.said == "Je ne sais pas de quel endroit tu parles." and said_so,
+          "the robot says so, once, in a fixed sentence: " + p1.order + " '" + p1.said + "'")
+    check(fails, p1.replies == 0, "and the reply model is NOT asked (it said it was going, and the robot stood): " + String(p1.replies))
+    var p1e = run_place(0.97, True, True, bank, String("en"))
+    check(fails, p1e.said == "I do not know which place you mean.", "in English for another language: '" + p1e.said + "'")
+    # the triage read it as talk first (0.8 over `talk_first` 0.7): the model's reply is out, and one reply a decision
+    var p1t = run_place(0.97, True, True, bank, String("fr"), 0.8)
+    var once = False
+    for n in p1t.notes:
+        if n.find("a place asked") >= 0 and n.find("replied already") >= 0:
+            once = True
+    check(fails, p1t.asked == "DC" and p1t.order == "T" and p1t.replies == 1 and once,
+          "after a talk-first reply: no sketch, and nothing more said: " + p1t.asked + " " + p1t.order + " (" + String(p1t.replies) + " asked)")
+    var p2 = run_place(0.08, True, True, bank)
+    check(fails, p2.asked == "DCS", "the gate under the bar (not a request for a place): the sketch is asked, as before: " + p2.asked)
+    var p3 = run_place(0.97, False, True, bank)
+    check(fails, p3.asked == "DCS", "`place_never_sketched` off: the sketch is asked, as before: " + p3.asked)
+    var p4 = run_place(0.97, True, False, bank)
+    var refused_place = False
+    for n in p4.notes:
+        if n.find("[refused] no such command") >= 0 and n.find("a place asked") >= 0:
+            refused_place = True
+    check(fails, p4.asked == "DC" and p4.replies == 0 and refused_place,
+          "`reply_refused` off: no sketch and no reply, refused silently with the reason in the note: " + p4.asked)
+    check(fails, G1VoiceConfig().place_never_sketched, "and it is ON by default: a caller has to ask for the old path")
+    var p5 = run_place(0.50, True, True, bank)
+    check(fails, p5.asked == "DC", "the gate AT the bar (0.5) counts as a place asked: " + p5.asked)
+    var p6 = run_place(0.49, True, True, bank)
+    check(fails, p6.asked == "DCS", "just under it does not: " + p6.asked)
 
     print("17. `strip_amount`: the command request reads the sentence without its amount")
     for on in range(2):

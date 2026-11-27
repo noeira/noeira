@@ -94,7 +94,7 @@ from noeira.envs.robots.g1_command_language import (
     g1_since_word, G1Context, G1LangPick, G1_Q_EXTENT,
     g1_destination_questions, g1_route_destination,
     g1_add_two_places_gate, g1_two_places_questions, g1_two_places_state, g1_route_two_places,
-    G1_Q_IS_TWO_PLACES,
+    G1_Q_IS_TWO_PLACES, G1_Q_IS_REQUEST,
     g1_add_memory_reference, g1_route_memory, g1_other_one,
     g1_add_triage, g1_route_triage, g1_trail_questions, g1_resolve_trail,
     g1_command_moves, G1Triage, G1_TRIAGE_OFF, G1_TRIAGE_FULL,
@@ -262,6 +262,28 @@ struct G1VoiceConfig(Copyable, Movable):
     cannot — harmless in an empty void, and walking into the fridge in a
     furnished room. A caller with obstacles sets this; a bare viewer does not.
     """
+    var place_never_sketched: Bool
+    """`request_wording` only: a sentence that ASKS FOR A PLACE (the first
+    request's gate, `is_request`, at 0.5 or more: the bar
+    `g1_route_destination` routes a place on) and that routed no place and no
+    command is not sent to the cache-miss path. It is refused, and with
+    `reply_refused` the robot says a FIXED sentence (`g1_unknown_place_phrase`:
+    « Je ne sais pas de quel endroit tu parles. »).
+
+    ⚠ FIXED, NOT THE REPLY MODEL'S. Asked to "ask briefly which place", the
+    reply model answered « Je reviens au milieu de la pièce. » and the robot
+    stood where it was, 2 replays of 2: it said it was going. A sentence
+    about what the robot will NOT do is not left to a model.
+
+    ⚠ ON BY DEFAULT, because the miss path answers a place it does not know
+    with a SPEED. « Va au centre de la pièce. » in a room with no such place:
+    the commands request says `no such command`, the reward sketch it then
+    asks for comes back "body speed forward, high", and the robot RUNS, about
+    20 s, 7 times of 8 (Orin, 2026-11-26, docs/BRAIN_TASK_LAYER_PLAN.md
+    §15.3); the next walk then failed 3 times of 4. On d1's bench answers the
+    gate is over the bar on 56 of the 166 sentences that route nothing: 44 ask
+    for a place the request could not settle, 9 are talk, 3 are a sideways
+    step. False = the miss path takes them, as before."""
     var llm_spec: String
     """Passed to the reply backend's `from_spec`: for `ChatClient`, `hf`,
     `openai`, `anthropic`, or a local openai-compatible base URL; for
@@ -435,6 +457,7 @@ struct G1VoiceConfig(Copyable, Movable):
         self.dest_descs = List[String]()
         self.mic_dev = String("")
         self.refuse_placeless = False
+        self.place_never_sketched = True
         self.llm_spec = String("hf")
         self.request_wording = False
         self.chain = True
@@ -585,6 +608,10 @@ struct G1VoiceLoopOf[
     amount was cut out of it ("" otherwise): the decision's note shows it."""
     var asked_amount: G1Amount
     """With `strip_amount`, the first action's amount (`g1_first_amount`)."""
+    var place_gate: Float64
+    """`request_wording`: the first request's `is_request` for the sentence
+    being decided, P(it asks the robot to go to a place); -1 when that request
+    was not asked or did not say. Read by `place_never_sketched`."""
     var dest_ms: Float64
     """`request_wording`: how long the first request of the current decision
     took, 0 when it was the only one. Shown in the decision's note."""
@@ -780,6 +807,7 @@ struct G1VoiceLoopOf[
         self.asked_cmd = String("")
         self.asked_cut = String("")
         self.asked_amount = G1Amount.none()
+        self.place_gate = -1.0
         self.dest_ms = 0.0
         self.dest_tok = 0
         self.then_decide = False
@@ -886,6 +914,7 @@ struct G1VoiceLoopOf[
         self.asked_cmd = move.asked_cmd^
         self.asked_cut = move.asked_cut^
         self.asked_amount = move.asked_amount^
+        self.place_gate = move.place_gate
         self.dest_ms = move.dest_ms
         self.dest_tok = move.dest_tok
         self.then_decide = move.then_decide
@@ -1847,6 +1876,11 @@ struct G1VoiceLoopOf[
         try:
             var ans = self.jev.result()
             var dest = g1_route_destination(ans)
+            # whether the sentence asks for a place at all, kept for the miss path (`place_never_sketched`)
+            try:
+                self.place_gate = ans.noul(String(G1_Q_IS_REQUEST))
+            except e:
+                self.place_gate = -1.0
             if self.cfg.triage != G1_TRIAGE_OFF:
                 # ⚠ THE TRIAGE OVERRIDES A CONFIDENT DESTINATION: "climb onto the
                 # table" routes the table, and it is the kind that says no
@@ -2004,6 +2038,7 @@ struct G1VoiceLoopOf[
         self._snapshot_view()
         self.mem_asked = False
         self.tri = G1Triage()
+        self.place_gate = -1.0
         self.dest_ms = 0.0
         self.dest_tok = 0
         self.then_decide = False
@@ -2236,6 +2271,20 @@ struct G1VoiceLoopOf[
         self.stream_cap = self.reply_cap
         self.stream_capped = False
 
+    def _say(mut self, text: String, note: String):
+        """`text` said as it is, the reply model not asked, and nothing else:
+        the robot's motion is unchanged. One reply a decision, and an answer
+        code holds for this utterance (`set_reply_override`) is said instead,
+        as in `_reply`."""
+        if self.replied:
+            self.note = note + String("  (replied already: nothing more said)")
+            self.state = VL_ST_IDLE
+            return
+        self.canned = self.reply_override if self.reply_override != "" else text
+        self.t_wait = perf_counter_ns()
+        self.note = note
+        self.state = VL_ST_CHAT
+
     def _reply(mut self, hint: String, note: String):
         """A spoken reply and nothing else: the robot's motion is unchanged.
         `hint` is added to the reply's system prompt ("" = a plain reply).
@@ -2400,7 +2449,20 @@ struct G1VoiceLoopOf[
                 # able to say it. Any other reason is a real refusal and must
                 # NOT be routed there, or background speech starts generating
                 # latents.
-                if self.has_pool and self.pick.reason == "no such command":
+                # ⚠ A PLACE THE ROBOT DOES NOT HAVE IS NOT A SPEED (`place_never_sketched`): the sentence asked
+                # for a place, none was routed, and no command fits. The reward vocabulary has no place in it;
+                # asked anyway, it answered "forward, fast" and the robot ran.
+                var asks_place = (self.cfg.place_never_sketched and self.place_gate >= 0.5
+                                  and self.pick.reason == "no such command")
+                if asks_place and self.cfg.reply_refused:
+                    self._say(
+                        g1_unknown_place_phrase(self.cfg.lang),
+                        String("[miss] a place asked (gate ") + _vl_f2(self.place_gate)
+                        + String("), none routed: no reward spec") + self._jev_ms(ans.latency_ms, ans.input_tokens)
+                        + String(" -> said so"),
+                    )
+                    got = True
+                if self.has_pool and self.pick.reason == "no such command" and not asks_place:
                     try:
                         # ⚠ THE INSTRUCTION ALONE. Asking with `doing` in the
                         # state made one instruction give ESS 5089 while
@@ -2441,6 +2503,8 @@ struct G1VoiceLoopOf[
                                  + _vl_f2(self.pick.addressed)
                                  + String("  world ")
                                  + _vl_f2(self.pick.needs_world)
+                                 + (String("  a place asked (gate ") + _vl_f2(self.place_gate) + String("): no reward spec")
+                                    if asks_place else String(""))
                                  + self._jev_ms(ans.latency_ms, ans.input_tokens))
         except e:
             self.note = String("[jev] FAILED: ") + String(e)
@@ -2606,6 +2670,16 @@ struct G1VoiceLoopOf[
         peak under the label "noise floor" — two different numbers, and the
         one it showed was the loudest thing in the first second."""
         return self.vad.floor
+
+
+def g1_unknown_place_phrase(lang: String) -> String:
+    """What the robot says to a request for a place it could not settle
+    (`G1VoiceConfig.place_never_sketched`): French for `fr`, English otherwise.
+    True of a place the room does not have and of one it could not tell from
+    the others ("the one on my left")."""
+    if lang == "fr":
+        return String("Je ne sais pas de quel endroit tu parles.")
+    return String("I do not know which place you mean.")
 
 
 def _vl_triage_hint(kind: String) -> String:
